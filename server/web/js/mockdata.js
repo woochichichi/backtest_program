@@ -56,6 +56,23 @@ function toYmdDash(d) {
   return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
 }
 
+/** 20260724(정수) → "2026-07-24" */
+function ymdIntToDash(v) {
+  const s = String(v);
+  return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
+}
+
+/** 파이썬 f-string 의 :g 서식과 같은 결과를 낸다. 0.1 → "0.1", 0.23 → "0.23" */
+function fmtG(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return String(v);
+  let s = n.toPrecision(6);
+  if (s.indexOf('e') < 0 && s.indexOf('.') >= 0) {
+    s = s.replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return s;
+}
+
 function isWeekend(d) {
   const w = d.getUTCDay();
   return w === 0 || w === 6;

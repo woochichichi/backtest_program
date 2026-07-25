@@ -377,7 +377,12 @@ def run_backtest(
             "일봉만으로는 저가·고가 순서를 알 수 없어 성과가 실제보다 좋게 나올 수 있습니다."
         )
 
-    stats = {"same_day_entry_exit": 0, "same_day_entry_exit_pct": 0.0, "ambiguous_bars": 0}
+    stats = {
+        "same_day_entry_exit": 0,
+        "same_day_entry_exit_pct": 0.0,
+        "ambiguous_bars": 0,
+        "same_day_profit_exits_blocked": 0,
+    }
 
     def make_assumptions() -> dict:
         return {
@@ -778,9 +783,11 @@ _FILL_MODEL_NOTES = {
 
 _SAME_DAY_NOTES = {
     "loss_only": (
-        "진입 체결이 있었던 날에는 손절 계열만 평가하고 익절은 다음 거래일부터 평가했습니다 "
-        "(same_day_exit=loss_only). 같은 봉에서 매수가와 익절가가 모두 닿았더라도 "
-        "익절이 먼저였다고 단정할 수 없기 때문입니다."
+        "진입 체결이 있었던 날에는 이익이 나는 청산을 모두 다음 거래일로 미루고, "
+        "손실·본전 청산만 당일에 허용했습니다 (same_day_exit=loss_only). "
+        "판정은 규칙 이름이 아니라 체결가 기준이며, 슬리피지·수수료까지 뺀 순손익으로 봅니다. "
+        "같은 봉에서 매수가와 청산가가 모두 닿았더라도 이익 쪽이 먼저였다고 단정할 수 없기 때문입니다. "
+        "손절 규칙이라도 손절선이 평단가 위에 있으면 실질은 익절이므로 함께 미뤘습니다."
     ),
     "never": (
         "진입 체결이 있었던 날에는 어떤 청산도 평가하지 않고 다음 거래일부터 판정했습니다 "
@@ -822,6 +829,13 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
         notes.append(
             f"진입과 청산 조건이 같은 봉 안에서 모두 성립한 경우가 {amb:,}건 있었습니다. "
             "이 봉들은 순서를 확정할 수 없어 위 가정에 의존합니다. 건수가 많을수록 결과 신뢰도는 낮습니다."
+        )
+    blocked = int(stats.get("same_day_profit_exits_blocked") or 0)
+    if blocked:
+        notes.append(
+            f"그중 {blocked:,}건은 진입 당일에 이익으로 청산될 수 있었지만 "
+            "이 규칙에 막혀 다음 거래일로 넘어갔습니다. "
+            "same_day_exit=always 로 두면 이 {0:,}건이 그대로 수익에 잡힙니다.".format(blocked)
         )
     notes.append("미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).")
     return [n for n in notes if n]

@@ -278,10 +278,12 @@ async def _handle_validation_error(
             "ok": False,
             "error": "요청 형식이 올바르지 않습니다.",
             "detail": "요청 본문(JSON)을 확인하세요.",
-            "errors": [
-                {"path": ".".join(str(p) for p in e.get("loc", [])), "message": e.get("msg", "")}
-                for e in exc.errors()
-            ],
+            "errors": normalize_errors(
+                [
+                    {"path": list(e.get("loc", [])), "message": e.get("msg", "")}
+                    for e in exc.errors()
+                ]
+            ),
         },
     )
 
@@ -766,7 +768,7 @@ def _validate_or_422(obj: Any) -> Dict[str, Any]:
             422,
             "전략 검증에 실패했습니다.",
             "" if from_engine else "engine.validate 가 없어 최소 검증만 수행했습니다.",
-            {"errors": list(errors or [])},
+            {"errors": normalize_errors(errors)},
         )
     return obj
 
@@ -808,9 +810,9 @@ async def api_strategies_validate(request: Request) -> Dict[str, Any]:
     except Exception as exc:
         return {
             "valid": False,
-            "errors": [{"path": "", "message": f"검증 중 오류: {type(exc).__name__}: {exc}"}],
+            "errors": normalize_errors([{"path": "", "message": f"검증 중 오류: {type(exc).__name__}: {exc}"}]),
         }
-    result: Dict[str, Any] = {"valid": bool(ok), "errors": list(errors or [])}
+    result: Dict[str, Any] = {"valid": bool(ok), "errors": normalize_errors(errors)}
     if not from_engine:
         result["warning"] = "engine.validate 가 없어 최소 검증만 수행했습니다."
     return result
@@ -1390,17 +1392,43 @@ def _indicator_params(key: str, args: List[str], registry: Any) -> Dict[str, Any
     return params
 
 
+def _requested_date(value: Optional[str]) -> Optional[_dt.date]:
+    """쿼리로 들어온 날짜 문자열을 date 로. 'auto'/빈값/파싱 실패는 None."""
+    text = (value or "").strip()
+    if not text or text.lower() == "auto":
+        return None
+    digits = re.sub(r"\D", "", text)[:8]
+    if len(digits) != 8:
+        return None
+    try:
+        return _dt.date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    except Exception:
+        return None
+
+
+def _iso_from_yyyymmdd(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(int(value))
+    if len(text) != 8:
+        return None
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+
+
 @app.get("/api/chart")
 def api_chart(
-    code: str,
+    code: Optional[str] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
     indicators: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     code = (code or "").strip()
+    auto_picked = False
     if not code:
-        raise ApiError(400, "code 파라미터가 필요합니다.", "예: /api/chart?code=042700")
+        # 1) run_id 의 첫 거래 종목  2) 시가총액 1위  3) 데이터 없으면 503
+        code = default_chart_code(run_id)
+        auto_picked = True
 
     store = get_store()
     try:
@@ -1450,10 +1478,17 @@ def api_chart(
         except Exception:
             name = ""
 
+    actual_start = _iso_from_yyyymmdd(next((x for x in t if x is not None), None))
+    actual_end = _iso_from_yyyymmdd(next((x for x in reversed(t) if x is not None), None))
+
     payload: Dict[str, Any] = {
         "code": code,
         "name": name,
         "n": n,
+        "start": actual_start,
+        "end": actual_end,
+        "requested": {"start": start, "end": end},
+        "truncated": False,
         "t": t,
         "o": _series(df, o_col),
         "h": _series(df, h_col),
@@ -1466,6 +1501,31 @@ def api_chart(
         "bands": [],
         "levels": [],
     }
+    if auto_picked:
+        payload["auto_selected"] = True
+
+    # ---- 실제 적용된 범위 vs 요청 범위 ----
+    warnings: List[str] = []
+    req_start = _requested_date(start)
+    req_end = _requested_date(end)
+    truncated = False
+
+    if req_start is not None and actual_start and actual_start != req_start.isoformat():
+        truncated = True
+        if actual_start > req_start.isoformat():
+            warnings.append(
+                f"요청 시작일({req_start.isoformat()}) 이전 데이터가 없어 {actual_start} 부터 표시합니다."
+            )
+    if req_end is not None and actual_end and actual_end != req_end.isoformat():
+        truncated = True
+        if actual_end < req_end.isoformat():
+            warnings.append(
+                f"요청 종료일({req_end.isoformat()}) 이후 데이터가 없어 {actual_end} 까지만 표시합니다."
+            )
+
+    payload["truncated"] = truncated
+    if warnings:
+        payload.setdefault("warnings", []).extend(warnings)
 
     # ---- 지표 ----
     tokens = _parse_indicator_tokens(indicators or "")
