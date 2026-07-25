@@ -94,30 +94,25 @@ _SL_TAIL = [
 ]
 
 
-def price_path(kind: str) -> List[tuple]:
+def price_path(kind: str, n: int = N_BARS) -> List[tuple]:
     """``kind`` 는 ``"tp"`` / ``"sl"`` / ``"flat"``."""
     rows = _warmup_rows()
-    if kind == "flat":
-        last = rows[-1][3]
-        while len(rows) < N_BARS:
-            rows.append((last, last * 1.01, last * 0.99, last))
-        return rows[:N_BARS]
-
-    rows += _COMMON_TAIL
-    rows += _TP_TAIL if kind == "tp" else _SL_TAIL
+    if kind != "flat":
+        rows += _COMMON_TAIL
+        rows += _TP_TAIL if kind == "tp" else _SL_TAIL
     last = rows[-1][3]
-    while len(rows) < N_BARS:
+    while len(rows) < n:
         rows.append((last, last * 1.01, last * 0.99, last))
-    return rows[:N_BARS]
+    return rows[:n]
 
 
-def amount_path(kind: str) -> List[float]:
+def amount_path(kind: str, n: int = N_BARS) -> List[float]:
     """거래대금(원). 기준일만 1,200억, 그 직전일 100억, 나머지 50억."""
-    amt = [50.0 * EOK] * N_BARS
+    amt = [50.0 * EOK] * max(n, N_BARS)
     if kind != "flat":
         amt[REF_BAR - 1] = 100.0 * EOK      # ≤ 200억 (prev_day_amount_max_eok)
         amt[REF_BAR] = 1200.0 * EOK         # ≥ 1,000억 (spike)
-    return amt
+    return amt[:n]
 
 
 def trading_dates(n: int = N_BARS, start: str = "2024-06-03") -> List[dt.date]:

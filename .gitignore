@@ -4,10 +4,15 @@
 # 갱신 로그
 /logs/
 
+# 파이썬 가상환경 (install.bat 이 생성)
+/.venv/
+/venv/
+
 # 캐시
 /cache/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # 편집기
 .vscode/

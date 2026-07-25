@@ -502,8 +502,8 @@ def run_backtest(
                 active.pop(code, None)
                 continue
 
-            # ---- 진입
-            for rule in entries:
+            # ---- 진입 (기준일 **다음** 거래일부터 감시한다)
+            for rule in entries if gi > w["ref_gi"] else ():
                 rid = rule.get("id")
                 if rid in w["fills"]:
                     continue

@@ -230,9 +230,9 @@ def test_strategy1_conditions(ctx, strategy1_json):
     entries = {e["id"]: e for e in strategy1_json["entries"]}
     exits = {e["id"]: e for e in strategy1_json["exits"]}
 
-    # B1 : low <= ref.open (100.0)
+    # B1 : low <= ref.open (100.0)   — low: 99 100 97 95 104
     assert list(evaluate_condition(entries["B1"]["when"], ctx)) == [
-        True, False, True, True, False
+        True, True, True, True, False
     ]
 
     # B2 : low <= fill.B1.price * (1 + -10/100) = 90
