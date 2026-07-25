@@ -174,6 +174,145 @@ const STOCK_POOL = [
 /** ARCHITECTURE 2장이 요구하는 1분봉 근사 경고 문구. */
 const WARN_1M_APPROX = '1분봉 데이터가 없어 일봉 근사로 체결했습니다.';
 
+/**
+ * /api/symbols 종목 검색용 고정 테이블. (코드, 종목명, 시장)
+ * STOCK_POOL 의 20종목을 그대로 포함해 폴백 데이터끼리 어긋나지 않게 한다.
+ */
+const SYMBOL_TABLE = [
+  ['005930', '삼성전자', 'KOSPI'],
+  ['000660', 'SK하이닉스', 'KOSPI'],
+  ['373220', 'LG에너지솔루션', 'KOSPI'],
+  ['207940', '삼성바이오로직스', 'KOSPI'],
+  ['005380', '현대차', 'KOSPI'],
+  ['000270', '기아', 'KOSPI'],
+  ['005490', 'POSCO홀딩스', 'KOSPI'],
+  ['051910', 'LG화학', 'KOSPI'],
+  ['006400', '삼성SDI', 'KOSPI'],
+  ['068270', '셀트리온', 'KOSPI'],
+  ['035420', 'NAVER', 'KOSPI'],
+  ['035720', '카카오', 'KOSPI'],
+  ['105560', 'KB금융', 'KOSPI'],
+  ['055550', '신한지주', 'KOSPI'],
+  ['086790', '하나금융지주', 'KOSPI'],
+  ['012330', '현대모비스', 'KOSPI'],
+  ['009150', '삼성전기', 'KOSPI'],
+  ['042700', '한미반도체', 'KOSPI'],
+  ['096770', 'SK이노베이션', 'KOSPI'],
+  ['329180', 'HD현대중공업', 'KOSPI'],
+  ['012450', '한화에어로스페이스', 'KOSPI'],
+  ['034020', '두산에너빌리티', 'KOSPI'],
+  ['028260', '삼성물산', 'KOSPI'],
+  ['066570', 'LG전자', 'KOSPI'],
+  ['033780', 'KT&G', 'KOSPI'],
+  ['259960', '크래프톤', 'KOSPI'],
+  ['402340', 'SK스퀘어', 'KOSPI'],
+  ['323410', '카카오뱅크', 'KOSPI'],
+  ['247540', '에코프로비엠', 'KOSDAQ'],
+  ['086520', '에코프로', 'KOSDAQ'],
+  ['196170', '알테오젠', 'KOSDAQ'],
+  ['112040', '위메이드', 'KOSDAQ'],
+  ['066970', '엘앤에프', 'KOSDAQ'],
+  ['277810', '레인보우로보틱스', 'KOSDAQ'],
+  ['039030', '이오테크닉스', 'KOSDAQ'],
+  ['058470', '리노공업', 'KOSDAQ'],
+  ['357780', '솔브레인', 'KOSDAQ'],
+  ['108320', 'LX세미콘', 'KOSDAQ'],
+  ['095340', 'ISC', 'KOSDAQ'],
+  ['240810', '원익IPS', 'KOSDAQ'],
+  ['403870', 'HPSP', 'KOSDAQ'],
+  ['263750', '펄어비스', 'KOSDAQ'],
+  ['214150', '클래시스', 'KOSDAQ'],
+  ['145020', '휴젤', 'KOSDAQ'],
+  ['035900', 'JYP Ent.', 'KOSDAQ'],
+  ['068760', '셀트리온제약', 'KOSDAQ'],
+];
+
+/** engine/backtest.py _FILL_MODEL_NOTES 와 문장까지 동일해야 한다. */
+const FILL_MODEL_NOTES = {
+  touch: '체결가는 목표가 그대로 잡되, 갭으로 목표가를 지나쳐 시작한 날은 당일 시가로 체결했습니다.',
+  next_open: '조건이 성립한 다음 거래일 시가로 체결했습니다.',
+  close: '조건이 성립한 당일 종가로 체결했습니다.',
+};
+
+/** engine/backtest.py _SAME_DAY_NOTES 와 문장까지 동일해야 한다. */
+const SAME_DAY_NOTES = {
+  loss_only:
+    '진입 체결이 있었던 날에는 손절 계열만 평가하고 익절은 다음 거래일부터 평가했습니다 ' +
+    '(same_day_exit=loss_only). 같은 봉에서 매수가와 익절가가 모두 닿았더라도 ' +
+    '익절이 먼저였다고 단정할 수 없기 때문입니다.',
+  never:
+    '진입 체결이 있었던 날에는 어떤 청산도 평가하지 않고 다음 거래일부터 판정했습니다 ' +
+    '(same_day_exit=never). 세 가지 설정 중 가장 보수적입니다.',
+  always:
+    '진입 체결이 있었던 날에도 익절·손절을 모두 평가했습니다 (same_day_exit=always). ' +
+    '같은 봉에서 매수가와 익절가가 모두 닿으면 매수가 먼저였다고 가정하므로 ' +
+    '결과가 실제보다 좋게 나올 수 있습니다.',
+};
+
+/** engine/backtest.py _order_exits: 우선순위에 적힌 순서 먼저, 나머지는 원래 순서. */
+function orderExitIds(exits, priority) {
+  const rules = Array.isArray(exits) ? exits : [];
+  const prio = Array.isArray(priority) ? priority : [];
+  const byId = {};
+  for (let i = 0; i < rules.length; i++) {
+    const rid = rules[i] && rules[i].id;
+    if (rid !== undefined && rid !== null) byId[String(rid)] = true;
+  }
+  const seen = {};
+  const out = [];
+  for (let i = 0; i < prio.length; i++) {
+    const pid = String(prio[i]);
+    if (byId[pid] && !seen[pid]) { seen[pid] = true; out.push(pid); }
+  }
+  for (let i = 0; i < rules.length; i++) {
+    const rid = rules[i] && rules[i].id;
+    if (rid === undefined || rid === null) continue;
+    const key = String(rid);
+    if (!seen[key]) { seen[key] = true; out.push(key); }
+  }
+  return out;
+}
+
+/**
+ * engine/backtest.py _assumption_notes 와 같은 순서·같은 문장을 만든다.
+ * slippagePct / feePct 는 이미 퍼센트 값(0.1 = 0.1%)이다.
+ */
+function assumptionNotes(requestedResolution, fillModel, sameDayExit, slippagePct, feePct, exitIds, stats) {
+  const notes = [
+    '일봉 데이터만 사용했습니다. 하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.',
+  ];
+  if (requestedResolution !== '1d') {
+    notes.push(
+      '전략은 ' + requestedResolution + ' 해상도 체결을 요청했지만 marcap 은 일봉만 제공합니다. ' +
+        '분봉 매매는 추후 지원 예정이며, 그 전까지는 일봉 근사로 동작합니다.'
+    );
+  }
+  notes.push(
+    Object.prototype.hasOwnProperty.call(FILL_MODEL_NOTES, fillModel)
+      ? FILL_MODEL_NOTES[fillModel]
+      : 'fill_model=' + fillModel + ' 로 체결했습니다.'
+  );
+  notes.push(
+    Object.prototype.hasOwnProperty.call(SAME_DAY_NOTES, sameDayExit) ? SAME_DAY_NOTES[sameDayExit] : ''
+  );
+  notes.push(
+    '매수는 체결가 +' + fmtG(slippagePct) + '%, 매도는 -' + fmtG(slippagePct) + '% 슬리피지를 적용하고 ' +
+      '매도 대금에 ' + fmtG(feePct) + '% 비용(수수료+거래세)을 부과했습니다.'
+  );
+  if (exitIds.length > 1) {
+    notes.push('같은 봉에서 여러 청산이 동시에 성립하면 ' + exitIds.join(' → ') + ' 순서로 평가했습니다.');
+  }
+  const amb = Math.floor(Number(stats && stats.ambiguous_bars) || 0);
+  if (amb > 0) {
+    notes.push(
+      '진입과 청산 조건이 같은 봉 안에서 모두 성립한 경우가 ' + fmtWon(amb) + '건 있었습니다. ' +
+        '이 봉들은 순서를 확정할 수 없어 위 가정에 의존합니다. 건수가 많을수록 결과 신뢰도는 낮습니다.'
+    );
+  }
+  notes.push('미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).');
+  return notes.filter((s) => typeof s === 'string' && s.length > 0);
+}
+
 /* ────────────────────────────── 4-1. GET /api/status ────────────────────────────── */
 
 /**
@@ -191,6 +330,82 @@ export function mockStatus() {
     git_rev: 'a1b2c3d',
     row_count: 11043912,
     auto_sync: { registered: true, time: '18:30', task: 'KRXBacktesterDataSync' },
+    // 프런트 기능 토글. 폴백 경로에는 API 키가 없으므로 ai_available 만 false.
+    features: { backtest_progress_sse: true, ai_available: false, symbol_search: true },
+  };
+}
+
+/* ────────────────────────────── GET /api/symbols ────────────────────────────── */
+
+/**
+ * 종목 검색. q 는 코드 접두어와 종목명 부분일치를 모두 본다(대소문자 무시).
+ * total 은 limit 를 적용하기 전 매치 개수다.
+ * marcap_eok 은 표 순서대로 시드 고정 LCG에서 뽑으므로 질의와 무관하게 항상 같다.
+ */
+export function mockSymbols(q, limit) {
+  const rnd = makeRng(20260725); // 함수 진입 시 시드 리셋
+  const lim = Math.max(0, Math.floor(limit === undefined || limit === null ? 30 : limit));
+  const query = (q === undefined || q === null ? '' : String(q)).trim().toLowerCase();
+
+  const matched = [];
+  for (let i = 0; i < SYMBOL_TABLE.length; i++) {
+    const row = SYMBOL_TABLE[i];
+    // 시총은 매치 여부와 상관없이 매 행마다 소비해 결정론을 유지한다.
+    const base = row[2] === 'KOSPI' ? 30000 : 4000;
+    const span = row[2] === 'KOSPI' ? 3900000 : 60000;
+    const marcap = Math.round(base + rnd() * rnd() * span);
+    if (query.length > 0) {
+      const hitCode = row[0].toLowerCase().indexOf(query) === 0;
+      const hitName = row[1].toLowerCase().indexOf(query) >= 0;
+      if (!hitCode && !hitName) continue;
+    }
+    matched.push({
+      code: row[0],
+      name: row[1],
+      market: row[2],
+      marcap_eok: clamp(marcap, 3000, 4000000),
+      last_date: LAST_TRADE_DATE,
+    });
+  }
+
+  return { total: matched.length, symbols: matched.slice(0, lim) };
+}
+
+/* ────────────────────────────── GET /api/sync/status ────────────────────────────── */
+
+/**
+ * 데이터 동기화 진행 상태. 기본은 "대기 중"(running:false).
+ * tick 이 0보다 큰 숫자면 진행 중 스냅샷을 만든다. 같은 tick 이면 결과도 같다.
+ */
+export function mockSyncStatus(tick) {
+  const t = Number(tick);
+  if (!isFinite(t) || t <= 0) {
+    return { running: false, started_at: null, elapsed_sec: 0, log_tail: '' };
+  }
+
+  const rnd = makeRng(20260725 + Math.floor(t)); // 함수 진입 시 시드 리셋
+  const elapsed = round(t * 1.5, 1);
+  const pct = clamp(Math.round(t * 6), 1, 99);
+
+  const TOTAL_OBJ = 2871;
+  const TOTAL_MIB = 28.6;
+  const recv = Math.max(1, Math.round((TOTAL_OBJ * pct) / 100));
+  const mib = round((TOTAL_MIB * pct) / 100, 1);
+  const speed = round(2 + rnd() * 2.5, 1);
+  const padPct = pct < 10 ? '  ' + pct : pct < 100 ? ' ' + pct : String(pct);
+
+  const logTail =
+    'remote: Enumerating objects: ' + TOTAL_OBJ + ', done.\n' +
+    'remote: Counting objects: 100% (' + TOTAL_OBJ + '/' + TOTAL_OBJ + '), done.\n' +
+    'remote: Compressing objects: 100% (1204/1204), done.\n' +
+    'Receiving objects: ' + padPct + '% (' + recv + '/' + TOTAL_OBJ + '), ' +
+    mib.toFixed(1) + ' MiB | ' + speed.toFixed(1) + ' MiB/s';
+
+  return {
+    running: true,
+    started_at: '2026-07-25 08:12:04',
+    elapsed_sec: elapsed,
+    log_tail: logTail,
   };
 }
 
@@ -835,7 +1050,26 @@ export function mockChart(opts) {
     indicators[key] = type === 'EMA' ? emaSeries(c, period) : smaSeries(c, period);
   }
 
-  return { code, name, n, t, o, h, l, c, v, amt, indicators, markers, bands, levels };
+  // 6) 구간 에코: 실제로 만든 봉의 범위와, 호출자가 요청했던 범위를 함께 돌려준다.
+  const startEcho = ymdIntToDash(t[0]);
+  const endEcho = ymdIntToDash(t[n - 1]);
+  const reqStart = o0.start === undefined || o0.start === null ? null : String(o0.start);
+  const reqEnd = o0.end === undefined || o0.end === null ? null : String(o0.end);
+
+  // 요청 봉 수가 실제 생성분보다 많거나, 요청 구간이 생성 구간 밖으로 나가면 잘렸다고 표시한다.
+  let truncated = false;
+  const reqN = Number(o0.n);
+  if (isFinite(reqN) && reqN > n) truncated = true;
+  if (reqStart && reqStart < startEcho) truncated = true;
+  if (reqEnd && reqEnd > endEcho) truncated = true;
+
+  return {
+    code, name, n, t, o, h, l, c, v, amt, indicators, markers, bands, levels,
+    start: startEcho,
+    end: endEcho,
+    requested: { start: reqStart, end: reqEnd },
+    truncated,
+  };
 }
 
 /* ────────────────────────────── 4-5. POST /api/backtest ────────────────────────────── */
@@ -1100,10 +1334,56 @@ export function mockBacktest(strategy) {
     });
   }
 
+  // ── 실행 가정(assumptions): engine/backtest.py make_assumptions 와 같은 모양.
+  const market = (strategy && strategy.market) || {};
+  const execution = (strategy && strategy.execution) || {};
+  const requestedResolution = String(market.trade_resolution || execution.resolution || '1d');
+  const fillModel = String(execution.fill_model || 'touch');
+  const sameDayExit = String(execution.same_day_exit || 'loss_only');
+  const slippagePct =
+    typeof execution.slippage_pct === 'number' ? execution.slippage_pct : 0.1;
+  const feePct = typeof execution.fee_pct === 'number' ? execution.fee_pct : 0.23;
+
+  let exitIds = orderExitIds(strategy && strategy.exits, strategy && strategy.exit_priority);
+  if (exitIds.length === 0) exitIds = ['SL', 'TP'];
+
+  // stats 는 반드시 trades 배열과 앞뒤가 맞아야 한다(UI 경고 상태를 보려고 0이 아닌 값을 쓴다).
+  const sameDayCount = Math.min(trades.length, Math.max(1, Math.round(trades.length * 0.15)));
+  const assumptionStats = {
+    same_day_entry_exit: sameDayCount,
+    same_day_entry_exit_pct: trades.length ? round((sameDayCount / trades.length) * 100, 1) : 0,
+    ambiguous_bars: sameDayCount + 3,
+  };
+
+  const assumptions = {
+    resolution: '1d',
+    requested_resolution: requestedResolution,
+    fill_model: fillModel,
+    same_day_exit: sameDayExit,
+    slippage_pct: slippagePct,
+    fee_pct: feePct,
+    exit_priority: exitIds,
+    notes: assumptionNotes(
+      requestedResolution, fillModel, sameDayExit, slippagePct, feePct, exitIds, assumptionStats
+    ),
+    stats: assumptionStats,
+  };
+
+  // 경고: 1분봉 근사 문구는 ARCHITECTURE 2장이 요구하므로 항상 남긴다.
+  // same_day_exit=always 경고는 backtest.py 와 같은 조건에서만 덧붙인다.
+  const warnings = [WARN_1M_APPROX];
+  if (sameDayExit === 'always') {
+    warnings.push(
+      'same_day_exit=always 는 진입 당일 익절을 허용합니다. ' +
+        '일봉만으로는 저가·고가 순서를 알 수 없어 성과가 실제보다 좋게 나올 수 있습니다.'
+    );
+  }
+
   return {
     run_id: 'r_20260725_081204',
     elapsed_sec: 2.31,
-    warnings: [WARN_1M_APPROX],
+    warnings: warnings,
+    assumptions: assumptions,
     metrics: {
       total_return_pct: totalReturnPct,
       cagr_pct: cagr,

@@ -30,6 +30,7 @@ ASSUMPTION_KEYS = {
 }
 ASSUMPTION_STAT_KEYS = {
     "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
+    "same_day_profit_exits_blocked",
 }
 METRIC_KEYS = {
     "total_return_pct", "cagr_pct", "mdd_pct", "sharpe", "win_rate_pct",
@@ -228,7 +229,7 @@ def test_warns_about_1m_resolution(strategy1, tp_store):
 
 def test_assumption_notes_change_with_mode(strategy1, tp_store):
     for mode, needle in [
-        ("loss_only", "손절 계열만 평가"),
+        ("loss_only", "이익이 나는 청산을 모두 다음 거래일로 미루고"),
         ("never", "어떤 청산도 평가하지 않고"),
         ("always", "실제보다 좋게 나올 수 있습니다"),
     ]:
@@ -549,14 +550,82 @@ def test_deferred_exit_is_logged(strategy1, dates):
                for s in res["signals"])
 
 
-def test_untyped_exit_rule_is_treated_as_loss_side(strategy1, dates):
-    """type 이 없는 커스텀 청산은 loss_only 에서 당일 평가를 허용한다 (보수적)."""
+def test_loss_only_ignores_rule_type(strategy1, dates):
+    """판정은 type 이 아니라 체결가 기준이다 — type 을 떼도 결과가 같아야 한다."""
+    base = run_backtest(_mode(strategy1, "loss_only"), _same_day_tp_store(dates))
     s = _mode(strategy1, "loss_only")
     for r in s["exits"]:
-        if r["id"] == "TP":
-            r.pop("type")
-    res = run_backtest(s, _same_day_tp_store(dates))
-    assert res["trades"][0]["exit_date"] == dates[B2_BAR].isoformat()
+        r.pop("type", None)
+    untyped = run_backtest(s, _same_day_tp_store(dates))
+    assert untyped["trades"][0]["exit_date"] == base["trades"][0]["exit_date"]
+    assert untyped["trades"][0]["exit_date"] > dates[B2_BAR].isoformat()   # 이익이므로 이월
+
+
+# --------------------------------------------------------------------------------------
+# ★ 라벨은 손절인데 체결가가 평단 위인 경우 (전략1의 45일선 손절이 실제로 이렇다)
+# --------------------------------------------------------------------------------------
+
+
+def _sl_above_avg_store(dates):
+    """45일선을 진입가 **위**에 두어, SL 규칙이 사실상 익절로 동작하게 만든 프레임."""
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100010", "테스트에이", "tp", dates)   # Amount 스케줄(기준일 1,200억) 재사용
+    # 워밍업 100봉을 6,000 평보합으로 덮어써 MA45 를 6,000 근처로 올린다
+    f.loc[: REF_BAR - 1, ["Open", "High", "Low", "Close"]] = [6000.0, 6050.0, 5950.0, 6000.0]
+    f.loc[REF_BAR, ["Open", "High", "Low", "Close"]] = [4000.0, 4100.0, 3900.0, 3950.0]
+    # 기준일 다음 봉: 저가 3,800 ≤ 기준일 시가 4,000 → B1 체결. 동시에 저가 ≤ MA45 → SL 성립
+    f.loc[REF_BAR + 1, ["Open", "High", "Low", "Close"]] = [4050.0, 4200.0, 3800.0, 3900.0]
+    f.loc[REF_BAR + 2, ["Open", "High", "Low", "Close"]] = [3900.0, 3950.0, 3700.0, 3750.0]
+    f.loc[REF_BAR + 3:, ["Open", "High", "Low", "Close"]] = [3750.0, 3800.0, 3700.0, 3750.0]
+    return FakeStore([f])
+
+
+def test_profitable_stop_loss_is_blocked_on_entry_day(strategy1, dates):
+    """type 은 stop_loss 지만 체결가가 평단 위 → loss_only 는 당일 차단하고 이월한다."""
+    entry_day = dates[REF_BAR + 1].isoformat()
+
+    # always: 진입 당일에 그대로 체결되고, 손절 규칙인데 **이익**으로 끝난다
+    a = run_backtest(_mode(strategy1, "always"), _sl_above_avg_store(dates))["trades"][0]
+    assert a["exit_rule"] == "SL"
+    assert a["exit_date"] == entry_day
+    assert a["pnl"] > 0, "이 픽스처는 '이익 나는 손절'이어야 한다"
+    assert a["exit_price"] > a["avg_price"]
+
+    # loss_only: 같은 봉인데 차단 → 다음 거래일에 손실로 청산
+    res = run_backtest(_mode(strategy1, "loss_only"), _sl_above_avg_store(dates))
+    t = res["trades"][0]
+    assert t["exit_rule"] == "SL"
+    assert t["exit_date"] == dates[REF_BAR + 2].isoformat()
+    assert t["pnl"] < 0
+    assert res["assumptions"]["stats"]["same_day_profit_exits_blocked"] == 1
+    assert res["assumptions"]["stats"]["ambiguous_bars"] >= 1
+    assert any("이월" in s["message"] for s in res["signals"])
+
+    # never 도 같은 결과 (모두 차단)
+    n = run_backtest(_mode(strategy1, "never"), _sl_above_avg_store(dates))["trades"][0]
+    assert n["exit_date"] == t["exit_date"]
+
+
+def test_loss_side_exit_still_allowed_same_day(strategy1, dates):
+    """순손익이 손실이면 진입 당일에도 통과한다 (차단 카운터도 안 올라간다)."""
+    res = run_backtest(_mode(strategy1, "loss_only"), _same_day_sl_store(dates))
+    t = res["trades"][0]
+    assert t["exit_date"] == dates[B2_BAR].isoformat()
+    assert t["pnl"] < 0
+    assert res["assumptions"]["stats"]["same_day_profit_exits_blocked"] == 0
+
+
+def test_always_never_blocks_nothing(strategy1, dates):
+    for store in (_same_day_tp_store(dates), _sl_above_avg_store(dates)):
+        res = run_backtest(_mode(strategy1, "always"), store)
+        assert res["assumptions"]["stats"]["same_day_profit_exits_blocked"] == 0
+
+
+def test_blocked_count_appears_in_notes(strategy1, dates):
+    res = run_backtest(_mode(strategy1, "loss_only"), _sl_above_avg_store(dates))
+    assert any("이익으로 청산될 수 있었지만" in n for n in res["assumptions"]["notes"])
+    assert any("체결가 기준" in n for n in res["assumptions"]["notes"])
 
 
 def test_same_day_stats(strategy1, dates):

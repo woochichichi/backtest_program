@@ -519,11 +519,19 @@ def _sync_snapshot() -> Dict[str, Any]:
 
 
 def _clean_log(raw: bytes) -> str:
-    """git 진행 표시는 \\r 로 갱신되므로 줄바꿈으로 정규화한다."""
-    text = _decode(raw)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln.rstrip() for ln in text.split("\n")]
-    return "\n".join(ln for ln in lines if ln.strip())
+    """git 진행 표시 정규화.
+
+    git 은 ``Receiving objects: 12%\\rReceiving objects: 43%\\r...`` 처럼 같은 줄을
+    \\r 로 덮어쓴다. 터미널이 보여주는 것과 똑같이 **마지막 프레임만** 남긴다.
+    (전부 남기면 clone 한 번에 수백 줄이 쌓여 log_tail 이 쓸모없어진다)
+    """
+    text = _decode(raw).replace("\r\n", "\n")
+    lines: List[str] = []
+    for line in text.split("\n"):
+        frames = [f for f in line.split("\r") if f.strip()]
+        if frames:
+            lines.append(frames[-1].rstrip())
+    return "\n".join(lines)
 
 
 def _run_sync_process(cmd: List[str]) -> Tuple[int, str]:
@@ -1406,6 +1414,23 @@ def _requested_date(value: Optional[str]) -> Optional[_dt.date]:
         return None
 
 
+def _store_range_arg(value: Optional[str], label: str) -> Optional[str]:
+    """store.bars() 에 넘길 값. 'auto'/빈값은 None(=제한 없음)으로 바꾼다.
+
+    프런트는 period.end 를 그대로 'auto' 로 보내므로 반드시 걸러야 한다.
+    """
+    text = (value or "").strip()
+    if not text or text.lower() == "auto":
+        return None
+    if _requested_date(text) is None:
+        raise ApiError(
+            400,
+            f"{label} 날짜 형식이 올바르지 않습니다: {text}",
+            "YYYY-MM-DD 형식이거나 'auto' 여야 합니다.",
+        )
+    return text
+
+
 def _iso_from_yyyymmdd(value: Optional[int]) -> Optional[str]:
     if value is None:
         return None
@@ -1431,8 +1456,12 @@ def api_chart(
         auto_picked = True
 
     store = get_store()
+    store_start = _store_range_arg(start, "start")
+    store_end = _store_range_arg(end, "end")
     try:
-        df = store.bars(code, start=start, end=end)
+        df = store.bars(code, start=store_start, end=store_end)
+    except ApiError:
+        raise
     except Exception as exc:
         if _is_data_unavailable(exc):
             raise ApiError(503, MSG_NO_DATA, str(exc)) from exc

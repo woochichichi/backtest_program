@@ -12,6 +12,9 @@
 /.venv/
 /venv/
 
+# 전략 저장 시 자동 백업 (서버가 생성)
+/strategies/.bak/
+
 # 캐시
 /cache/
 __pycache__/

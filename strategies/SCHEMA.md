@@ -237,8 +237,13 @@ B1만 체결된 상태에서 다음 날 B2가 체결되면, B2 체결일에도 �
 > `same_day_exit` 을 `always` 로 되돌리면 된다.
 
 백테스트 결과의 `assumptions` 블록에 실제로 적용된 값과 사람이 읽을 수 있는 설명(`notes`),
-그리고 순서를 알 수 없어 가정에 의존한 봉의 개수(`stats.ambiguous_bars`)가 함께 담겨 나온다.
-`ambiguous_bars` 가 많으면 그 결과는 가정에 크게 의존한다는 뜻이다.
+그리고 아래 통계가 함께 담겨 나온다.
+
+| `assumptions.stats` | 의미 |
+|---|---|
+| `ambiguous_bars` | 진입과 청산이 같은 봉 안에서 모두 성립해 **순서를 알 수 없었던** 봉의 수. 많을수록 결과가 가정에 크게 의존한다 |
+| `same_day_profit_exits_blocked` | 그중 `loss_only`/`never` 규칙 때문에 **당일 이익 청산이 차단되어** 다음 거래일로 넘어간 건수. 이 옵션이 실제로 얼마나 작동했는지를 보여준다 |
+| `same_day_entry_exit` / `_pct` | 진입일과 청산일이 같은 거래 수와 비중 |
 
 ---
 
