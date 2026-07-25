@@ -2,9 +2,12 @@
    main.js — 부트스트랩 / 애플리케이션 상태
    ------------------------------------------------------------
    흐름:
-     status → indicators → strategies → strategy → chart
-     [백테스트 실행] → 우측 KPI · 곡선 · 하단 표 갱신
-   에러는 절대 삼키지 않는다. 무엇을 해야 하는지 한국어 배너로 띄운다.
+     status → (필요하면 자동 시세 갱신) → indicators → strategies → strategy → chart
+     [백테스트 실행] → 실행 기준 · KPI · 곡선 · 거래 내역 갱신
+
+   피드백 원칙:
+     모든 비동기 동작은 대기/진행/성공/실패 네 가지 상태를 모두 화면에 드러낸다.
+     성공은 토스트, 실패는 사라지지 않는 배너. 실패는 항상 "다음에 할 일"을 함께 쓴다.
    ============================================================ */
 
 import * as api from './api.js';
@@ -14,6 +17,7 @@ import { CandleChart, MiniChart } from './chart.js';
 import * as P from './panels.js';
 
 const $ = (id) => document.getElementById(id);
+const LS_AUTOSYNC = 'autoSyncOnStart';
 
 /* ---------------- 상태 ---------------- */
 const S = {
@@ -26,19 +30,32 @@ const S = {
   specs: [],               // /api/indicators
   active: [],              // 화면에 그릴 지표 인스턴스
   result: null,            // /api/backtest 응답
+  ran: false,              // 백테스트를 한 번이라도 끝냈는가 (빈 상태 문구 분기)
   tradeNo: 0,
   rangeMonths: 6,
   symbol: { code: '', name: '' },
   running: false,
+  syncing: false,
+  syncFailed: false,
+  abort: null,             // 실행 중인 백테스트의 AbortController
   chart: null, eq: null, mo: null,
 };
 
 /* ---------------- 공통 유틸 ---------------- */
 
 const ymdInt = (s) => Number(String(s || '').replace(/-/g, '')) || 0;
+const pad = (n) => String(n).padStart(2, '0');
+const isoOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const ymdDate = (s) => new Date(s + 'T00:00:00').getTime();
 
-function pad(n) { return String(n).padStart(2, '0'); }
-function isoOf(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function autoSyncEnabled() {
+  try { return localStorage.getItem(LS_AUTOSYNC) !== 'off'; } catch { return true; }
+}
+function setAutoSyncEnabled(on) {
+  try { localStorage.setItem(LS_AUTOSYNC, on ? 'on' : 'off'); } catch { /* 저장 불가 환경 */ }
+  const el = $('optAutoSync');
+  if (el) el.checked = on;
+}
 
 /** 조회 기간 계산. months=0 이면 전체. */
 function rangeParams() {
@@ -50,23 +67,24 @@ function rangeParams() {
   const end = new Date(endStr + 'T00:00:00');
   const start = new Date(end);
   start.setMonth(start.getMonth() - S.rangeMonths);
-  // 폴백 mockdata 가 만들 봉 수 (영업일 ≈ 21/월)
   return { start: isoOf(start), end: endStr, n: Math.round(S.rangeMonths * 21) };
 }
 
-/** 예상치 못한 실패를 화면에 드러낸다 */
+/**
+ * 실패를 화면에 드러낸다.
+ * error 는 크게, 조치는 그 아래, 기술적 detail 은 "자세히" 안에.
+ */
 function handleError(e, ctx) {
+  if (e && e.aborted) return;                 // 사용자가 취소한 건 오류가 아니다
   console.error(`[${ctx}]`, e);
   const isApi = e instanceof ApiError;
-  const msg = isApi ? e.message : (e && e.message) || String(e);
-  const how = isApi && e.howTo ? e.howTo : '';
-  P.banner('err-' + ctx, isApi && e.offline ? 'warn' : 'err',
-    `<b>${P.esc(ctx)}</b> — ${P.esc(msg)}${how ? `<br>${P.esc(how)}` : ''}`);
-  P.toast(msg, 'err', 4200);
+  const tone = isApi && (e.kind === 'network' || e.kind === 'nodata' || e.kind === 'slow') ? 'warn' : 'err';
+  P.banner('err-' + ctx, tone, P.errorHtml(e, ctx));
+  P.toast((e && e.message) || String(e), 'err', 4200);
 }
 
 /* ============================================================
-   1. 데이터 상태
+   1. 데이터 상태 · 시세 갱신
    ============================================================ */
 
 async function loadStatus() {
@@ -74,79 +92,188 @@ async function loadStatus() {
     const st = await api.getStatus();
     S.status = st;
     applyStatus(st);
-    P.clearBanner('err-데이터 상태 조회');
+    P.clearBanner('err-데이터 상태 확인');
+    return st;
   } catch (e) {
-    handleError(e, '데이터 상태 조회');
+    handleError(e, '데이터 상태 확인');
     P.renderDataStatus(null);
+    return null;
   }
 }
 
 function applyStatus(st) {
-  $('lastSync').textContent = st.last_sync || '—';
+  const f = P.freshness(st.last_sync);
+  // 색만으로 전달하지 않기 위해 신선도 텍스트를 항상 함께 쓴다
+  $('freshLabel').textContent = st.available === false ? '없음' : f.label;
+  $('lastSync').textContent = st.last_sync ? String(st.last_sync).slice(0, 16) : '';
   $('lastTrade').textContent = st.latest_trade_date || '—';
-  const auto = st.auto_sync || {};
-  $('autoTime').textContent = auto.time || '미등록';
-  $('autoSync').checked = !!auto.registered;
-
-  const dot = $('dataDot');
-  dot.className = 'dot' + (st.available === false ? ' err' : (st.result === 'stale' ? ' stale' : ''));
+  $('dataDot').className = 'dot' + (st.available === false ? ' err' : (f.tone === 'ok' ? '' : ' ' + f.tone));
+  $('pillSync').title = st.available === false
+    ? '주가 데이터가 아직 없습니다'
+    : `마지막으로 시세를 받은 시각: ${st.last_sync || '기록 없음'} (${f.label})`;
 
   P.renderDataStatus(st, api.isFallback() ? api.fallbackNote() : '');
 
   if (st.available === false) {
     P.banner('no-data', 'err',
-      '<b>marcap 데이터가 없습니다.</b> 종목 데이터 없이는 백테스트를 실행할 수 없습니다.<br>' +
-      '프로젝트 폴더에서 <code>update_marcap.bat</code> 을 실행해 저장소를 내려받은 뒤 이 페이지를 새로고침하세요.',
+      '<b>주가 데이터가 아직 없습니다.</b> 데이터 없이는 백테스트를 실행할 수 없습니다.<br>' +
+      '프로젝트 폴더에서 <code>update_marcap.bat</code> 을 실행해 데이터를 내려받은 뒤 이 화면을 새로고침하세요. ' +
+      '용량이 약 1.8GB 라 처음 한 번은 시간이 걸립니다.',
       false);
   } else {
     P.clearBanner('no-data');
   }
+  updateNextStep();
 }
 
-async function doSync(btn) {
+/**
+ * 시세 갱신. 화면을 막지 않는다.
+ * @param {object} o {auto:boolean}
+ */
+async function startSync(o = {}) {
+  if (S.syncing) { P.toast('이미 시세를 받는 중입니다.'); return; }
+  S.syncing = true;
+  S.syncFailed = false;
+
+  const btn = $('btnSync');
   btn.classList.add('spin'); btn.disabled = true;
-  P.progress(null);
+  $('btnSyncLabel').textContent = '받는 중…';
   $('dataDot').className = 'dot stale';
+  P.progress(null);
+
+  const t0 = Date.now();
+  let logTail = '';
+  const paint = () => {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    P.banner('sync', 'info',
+      `<div class="sync-line"><span class="spinner" aria-hidden="true"></span>` +
+      `<b>${o.auto ? '오늘 시세를 받는 중입니다' : '시세를 받는 중입니다'}</b>` +
+      `<span class="sync-el">${sec}초 경과</span></div>` +
+      `<div style="font-size:12px;color:var(--tx-sub);margin-top:2px">받는 동안에도 화면은 그대로 쓸 수 있습니다.</div>` +
+      (logTail ? `<code class="sync-log">${P.esc(logTail)}</code>` : ''),
+      false);
+  };
+  paint();
+  const tick = setInterval(paint, 1000);
+
+  // 서버가 진행 상황을 알려 주면 log_tail 까지 보여 준다
+  let poll = 0;
+  if (api.hasFeature('sync_status', false)) {
+    poll = setInterval(async () => {
+      const s = await api.getSyncStatus();
+      if (s && s.log_tail) { logTail = String(s.log_tail).split('\n').slice(-3).join('\n'); paint(); }
+    }, 2000);
+  }
+
   try {
     const st = await api.postSync();
     S.status = st;
     applyStatus(st);
-    P.toast(`데이터 갱신 완료 — 최신 거래일 ${st.latest_trade_date || '—'}`, 'ok');
-    P.clearBanner('err-데이터 갱신');
+    P.clearBanner('sync');
+    P.clearBanner('sync-failed');
+    P.toast(`시세를 받았습니다 — 최신 거래일 ${st.latest_trade_date || '—'}`, 'ok', 3600);
   } catch (e) {
-    handleError(e, '데이터 갱신');
+    S.syncFailed = true;
+    const f = P.freshness(S.status && S.status.last_sync);
+    P.clearBanner('sync');
+    // 실패해도 앱은 계속 쓸 수 있다. 다만 어느 시점 데이터인지 분명히 밝힌다.
+    P.banner('sync-failed', 'warn',
+      `<b>오늘 시세를 받지 못했습니다. 지금은 ${P.esc(f.label)} 받은 데이터로 보고 있습니다.</b><br>` +
+      P.errorHtml(e), false);
+    P.toast('시세 갱신 실패 — 이전 데이터로 계속 사용합니다.', 'err', 4200);
     $('dataDot').className = 'dot err';
   } finally {
+    clearInterval(tick);
+    if (poll) clearInterval(poll);
+    S.syncing = false;
     btn.classList.remove('spin'); btn.disabled = false;
+    $('btnSyncLabel').textContent = '지금 갱신';
     P.progress(false);
+    updateNextStep();
   }
 }
 
-/** 브라우저는 Windows 작업 스케줄러를 건드릴 수 없다 → 실행 방법을 안내한다 */
-function explainAutoSync(wantOn) {
-  const reg = !!(S.status && S.status.auto_sync && S.status.auto_sync.registered);
-  $('autoSync').checked = reg;   // 토글을 원래대로 되돌린다
-  P.modal(
-    wantOn ? '매일 자동 갱신 등록' : '매일 자동 갱신 해제',
-    `<p>브라우저에서는 Windows 작업 스케줄러를 직접 등록하거나 해제할 수 없습니다.
-     아래 배치 파일을 <b>관리자 권한 명령 프롬프트</b>에서 실행하세요.</p>
-     <code class="cmd">${wantOn ? 'setup_daily_update.bat' : 'remove_daily_update.bat'}</code>
-     <p>실행한 뒤 이 페이지를 새로고침하면 상태가 반영됩니다.
-     현재 등록 상태: <b>${reg ? '등록됨' : '미등록'}</b>${reg && S.status.auto_sync.time ? ` (매일 ${P.esc(S.status.auto_sync.time)})` : ''}.</p>`,
-    [{ label: '상태 새로고침', onClick: loadStatus }, { label: '닫기', primary: true }],
-  );
+/**
+ * 켤 때 자동 갱신.
+ * · available:false → 최초 1.8GB 다운로드라 자동으로 하지 않는다 (안내만)
+ * · 오늘 이미 받았으면 하지 않는다
+ */
+function maybeAutoSync() {
+  if (!S.status || S.status.available === false) return;
+  if (!autoSyncEnabled()) return;
+  if (P.freshness(S.status.last_sync).fresh) return;
+  startSync({ auto: true });   // 일부러 await 하지 않는다 — 화면을 막지 않기 위해
+}
+
+/** 톱니 → 데이터 받기 설정. 두 가지 자동 갱신의 차이를 한 줄로 구분해 준다. */
+function openSettings() {
+  const auto = (S.status && S.status.auto_sync) || {};
+  const on = autoSyncEnabled();
+  P.modal('데이터 받기 설정',
+    `<label class="opt" style="margin-bottom:14px">
+       <span class="sw"><input type="checkbox" id="dlgAuto"${on ? ' checked' : ''}><i></i></span>
+       <span class="opt-tx"><b>켤 때 자동으로 시세 받기</b>
+         <span>프로그램을 열었을 때 오늘 시세를 아직 안 받았으면 자동으로 받습니다.
+         이미 받아 둔 데이터를 갱신하는 것이라 보통 몇 초면 끝나고, 받는 동안에도 화면은 그대로 쓸 수 있습니다.</span>
+       </span>
+     </label>
+     <div style="border-top:1px dashed var(--bd);padding-top:12px">
+       <b style="font-size:12.5px">매일 정해진 시각에 자동으로 받기</b>
+       <p style="font-size:12px;color:var(--tx-sub);margin-top:3px">
+         현재 상태: <b>${auto.registered ? `등록됨 (매일 ${P.esc(auto.time || '')})` : '등록 안 됨'}</b>
+       </p>
+       <p style="font-size:12px;color:var(--tx-sub);margin-top:6px">
+         이건 <b>프로그램을 켜지 않아도</b> 컴퓨터가 정해진 시각에 알아서 받는 기능입니다.
+         위의 '켤 때 자동으로 받기'는 <b>프로그램을 열었을 때만</b> 동작하니 서로 다른 기능입니다.
+       </p>
+       <p style="font-size:12px;color:var(--tx-sub);margin-top:6px">
+         브라우저에서는 Windows 작업 스케줄러를 건드릴 수 없어, 아래 파일을
+         <b>관리자 권한 명령 프롬프트</b>에서 직접 실행해야 합니다.
+       </p>
+       <code class="cmd">${auto.registered ? 'remove_daily_update.bat' : 'setup_daily_update.bat'}</code>
+     </div>`,
+    [
+      { label: '상태 새로고침', onClick: loadStatus },
+      { label: '확인', primary: true, onClick: () => setAutoSyncEnabled($('dlgAuto').checked) },
+    ]);
 }
 
 /* ============================================================
-   2. 지표
+   2. 지금 할 일 안내
+   ============================================================ */
+
+function updateNextStep() {
+  if (!S.status) return;
+  if (S.status.available === false) {
+    P.renderNextStep({
+      num: '1', tone: 'err',
+      title: '먼저 주가 데이터를 받아야 합니다',
+      desc: '프로젝트 폴더의 <code>update_marcap.bat</code> 을 두 번 눌러 실행한 뒤, 이 화면을 새로고침하세요. 약 1.8GB 라 처음 한 번은 몇 분 걸립니다.',
+    });
+    return;
+  }
+  if (!S.ran) {
+    P.renderNextStep({
+      num: '1', tone: 'info',
+      title: '왼쪽에서 전략을 고르고 [백테스트 실행] 을 누르세요',
+      desc: '조건을 바꾸고 싶으면 왼쪽 파라미터를 수정하면 됩니다. 실행하면 언제 사고팔았는지와 수익률이 나옵니다.',
+      action: { label: '백테스트 실행', act: 'run' },
+    });
+    return;
+  }
+  P.renderNextStep(null);   // 한 번 실행한 뒤에는 안내를 치운다
+}
+
+/* ============================================================
+   3. 지표
    ============================================================ */
 
 async function loadIndicators() {
   try {
     S.specs = await api.listIndicators();
-    P.clearBanner('err-지표 목록 조회');
+    P.clearBanner('err-지표 목록 확인');
   } catch (e) {
-    handleError(e, '지표 목록 조회');
+    handleError(e, '지표 목록 확인');
     S.specs = [];
   }
 }
@@ -155,7 +282,6 @@ function specOf(type) {
   return S.specs.find((s) => s.key === type) || { key: type, label: type, params: [], overlay: true };
 }
 
-/** strategy.indicators → 화면/차트용 인스턴스 배열 */
 function rebuildActive() {
   const list = (S.draft && Array.isArray(S.draft.indicators)) ? S.draft.indicators : [];
   S.active = list
@@ -178,16 +304,15 @@ function rebuildActive() {
 function drawChips() {
   P.renderChips(S.specs, S.active, {
     onToggleActive: (key) => {
-      const idx = S.active.findIndex((a) => a.key === key);
-      if (idx < 0) return;
-      const a = S.active[idx];
+      const a = S.active.find((x) => x.key === key);
+      if (!a) return;
       S.draft.indicators = (S.draft.indicators || []).filter((e) => {
         const spec = specOf(e.type || e.key);
         const params = {};
         for (const p of spec.params || []) params[p.name] = (e[p.name] ?? p.default);
         return P.indKey(spec, params) !== a.key;
       });
-      afterIndicatorChange();
+      afterIndicatorChange(`${a.label} 숨김`);
     },
     onAddDefault: (type) => {
       const spec = specOf(type);
@@ -195,30 +320,30 @@ function drawChips() {
       for (const p of spec.params || []) entry[p.name] = p.default;
       entry.key = P.indLabel(spec, entry);
       (S.draft.indicators ||= []).push(entry);
-      afterIndicatorChange();
+      afterIndicatorChange(`${entry.key} 표시`);
     },
     onAdd: openIndicatorDialog,
   }, (slot) => (S.chart ? S.chart.slotColor(slot) : 'currentColor'));
 }
 
-function afterIndicatorChange() {
+function afterIndicatorChange(msg) {
   markDirty();
   rebuildActive();
   drawChips();
   P.renderJson(S.draft);
+  if (msg) P.toast(msg, 'ok', 1600);
   loadChart();
 }
 
-/** "+ 지표 추가" — 파라미터 입력 다이얼로그 */
 function openIndicatorDialog() {
   if (!S.specs.length) {
-    P.modal('지표 목록 없음',
-      '<p>서버에서 지표 목록을 받지 못했습니다. <code>GET /api/indicators</code> 응답을 확인하세요.</p>');
+    P.modal('지표 목록을 받지 못했습니다',
+      '<p>프로그램 서버에서 지표 목록을 받지 못했습니다. 서버가 켜져 있는지 확인한 뒤 화면을 새로고침하세요.</p>');
     return;
   }
   const opts = S.specs.map((s) => `<option value="${P.esc(s.key)}">${P.esc(s.label || s.key)} (${P.esc(s.key)})</option>`).join('');
   P.modal('지표 추가',
-    `<p>추가할 지표와 파라미터를 지정하세요. 목록은 <code>GET /api/indicators</code> 응답에서 가져옵니다.</p>
+    `<p>차트에 함께 그릴 지표를 고르세요. 목록은 프로그램이 실제로 계산할 수 있는 지표만 보여 줍니다.</p>
      <div class="fld"><label for="dlgType"><b>지표</b></label>
        <select class="inp wide" id="dlgType">${opts}</select><span class="unit"></span></div>
      <div id="dlgParams"></div>`,
@@ -226,8 +351,7 @@ function openIndicatorDialog() {
       { label: '취소' },
       {
         label: '추가', primary: true, keepOpen: true, onClick: () => {
-          const type = $('dlgType').value;
-          const spec = specOf(type);
+          const spec = specOf($('dlgType').value);
           const entry = { key: '', type: spec.key, plot: true };
           for (const p of spec.params || []) {
             const el = $('dlgP_' + p.name);
@@ -239,8 +363,7 @@ function openIndicatorDialog() {
           entry.key = P.indLabel(spec, entry);
           (S.draft.indicators ||= []).push(entry);
           P.closeModal();
-          afterIndicatorChange();
-          P.toast(`${entry.key} 추가됨`, 'ok');
+          afterIndicatorChange(`${entry.key} 추가됨`);
         },
       },
     ]);
@@ -257,47 +380,61 @@ function openIndicatorDialog() {
         <input class="inp" id="dlgP_${P.esc(p.name)}" type="number"
           value="${P.esc(p.default)}"${p.min !== undefined ? ` min="${P.esc(p.min)}"` : ''}${p.max !== undefined ? ` max="${P.esc(p.max)}"` : ''}${p.step !== undefined ? ` step="${P.esc(p.step)}"` : ''}>
         <span class="unit"></span></div>`;
-    }).join('') || '<p class="hint">이 지표는 파라미터가 없습니다.</p>';
+    }).join('') || '<p class="hint">이 지표는 따로 정할 값이 없습니다.</p>';
   };
   $('dlgType').addEventListener('change', paint);
   paint();
 }
 
 /* ============================================================
-   3. 전략
+   4. 전략
    ============================================================ */
 
 async function loadStrategies(selectId) {
+  P.renderStrategyListLoading();
   try {
     S.strategies = await api.listStrategies();
-    P.clearBanner('err-전략 목록 조회');
+    P.clearBanner('err-전략 목록 확인');
   } catch (e) {
-    handleError(e, '전략 목록 조회');
+    handleError(e, '전략 목록 확인');
     S.strategies = [];
   }
   const id = selectId || S.strategyId || (S.strategies[0] && S.strategies[0].id);
-  P.renderStrategyList(S.strategies, id, selectStrategy);
+  P.renderStrategyList(S.strategies, id, requestSelectStrategy);
   if (id && id !== S.strategyId) await selectStrategy(id);
+  else P.renderStrategyList(S.strategies, S.strategyId, requestSelectStrategy);
+}
+
+/** 저장 안 된 변경이 있으면 확인 모달을 띄운 뒤 전환한다 */
+function requestSelectStrategy(id) {
+  if (id === S.strategyId) return;
+  if (!S.dirty) { selectStrategy(id); return; }
+  const target = S.strategies.find((x) => x.id === id);
+  P.modal('저장하지 않은 변경이 있습니다',
+    `<p>지금 <b>${P.esc((S.draft && S.draft.name) || S.strategyId)}</b> 의 파라미터를 고쳤지만 아직 저장하지 않았습니다.</p>
+     <p><b>${P.esc((target && target.name) || id)}</b> 로 넘어가면 이 변경은 사라집니다.</p>`,
+    [
+      { label: '취소' },
+      { label: '저장하고 이동', onClick: async () => { await saveStrategy({ silent: true }); selectStrategy(id); } },
+      { label: '버리고 이동', primary: true, onClick: () => selectStrategy(id) },
+    ]);
 }
 
 async function selectStrategy(id) {
-  if (S.dirty && id !== S.strategyId) {
-    // 저장하지 않은 편집이 있으면 알려 준다 (조용히 버리지 않는다)
-    const go = window.confirm('저장하지 않은 파라미터 변경이 있습니다. 버리고 다른 전략을 열까요?');
-    if (!go) { P.renderStrategyList(S.strategies, S.strategyId, selectStrategy); return; }
-  }
   S.strategyId = id;
-  P.renderStrategyList(S.strategies, id, selectStrategy);
+  P.renderStrategyList(S.strategies, id, requestSelectStrategy);
   try {
     const st = await api.getStrategy(id);
     S.strategy = st;
     S.draft = structuredClone(st);
-    S.dirty = false;
-    P.markTabDirty('pnJson', false);
+    setDirty(false);
     P.fillForm(S.draft);
+    P.renderFieldHints();
+    checkForm();
     rebuildActive();
     drawChips();
     P.renderJson(S.draft);
+    syncResolutionNote();
     P.clearBanner('err-전략 불러오기');
     await loadChart();
   } catch (e) {
@@ -305,28 +442,78 @@ async function selectStrategy(id) {
   }
 }
 
-function markDirty() {
-  S.dirty = true;
-  P.markTabDirty('pnJson', true);
+function setDirty(on) {
+  S.dirty = on;
+  P.markTabDirty('pnJson', on);
+  P.setDirtyBadge(on);
+  $('btnRevert').disabled = !on;
 }
+function markDirty() { setDirty(true); }
 
-/** 폼 → draft 반영 (300ms 디바운스 후 호출됨) */
+/** 폼 → draft 반영 (300ms 디바운스) */
 function onFormChange() {
   if (!S.draft) return;
   S.draft = P.readForm(S.draft);
   markDirty();
   P.renderJson(S.draft);
+  checkForm();
+  syncResolutionNote();
 }
 
-async function saveStrategy() {
+/** 프런트에서 즉시 잡을 수 있는 문제를 인라인으로 보여 준다 */
+function checkForm() {
+  const issues = P.formIssues();
+  P.showFormIssues(issues);
+  const errs = issues.filter((i) => i.level === 'err').length;
+  $('btnSave').classList.toggle('btn-danger', errs > 0);
+  return issues;
+}
+
+/**
+ * 전략 JSON 이 1분봉을 요청하더라도 화면은 "일봉으로 실행됨"을 정확히 보여준다.
+ * 여기서 1분봉을 지원하는 듯한 인상을 주지 않는다.
+ */
+function syncResolutionNote() {
+  const sel = $('p_res');
+  const want = (S.draft && (S.draft.execution || {}).resolution) || '1d';
+  // 셀렉트는 항상 일봉으로 보인다 (1분봉 option 은 disabled)
+  sel.value = '1d';
+  const note = $('resNote');
+  note.innerHTML = want !== '1d'
+    ? `<span class="soon">추후 지원 예정</span>
+       이 전략의 JSON 에는 <b>${P.esc(want)}</b> 체결이 적혀 있지만, 분봉 데이터가 없어
+       <b>일봉으로 계산</b>합니다. 결과의 '이 결과를 읽는 법' 에 실제 적용된 기준이 표시됩니다.`
+    : `<span class="soon">추후 지원 예정</span>
+       분봉 매매는 아직 준비 중입니다. 지금은 <b>일봉</b>으로만 계산하며,
+       하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.`;
+}
+
+async function saveStrategy(o = {}) {
   if (!S.draft) return;
-  P.clearFieldErrors();
+  const issues = checkForm();
+  const errs = issues.filter((i) => i.level === 'err');
+  if (errs.length) {
+    P.focusFirstError();
+    P.toast(`고쳐야 할 값이 ${errs.length}개 있습니다.`, 'err');
+    return;
+  }
+  // 되돌릴 수 없는 덮어쓰기라 확인을 받는다
+  if (!o.silent && !o.confirmed) {
+    const diffs = P.diffStrategies(S.strategy, S.draft);
+    P.modal('이 내용으로 저장할까요?',
+      `<p><b>${P.esc(S.draft.name || S.strategyId)}</b> 파일을 덮어씁니다. 이전 값은 되돌릴 수 없습니다.</p>` +
+      P.renderDiffTable(diffs),
+      [{ label: '취소' }, { label: '저장', primary: true, onClick: () => saveStrategy({ confirmed: true }) }]);
+    return;
+  }
+
+  const btn = $('btnSave');
+  btn.disabled = true; btn.textContent = '저장 중…';
   P.progress(null);
   try {
     await api.putStrategy(S.strategyId, S.draft);
     S.strategy = structuredClone(S.draft);
-    S.dirty = false;
-    P.markTabDirty('pnJson', false);
+    setDirty(false);
     P.clearBanner('err-전략 저장');
     P.clearBanner('validate');
     P.toast('전략을 저장했습니다.', 'ok');
@@ -334,17 +521,40 @@ async function saveStrategy() {
   } catch (e) {
     if (e instanceof ApiError && e.status === 422 && e.errors) {
       const rest = P.showFieldErrors(e.errors);
+      P.focusFirstError();
       const list = rest.map((r) => `<li><code>${P.esc(r.path || '')}</code> ${P.esc(r.message || '')}</li>`).join('');
       P.banner('validate', 'err',
-        `<b>전략 검증 실패 (${e.errors.length}건)</b> — 표시된 항목을 고친 뒤 다시 저장하세요.` +
+        `<b>저장하지 못했습니다 — 값 ${e.errors.length}개를 고쳐야 합니다.</b>` +
+        '<div class="err-advice">빨간색으로 표시된 항목을 고친 뒤 다시 저장하세요.</div>' +
         (list ? `<ul>${list}</ul>` : ''));
-      P.toast(`검증 실패 ${e.errors.length}건`, 'err');
+      P.toast(`고쳐야 할 값이 ${e.errors.length}개 있습니다.`, 'err');
     } else {
       handleError(e, '전략 저장');
     }
   } finally {
+    btn.disabled = false; btn.textContent = '저장';
     P.progress(false);
   }
+}
+
+function revertStrategy() {
+  if (!S.strategy) return;
+  const diffs = P.diffStrategies(S.draft, S.strategy);
+  P.modal('저장된 값으로 되돌릴까요?',
+    '<p>마지막으로 저장된 상태로 되돌립니다. 지금 고친 내용은 사라집니다.</p>' + P.renderDiffTable(diffs),
+    [{ label: '취소' }, {
+      label: '되돌리기', primary: true, onClick: () => {
+        S.draft = structuredClone(S.strategy);
+        P.fillForm(S.draft);
+        checkForm();
+        rebuildActive(); drawChips();
+        P.renderJson(S.draft);
+        syncResolutionNote();
+        setDirty(false);
+        P.toast('저장된 값으로 되돌렸습니다.', 'ok');
+        loadChart();
+      },
+    }]);
 }
 
 async function cloneStrategy() {
@@ -352,13 +562,40 @@ async function cloneStrategy() {
   const copy = structuredClone(S.draft);
   copy.id = `${copy.id}_copy_${Date.now().toString(36)}`;
   copy.name = `${copy.name} (복사본)`;
+  const btn = $('btnClone');
+  btn.disabled = true;
   try {
     await api.createStrategy(copy);
     P.toast('전략을 복제했습니다.', 'ok');
     await loadStrategies(copy.id);
   } catch (e) {
     handleError(e, '전략 복제');
+  } finally { btn.disabled = false; }
+}
+
+function deleteStrategy() {
+  if (!S.strategyId) return;
+  if (S.strategies.length <= 1) {
+    P.modal('삭제할 수 없습니다', '<p>전략이 하나뿐입니다. 최소 한 개는 남아 있어야 합니다.</p>');
+    return;
   }
+  P.modal('전략을 삭제할까요?',
+    `<p><b>${P.esc((S.draft && S.draft.name) || S.strategyId)}</b> 를 삭제합니다.</p>
+     <p style="color:var(--danger-tx)">삭제한 전략은 되돌릴 수 없습니다. 필요하면 먼저 <b>내보내기</b>로 파일을 저장해 두세요.</p>`,
+    [
+      { label: '취소' },
+      { label: '먼저 내보내기', onClick: exportStrategy },
+      {
+        label: '삭제', primary: true, onClick: async () => {
+          try {
+            await api.deleteStrategy(S.strategyId);
+            P.toast('전략을 삭제했습니다.', 'ok');
+            S.strategyId = null; setDirty(false);
+            await loadStrategies();
+          } catch (e) { handleError(e, '전략 삭제'); }
+        },
+      },
+    ]);
 }
 
 function exportStrategy() {
@@ -369,45 +606,44 @@ function exportStrategy() {
   a.download = `${S.draft.id || 'strategy'}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  P.toast(`${a.download} 내려받기`, 'ok');
+  P.toast(`${a.download} 파일로 저장했습니다.`, 'ok');
 }
 
 function newStrategy() {
   if (!S.strategies.length && !S.draft) {
-    P.modal('새 전략', '<p>기준이 될 전략이 없습니다. 먼저 <code>strategies/</code> 폴더에 전략 JSON 을 하나 두거나, AI 전략 생성 탭을 사용하세요.</p>');
+    P.modal('새 전략', '<p>기준이 될 전략이 없습니다. AI 전략 생성 탭에서 한국어로 조건을 설명해 만들어 보세요.</p>');
     return;
   }
   cloneStrategy();
 }
 
 /* ============================================================
-   4. 차트
+   5. 차트 · 종목 검색
    ============================================================ */
 
-/**
- * @param {object} o {code, start, end, n, name}  생략하면 현재 종목 + 기간 세그먼트 값
- */
 async function loadChart(o = {}) {
   if (!S.chart) return;
   const r = rangeParams();
   const code = o.code || S.symbol.code || firstTradeCode() || '';
   const start = o.start || r.start, end = o.end || r.end, n = o.n || r.n;
+  $('chartNote').hidden = true;
 
-  // 종목이 정해지기 전에는 요청하지 않는다.
-  // (code 없이 부르면 /api/chart 가 필수 파라미터 누락으로 422 를 낸다)
+  // 종목이 정해지기 전에는 요청하지 않는다 (code 없이 부르면 서버가 422 를 낸다)
   if (!code) {
     S.chart.setData(null);
     $('symCode').textContent = '—';
-    $('symName').textContent = '종목 미선택';
-    $('chartEmpty').hidden = false;
-    $('chartEmptyMsg').textContent =
-      '표시할 종목이 없습니다. 백테스트를 실행하면 첫 거래 종목의 차트가 자동으로 표시되고, 거래 내역의 행을 클릭하면 그 구간으로 이동합니다.';
+    $('symName').textContent = '종목 선택';
+    showChartEmpty({
+      icon: 'symbol',
+      title: '아직 볼 종목이 없습니다',
+      desc: '백테스트를 실행하면 첫 거래 종목이 자동으로 뜹니다. 지금 바로 특정 종목을 보고 싶으면 종목을 골라 주세요.',
+      action: { label: '종목 고르기', act: 'pickSymbol', primary: true },
+    });
     P.renderLegend(null, [], () => '', '');
     return;
   }
 
-  $('chartEmpty').hidden = false;
-  $('chartEmptyMsg').textContent = '차트 데이터를 불러오는 중입니다…';
+  showChartEmpty({ icon: 'chart', title: '차트를 불러오는 중입니다…', desc: `${code} 의 시세를 받고 있습니다.` });
   try {
     const payload = await api.getChart({
       code, start, end, n,
@@ -416,27 +652,101 @@ async function loadChart(o = {}) {
     });
     S.symbol = { code: payload.code || code, name: payload.name || o.name || '' };
     $('symCode').textContent = S.symbol.code || '—';
-    $('symName').textContent = S.symbol.name || (S.symbol.code ? '' : '종목을 선택하세요');
+    $('symName').textContent = S.symbol.name || '이름 없음';
     S.chart.setData(payload, S.active);
-    $('chartEmpty').hidden = !!(payload && payload.n);
-    if (!(payload && payload.n)) $('chartEmptyMsg').textContent = '이 구간에 표시할 봉이 없습니다. 조회 기간을 넓혀 보세요.';
+
+    if (payload && payload.n) {
+      $('chartEmpty').hidden = true;
+      // 서버가 요청한 기간을 다 주지 못했으면 알린다
+      if (payload.truncated) {
+        $('chartNote').hidden = false;
+        $('chartNote').innerHTML =
+          `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>` +
+          `요청한 기간 전체가 표시되지 않았습니다 — 실제 표시 구간 ${P.esc(payload.start || '')} ~ ${P.esc(payload.end || '')}`;
+      }
+    } else {
+      showChartEmpty({
+        icon: 'search',
+        title: '이 기간에는 거래된 기록이 없습니다',
+        desc: '상장 전이거나 거래가 정지된 구간일 수 있습니다. 위의 기간 버튼에서 "전체" 를 눌러 보세요.',
+      });
+    }
     P.renderLegend(null, [], () => '', `${S.symbol.code} ${S.symbol.name}`);
-    P.clearBanner('err-차트 조회');
+    P.clearBanner('err-차트 불러오기');
   } catch (e) {
-    handleError(e, '차트 조회');
-    $('chartEmpty').hidden = false;
-    $('chartEmptyMsg').textContent = '차트를 불러오지 못했습니다. 화면 위 안내를 확인하세요.';
+    handleError(e, '차트 불러오기');
+    showChartEmpty({
+      icon: 'alert', tone: 'err',
+      title: '차트를 불러오지 못했습니다',
+      desc: (e && e.advice) || '화면 위쪽 안내를 확인하세요.',
+    });
   }
+}
+
+function showChartEmpty(opts) {
+  $('chartEmpty').hidden = false;
+  $('chartEmptyBox').innerHTML = P.emptyState(opts);
 }
 
 function firstTradeCode() {
   return S.result && S.result.trades && S.result.trades.length ? S.result.trades[0].code : '';
 }
 
-/**
- * t 배열(YYYYMMDD 정수)에서 날짜에 해당하는 인덱스.
- * 배열 범위를 벗어나면 -1 을 돌려준다 (0 으로 뭉개면 엉뚱한 구간을 확대하게 된다).
- */
+/* ---------------- 종목 검색 ---------------- */
+
+let symTimer = 0;
+let symAbort = null;
+
+function openSymbolPicker() {
+  const pop = $('symPop');
+  pop.hidden = false;
+  $('symBtn').setAttribute('aria-expanded', 'true');
+  const inp = $('symInput');
+  inp.value = '';
+  inp.focus();
+  doSymbolSearch('');
+}
+
+function closeSymbolPicker() {
+  $('symPop').hidden = true;
+  $('symBtn').setAttribute('aria-expanded', 'false');
+}
+
+async function doSymbolSearch(q) {
+  if (symAbort) symAbort.abort();
+  symAbort = new AbortController();
+  // 서버에 검색 기능이 없으면 코드 직접 입력으로 대체한다
+  if (!api.hasFeature('symbol_search', false) && !api.isFallback()) {
+    const code = String(q || '').trim();
+    const valid = /^\d{6}$/.test(code);
+    P.renderSymbolResults(
+      valid ? [{ code, name: '입력한 종목코드', market: '', marcap_eok: null }] : [],
+      valid ? 1 : 0, q, pickSymbol,
+      valid ? '' : '이 서버는 아직 종목 이름 검색을 지원하지 않습니다. 6자리 종목코드를 직접 입력하세요. (예: 042700)');
+    if (valid) P.renderSymbolResults([{ code, name: '이 코드로 차트 보기', market: '', marcap_eok: null }], 1, q, pickSymbol);
+    return;
+  }
+  P.renderSymbolResults(null, 0, q, pickSymbol, '찾는 중…');
+  try {
+    const r = await api.searchSymbols(q, 30, symAbort.signal);
+    if (!r) { P.renderSymbolResults([], 0, q, pickSymbol, '종목 검색을 사용할 수 없습니다.'); return; }
+    P.renderSymbolResults(r.symbols || [], r.total || 0, q, pickSymbol);
+  } catch (e) {
+    if (e && e.aborted) return;
+    P.renderSymbolResults([], 0, q, pickSymbol, `검색에 실패했습니다. ${(e && e.message) || ''}`);
+  }
+}
+
+function pickSymbol(s) {
+  closeSymbolPicker();
+  S.symbol = { code: s.code, name: s.name || '' };
+  S.chart.setHighlight(null);
+  loadChart({ code: s.code, name: s.name });
+  P.toast(`${s.name || s.code} 차트로 이동`, 'ok', 1800);
+}
+
+/* ---------------- 거래 이동 ---------------- */
+
 function indexOfDate(t, dateStr) {
   const target = ymdInt(dateStr);
   if (!target || !t || !t.length) return -1;
@@ -449,7 +759,6 @@ function indexOfDate(t, dateStr) {
   return lo;
 }
 
-/** 거래의 시작/끝 날짜 (기준일 ~ 청산일) */
 function tradeSpan(t) {
   const fills = t.fills || [];
   return {
@@ -458,7 +767,6 @@ function tradeSpan(t) {
   };
 }
 
-/** 날짜 문자열에 개월 수를 더한다 */
 function shiftMonths(dateStr, months) {
   const d = new Date(dateStr + 'T00:00:00');
   if (Number.isNaN(d.getTime())) return dateStr;
@@ -466,10 +774,6 @@ function shiftMonths(dateStr, months) {
   return isoOf(d);
 }
 
-/**
- * 거래 내역 행 클릭 → 해당 종목·구간으로 차트 이동 + 마커 강조.
- * 거래 구간이 반드시 들어오도록 조회 기간을 거래 기준으로 다시 계산해서 받는다.
- */
 async function gotoTrade(no) {
   const trades = (S.result && S.result.trades) || [];
   const t = trades.find((x) => x.no === no);
@@ -486,8 +790,7 @@ async function gotoTrade(no) {
     && indexOfDate(d0.t, span.to) >= 0;
 
   if (!covered) {
-    // 거래 앞뒤로 2개월씩 여유를 두고 다시 받는다 (await 필수 —
-    // 기다리지 않으면 새 데이터가 도착하면서 setHighlight 가 지워진다)
+    // await 필수 — 기다리지 않으면 새 데이터가 도착하며 setHighlight 가 지워진다
     const start = shiftMonths(span.from, -2);
     const end = shiftMonths(span.to, 2);
     const days = Math.max(40, Math.round((ymdDate(end) - ymdDate(start)) / 86400000 * 0.69));
@@ -496,8 +799,6 @@ async function gotoTrade(no) {
   focusTrade(t);
 }
 
-function ymdDate(s) { return new Date(s + 'T00:00:00').getTime(); }
-
 function focusTrade(t) {
   const d = S.chart && S.chart.d;
   if (!d || !d.n) return;
@@ -505,10 +806,9 @@ function focusTrade(t) {
   const from = indexOfDate(d.t, span.from);
   const to = indexOfDate(d.t, span.to);
   if (from < 0 || to < 0) {
-    // 폴백 모드에서는 차트와 거래 내역이 서로 다른 예시 데이터라 날짜가 맞지 않는 게 정상이다
     P.toast(api.isFallback()
-      ? '예시 데이터에서는 거래 구간과 차트 구간이 서로 맞지 않습니다. 실제 결과는 백엔드를 띄운 뒤 확인하세요.'
-      : `${t.name || t.code} 거래 구간(${span.from} ~ ${span.to})이 차트 데이터 범위 밖입니다.`,
+      ? '예시 데이터에서는 거래 구간과 차트 구간이 서로 맞지 않습니다.'
+      : `${t.name || t.code} 거래 구간(${span.from} ~ ${span.to})이 차트 범위 밖입니다.`,
     api.isFallback() ? '' : 'err', 4000);
     return;
   }
@@ -533,71 +833,129 @@ function setRange(months) {
 }
 
 /* ============================================================
-   5. 백테스트
+   6. 백테스트
    ============================================================ */
+
+function setRunning(on) {
+  S.running = on;
+  $('btnRun').disabled = on;
+  $('btnRunIcon').style.display = on ? 'none' : '';
+  $('btnCancelRun').hidden = !on;
+  $('btnRunLabel').textContent = on ? '실행 중…' : '백테스트 실행';
+}
 
 async function runBacktest() {
   if (S.running || !S.draft) return;
   if (S.status && S.status.available === false) {
-    P.toast('marcap 데이터가 없어 백테스트를 실행할 수 없습니다.', 'err', 4000);
+    P.toast('주가 데이터가 없어 백테스트를 실행할 수 없습니다.', 'err', 4000);
+    P.focusFirstError();
     return;
   }
-  S.running = true;
-  const btn = $('btnRun');
-  btn.disabled = true;
-  $('btnRunLabel').textContent = '실행 중…';
+  const errs = checkForm().filter((i) => i.level === 'err');
+  if (errs.length) {
+    P.focusFirstError();
+    P.toast(`고쳐야 할 값이 ${errs.length}개 있습니다.`, 'err');
+    return;
+  }
+  // 시세를 받는 중이어도 막지 않는다. 대신 어느 시점 데이터인지 알린다.
+  if (S.syncing) {
+    P.toast('시세를 받는 중입니다. 어제까지 데이터로 실행합니다.', '', 4000);
+  }
 
-  // 서버가 진행률 SSE 를 지원한다고 알린 경우에만 연결. 아니면 인디터미닛 진행바.
-  let es = api.backtestProgressStream(S.status);
-  let gotProgress = false;
+  setRunning(true);
+  P.clearBanner('no-trades');
+  P.clearBanner('slow');
+  P.renderTrades([], gotoTrade, { loading: true });
+  P.renderByStock([], { loading: true });
+  P.renderSignals([], { loading: true });
+
+  const jobId = api.newJobId();
+  S.abort = new AbortController();
+
+  // 오래 걸리면 왜 걸리는지 알려 준다
+  const slowTimer = setTimeout(() => {
+    P.banner('slow', 'info',
+      '<b>계산에 시간이 걸리고 있습니다.</b>' +
+      '<div class="err-advice">전 종목을 하루씩 훑어보는 중입니다. 종목 수와 기간이 길수록 오래 걸립니다. 그대로 두면 끝나고, 급하면 오른쪽 위 [취소] 를 누르세요.</div>');
+  }, 5000);
+
+  // 진행률 SSE 는 job_id 를 먼저 열고 같은 id 로 실행한다
+  let es = api.backtestProgressStream(jobId);
+  let sawProgress = false;
   P.progress(null);
   if (es) {
     es.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
+        if (d.message) $('btnRunLabel').textContent = String(d.message).slice(0, 20);
         if (Number.isFinite(d.done) && Number.isFinite(d.total) && d.total > 0) {
-          gotProgress = true;
-          P.progress(d.done / d.total * 100);
-          if (d.message) $('btnRunLabel').textContent = String(d.message).slice(0, 18);
+          sawProgress = true;
+          P.progress((d.done / d.total) * 100);
         }
       } catch { /* 진행률 파싱 실패는 무시하고 인디터미닛 유지 */ }
     };
-    es.onerror = () => { es.close(); es = null; if (!gotProgress) P.progress(null); };
+    es.onerror = () => { if (es) { es.close(); es = null; } if (!sawProgress) P.progress(null); };
   }
 
   try {
-    const res = await api.runBacktest(S.draft, S.draft.period);
+    const res = await api.runBacktest(S.draft, S.draft.period, { jobId, signal: S.abort.signal });
     S.result = res;
+    S.ran = true;
     applyResult(res);
     P.clearBanner('err-백테스트 실행');
     P.toast(`백테스트 완료 — ${res.metrics.trades}거래 · ${P.pct1(res.metrics.total_return_pct)} · ${(res.elapsed_sec ?? 0).toFixed(1)}초`, 'ok', 3800);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 422 && e.errors) {
+    if (e && e.aborted) {
+      // 서버 취소 API 가 없으므로 거짓 안내를 하지 않는다
+      P.renderTrades(S.result ? S.result.trades : [], gotoTrade, { ran: S.ran });
+      P.renderSignals(S.result ? S.result.signals : [], { ran: S.ran });
+      P.renderByStock(S.result ? S.result.by_stock : [], { ran: S.ran });
+      P.banner('cancelled', 'warn',
+        '<b>화면에서 실행을 취소했습니다.</b>' +
+        '<div class="err-advice">결과를 받지 않고 화면만 되돌렸습니다. 프로그램 서버에서는 계산이 계속 진행 중일 수 있으며, 끝날 때까지 다음 실행이 느려질 수 있습니다.</div>');
+      P.toast('실행을 취소했습니다.', '', 3000);
+    } else if (e instanceof ApiError && e.status === 422 && e.errors) {
       P.showFieldErrors(e.errors);
-      P.banner('validate', 'err', `<b>전략 검증 실패 (${e.errors.length}건)</b> — 파라미터를 고친 뒤 다시 실행하세요.`);
+      P.focusFirstError();
+      P.banner('validate', 'err',
+        `<b>실행하지 못했습니다 — 값 ${e.errors.length}개를 고쳐야 합니다.</b>` +
+        '<div class="err-advice">빨간색으로 표시된 항목을 고친 뒤 다시 실행하세요.</div>');
+      P.renderTrades([], gotoTrade, { ran: false });
+      P.renderSignals([], { ran: false });
+      P.renderByStock([], { ran: false });
     } else {
       handleError(e, '백테스트 실행');
+      P.renderTrades([], gotoTrade, { ran: false });
+      P.renderSignals([], { ran: false });
+      P.renderByStock([], { ran: false });
     }
   } finally {
+    clearTimeout(slowTimer);
+    P.clearBanner('slow');
     if (es) es.close();
-    S.running = false;
-    btn.disabled = false;
-    $('btnRunLabel').textContent = '백테스트 실행';
+    S.abort = null;
+    setRunning(false);
     P.progress(false);
+    updateNextStep();
   }
 }
 
+function cancelBacktest() {
+  if (S.abort) S.abort.abort();
+}
+
 function applyResult(res) {
+  P.renderAssumptions(res.assumptions, res.metrics);
   P.renderKpis(res.metrics);
   S.eq.set(res.equity || null);
   S.mo.set(res.monthly || null);
-  P.renderByStock(res.by_stock);
-  P.renderTrades(res.trades, gotoTrade);
-  P.renderSignals(res.signals);
+  P.renderByStock(res.by_stock, { ran: true });
+  P.renderTrades(res.trades, gotoTrade, { ran: true, hints: emptyHints() });
+  P.renderSignals(res.signals, { ran: true });
 
   if (Array.isArray(res.warnings) && res.warnings.length) {
     P.banner('warnings', 'warn',
-      '<b>백테스트 주의사항</b><ul>' + res.warnings.map((w) => `<li>${P.esc(w)}</li>`).join('') + '</ul>');
+      '<b>결과를 볼 때 참고하세요</b><ul>' + res.warnings.map((w) => `<li>${P.esc(w)}</li>`).join('') + '</ul>');
   } else {
     P.clearBanner('warnings');
   }
@@ -607,51 +965,98 @@ function applyResult(res) {
     gotoTrade(res.trades[0].no);
   } else {
     $('tradeIdxLabel').textContent = '0 / 0';
-    P.banner('no-trades', 'info', '<b>체결된 거래가 없습니다.</b> 조건이 너무 좁을 수 있습니다. 기준일 거래대금·탐색 기간·유효 기간을 완화해 보세요.');
   }
 }
 
+/** 거래 0건일 때 어떤 값을 풀면 되는지 지금 설정 기준으로 알려 준다 */
+function emptyHints() {
+  const v = (id) => Number(($(id) || {}).value);
+  const out = [];
+  if (Number.isFinite(v('p_amt'))) out.push(`기준일 거래대금을 ${P.fmt(v('p_amt'))}억 → ${P.fmt(Math.max(50, Math.round(v('p_amt') / 2)))}억 으로 낮춰 보세요`);
+  if (Number.isFinite(v('p_look'))) out.push(`탐색 기간을 ${v('p_look')}일 → ${v('p_look') * 2}일 로 늘려 보세요`);
+  if (Number.isFinite(v('p_prev'))) out.push(`전일 거래대금 상한 ${P.fmt(v('p_prev'))}억 이 너무 낮을 수 있습니다`);
+  if (Number.isFinite(v('p_valid'))) out.push(`유효 기간을 ${v('p_valid')}일 → ${v('p_valid') * 2}일 로 늘리면 더 오래 기다립니다`);
+  out.push('백테스트 구간의 시작일을 더 앞으로 당겨 보세요');
+  return out;
+}
+
 /* ============================================================
-   6. AI 전략 생성
+   7. AI 전략 생성
    ============================================================ */
+
+function updateAiNotice() {
+  const host = $('aiNotice');
+  if (!host) return;
+  // 변환을 눌러야 알게 되면 안 되므로 미리 안내한다
+  if (api.getFeatures() && api.hasFeature('ai_available', true) === false) {
+    host.innerHTML =
+      '<div class="ai-msg err"><b>AI 변환을 지금은 쓸 수 없습니다.</b>' +
+      'ANTHROPIC_API_KEY 가 설정되지 않아 이 기능만 꺼져 있습니다. 나머지 기능은 정상입니다.' +
+      '<pre>명령 프롬프트에서\n  setx ANTHROPIC_API_KEY sk-ant-...\n를 실행한 뒤 프로그램을 다시 시작하세요.</pre></div>';
+    $('btnAI').disabled = true;
+    $('btnAILabel').textContent = '사용 불가';
+  } else {
+    host.innerHTML = '';
+    $('btnAI').disabled = false;
+    $('btnAILabel').textContent = 'DSL로 변환';
+  }
+}
 
 async function runAi() {
   const prompt = $('aiIn').value.trim();
   const out = $('aiResult');
-  if (!prompt) { P.toast('전략 설명을 입력하세요.', 'err'); $('aiIn').focus(); return; }
+  if (!prompt) { P.toast('먼저 전략 설명을 적어 주세요.', 'err'); $('aiIn').focus(); return; }
 
   const btn = $('btnAI');
   btn.disabled = true;
-  $('aiStat').textContent = '변환 중… 자연어 → DSL v1';
-  out.innerHTML = '';
+  $('btnAILabel').textContent = '변환 중…';
+  $('aiStat').textContent = '한국어 설명을 전략 형식으로 바꾸는 중입니다…';
+  out.innerHTML = `<div class="ai-msg"><span class="sk sk-line" style="width:70%"></span>
+    <span class="sk sk-line" style="width:92%;margin-top:6px"></span></div>`;
   P.progress(null);
   try {
     const r = await api.aiStrategy(prompt, S.draft || undefined);
     if (r && r.ok) {
-      S.draft = r.strategy;
-      S.strategyId = r.strategy.id || S.strategyId;
-      markDirty();
-      P.fillForm(S.draft);
-      rebuildActive();
-      drawChips();
-      P.renderJson(S.draft);
-      const warn = (r.warnings || []).map((w) => `<li>${P.esc(w)}</li>`).join('');
-      out.innerHTML = `<div class="ai-msg ok"><b>변환 완료</b>좌측 파라미터 패널에 로드했습니다. 확인 후 <b>저장</b>을 누르세요.${warn ? `<ul>${warn}</ul>` : ''}</div>`;
-      $('aiStat').textContent = '변환 완료 · 스키마 검증 대기';
-      P.toast('AI 전략 변환 완료', 'ok');
-      await loadChart();
+      // 덮어쓰기 전에 무엇이 바뀌는지 보여 준다
+      const diffs = P.diffStrategies(S.draft, r.strategy);
+      out.innerHTML = `<div class="ai-msg ok"><b>변환했습니다 — 아직 적용하지는 않았습니다.</b>
+        아래 내용을 확인하고 [적용] 을 눌러야 왼쪽 파라미터가 바뀝니다.</div>`;
+      $('aiStat').textContent = '변환 완료 — 적용 여부를 확인하세요';
+      P.modal('이 내용으로 바꿀까요?',
+        `<p>AI 가 만든 전략을 지금 파라미터에 덮어씁니다. 바뀌는 값은 아래와 같습니다.</p>` +
+        P.renderDiffTable(diffs) +
+        ((r.warnings || []).length
+          ? `<p class="hint" style="margin-top:8px">참고: ${(r.warnings || []).map((w) => P.esc(w)).join(' / ')}</p>` : ''),
+        [
+          { label: '취소', onClick: () => { $('aiStat').textContent = '적용하지 않았습니다.'; } },
+          {
+            label: '적용', primary: true, onClick: async () => {
+              S.draft = r.strategy;
+              markDirty();
+              P.fillForm(S.draft);
+              P.renderFieldHints(); checkForm();
+              rebuildActive(); drawChips();
+              P.renderJson(S.draft);
+              syncResolutionNote();
+              out.innerHTML = '<div class="ai-msg ok"><b>왼쪽 파라미터에 적용했습니다.</b>내용을 확인한 뒤 [저장] 을 누르세요.</div>';
+              $('aiStat').textContent = '적용됨 — 저장 전';
+              P.toast('AI 전략을 적용했습니다.', 'ok');
+              await loadChart();
+            },
+          },
+        ]);
     } else {
-      // ok:false 는 정상 응답이다. error 와 how_to 를 그대로 보여 준다.
       out.innerHTML = `<div class="ai-msg err"><b>${P.esc((r && r.error) || 'AI 전략 생성에 실패했습니다.')}</b>` +
         ((r && r.how_to) ? `<pre>${P.esc(r.how_to)}</pre>` : '') + '</div>';
-      $('aiStat').textContent = '변환 실패';
+      $('aiStat').textContent = '변환하지 못했습니다';
     }
   } catch (e) {
     handleError(e, 'AI 전략 생성');
-    out.innerHTML = `<div class="ai-msg err"><b>요청 실패</b>${P.esc(e.message)}</div>`;
-    $('aiStat').textContent = '변환 실패';
+    out.innerHTML = `<div class="ai-msg err">${P.errorHtml(e, '요청 실패')}</div>`;
+    $('aiStat').textContent = '변환하지 못했습니다';
   } finally {
     btn.disabled = false;
+    $('btnAILabel').textContent = 'DSL로 변환';
     P.progress(false);
   }
 }
@@ -661,27 +1066,43 @@ const AI_EXAMPLE = '20일 안에 거래대금 1000억 넘은 날이 있고, 그 
   '평단 +10%면 전량 익절, 45일선 닿으면 전량 손절.';
 
 /* ============================================================
-   7. 부트스트랩
+   8. 부트스트랩
    ============================================================ */
 
 function wire() {
   bindThemeToggle($('themeSeg'));
   P.bindModal();
+  P.bindAssumptions();
+
+  // 빈 상태 / 안내 배너 안의 버튼을 한 곳에서 처리
+  P.bindEmptyActions({
+    run: runBacktest,
+    pickSymbol: openSymbolPicker,
+    sync: () => startSync({}),
+  });
 
   P.bindTabs((name) => {
     if (name === 'pnJson' && S.draft) P.renderJson(S.draft);
     if (name === 'pnData') P.renderDataStatus(S.status, api.isFallback() ? api.fallbackNote() : '');
-    // 숨겨져 있던 캔버스는 크기가 0이었을 수 있다
     if (name === 'pnTrades') { S.eq.schedule(); S.mo.schedule(); }
   });
 
   P.bindForm(onFormChange);
 
-  $('btnSync').addEventListener('click', (e) => doSync(e.currentTarget));
-  $('autoSync').addEventListener('click', (e) => { e.preventDefault(); explainAutoSync(!e.currentTarget.checked); });
+  $('btnSync').addEventListener('click', () => startSync({}));
+  $('btnSettings').addEventListener('click', openSettings);
+  $('optAutoSync').addEventListener('change', (e) => {
+    setAutoSyncEnabled(e.currentTarget.checked);
+    P.toast(e.currentTarget.checked
+      ? '켤 때 자동으로 시세를 받습니다.'
+      : '자동 갱신을 껐습니다. [지금 갱신] 으로만 받습니다.', 'ok');
+  });
   $('btnRun').addEventListener('click', runBacktest);
-  $('btnSave').addEventListener('click', saveStrategy);
+  $('btnCancelRun').addEventListener('click', cancelBacktest);
+  $('btnSave').addEventListener('click', () => saveStrategy());
+  $('btnRevert').addEventListener('click', revertStrategy);
   $('btnClone').addEventListener('click', cloneStrategy);
+  $('btnDelete').addEventListener('click', deleteStrategy);
   $('btnExport').addEventListener('click', exportStrategy);
   $('btnNewStrategy').addEventListener('click', newStrategy);
   $('btnAddInd').addEventListener('click', openIndicatorDialog);
@@ -694,26 +1115,66 @@ function wire() {
     b.addEventListener('click', () => setRange(Number(b.dataset.months)));
   }
 
-  // 폴백 진입 알림
+  // 종목 검색
+  $('symBtn').addEventListener('click', () => {
+    if ($('symPop').hidden) openSymbolPicker(); else closeSymbolPicker();
+  });
+  $('symInput').addEventListener('input', (e) => {
+    clearTimeout(symTimer);
+    const q = e.target.value;
+    symTimer = setTimeout(() => doSymbolSearch(q), 220);
+  });
+  $('symInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeSymbolPicker(); $('symBtn').focus(); }
+    if (e.key === 'Enter') {
+      const first = $('symResults').querySelector('.sym-item');
+      if (first) first.click();
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      $('symResults').querySelector('.sym-item')?.focus();
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (!$('symPop').hidden && !e.target.closest('.sym-picker')) closeSymbolPicker();
+  });
+
+  // 오류 배너의 "자세히"
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-more]');
+    if (!b) return;
+    const pre = b.parentElement.querySelector('.err-detail');
+    if (!pre) return;
+    pre.hidden = !pre.hidden;
+    b.textContent = pre.hidden ? '자세히' : '접기';
+  });
+
   window.addEventListener('api:fallback', (e) => {
     $('mockBadge').hidden = false;
     P.banner('fallback', 'warn',
-      `<b>백엔드에 연결하지 못했습니다.</b> ${P.esc(e.detail.reason)}<br>` +
-      '지금 보이는 숫자는 화면 확인용 <b>예시 데이터</b>이며 실제 백테스트 결과가 아닙니다.',
+      `<b>프로그램 서버에 연결하지 못했습니다.</b> ${P.esc(e.detail.reason)}<br>` +
+      '지금 보이는 숫자는 화면 확인용 <b>예시 데이터</b>이며 실제 계산 결과가 아닙니다.',
       false);
+    updateAiNotice();
   });
 
-  // 삼키면 안 되는 에러들
   window.addEventListener('error', (e) => {
-    P.banner('js-error', 'err', `<b>화면 오류</b> — ${P.esc(e.message || '알 수 없는 오류')}<br>브라우저 콘솔을 확인하세요.`);
+    P.banner('js-error', 'err', `<b>화면 오류가 발생했습니다.</b><div class="err-advice">${P.esc(e.message || '알 수 없는 오류')} — 화면을 새로고침해 보세요.</div>`);
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e.reason;
-    P.banner('js-error', 'err', `<b>처리되지 않은 오류</b> — ${P.esc((r && r.message) || String(r))}`);
+    if (r && r.aborted) return;
+    P.banner('js-error', 'err', `<b>처리되지 않은 오류</b><div class="err-advice">${P.esc((r && r.message) || String(r))}</div>`);
   });
 
-  // 테마가 바뀌면 지표 칩의 색 표식도 다시 칠한다
   window.addEventListener('themechange', () => { if (S.specs.length || S.active.length) drawChips(); });
+
+  // 저장 안 한 채로 창을 닫으려 하면 브라우저 기본 확인창을 띄운다
+  window.addEventListener('beforeunload', (e) => {
+    if (!S.dirty) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 }
 
 function setupCharts() {
@@ -729,8 +1190,7 @@ function setupCharts() {
   S.eq = new MiniChart($('eq'), 'equity');
   S.mo = new MiniChart($('mo'), 'monthly');
 
-  // playwright 성능 측정용 훅
-  window.__app = S;
+  window.__app = S;      // playwright 성능 측정용 훅
   window.__chart = S.chart;
 }
 
@@ -744,12 +1204,21 @@ async function boot() {
     $('mockBadge').hidden = false;
   }
 
+  $('optAutoSync').checked = autoSyncEnabled();
+  $('btnRevert').disabled = true;
+
+  // 초기 빈 상태 (왜 비었는지 + 무엇을 하면 되는지)
+  P.renderAssumptions(null, null);
   P.renderKpis(null);
-  P.renderTrades([], gotoTrade);
-  P.renderSignals([]);
-  P.renderByStock([]);
+  P.renderTrades([], gotoTrade, { ran: false });
+  P.renderSignals([], { ran: false });
+  P.renderByStock([], { ran: false });
+  showChartEmpty({ icon: 'chart', title: '준비 중입니다…', desc: '프로그램 상태를 확인하고 있습니다.' });
 
   await loadStatus();
+  updateAiNotice();
+  maybeAutoSync();          // 화면을 막지 않도록 await 하지 않는다
+
   await loadIndicators();
   await loadStrategies();
 
