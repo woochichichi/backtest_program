@@ -571,7 +571,8 @@ export class CandleChart {
     // 가시 봉이 픽셀보다 많으면 선도 픽셀 단위로 솎아낸다
     const stride = Math.max(1, Math.floor(nVis / Math.max(1, g.plotW)));
     ctx.lineWidth = 1.4;
-    ctx.lineJoin = 'round';
+    // 점이 수백 개인 폴리라인에서 round join 은 눈에 띄는 이득 없이 래스터 비용만 올린다
+    ctx.lineJoin = 'bevel';
     for (const ind of this.d.ind) {
       if (!ind.overlay) continue;
       const a = ind.arr;

@@ -41,10 +41,10 @@
 
     <div class="pill" id="pillSync" title="marcap 저장소 마지막 갱신 시각">
       <span class="dot" id="dataDot" aria-hidden="true"></span>
-      <span class="lbl-sync">데이터 갱신</span><b id="lastSync">—</b>
+      <span>데이터 갱신</span><b id="lastSync">—</b>
     </div>
-    <div class="pill" title="데이터셋에 포함된 마지막 거래일">
-      <span class="lbl-sync">최신 거래일</span><b id="lastTrade">—</b>
+    <div class="pill pill-latest" title="데이터셋에 포함된 마지막 거래일">
+      <span>최신 거래일</span><b id="lastTrade">—</b>
     </div>
 
     <button class="btn" id="btnSync" title="marcap 저장소를 지금 갱신합니다">
@@ -56,7 +56,7 @@
 
     <label class="pill" style="cursor:pointer" title="Windows 작업 스케줄러 등록 상태">
       <span class="sw"><input type="checkbox" id="autoSync"><i></i></span>
-      <span class="lbl-sync">매일 자동</span><b id="autoTime">—</b>
+      <span>매일 자동</span><b id="autoTime">—</b>
     </label>
 
     <span class="badge-mock" id="mockBadge" hidden title="백엔드에 연결하지 못해 개발용 예시 데이터를 표시하고 있습니다">

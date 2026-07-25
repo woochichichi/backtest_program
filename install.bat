@@ -156,9 +156,17 @@ echo  ==========================================
 echo.
 echo  다음 순서로 진행하세요.
 echo.
-echo    1. update_marcap.bat      - 시세 데이터 내려받기 ^(최초 1회, 수 분 소요^)
-echo    2. run_web.bat            - 웹 서버 실행 + 브라우저 열기
+echo    1. update_marcap.bat      - 시세 데이터 내려받기 ^(최초 1회, 10~30분^)
+echo    2. KRX백테스터.vbs        - 이걸 더블클릭하면 끝입니다
+echo                                검은 창 없이 켜지고 브라우저가 자동으로 열립니다.
+echo                                한 번 더 누르면 종료할지 물어봅니다.
 echo    3. setup_daily_update.bat - 매일 자동 갱신 등록 ^(선택^)
+echo.
+echo  앞으로는 KRX백테스터.vbs 하나만 쓰시면 됩니다.
+echo  install.bat 은 이번 한 번으로 끝입니다.
+echo.
+echo  문제가 생기면 run_web.bat 을 실행해 보세요.
+echo  검은 창에 오류 메시지가 그대로 보입니다 ^(로그: logs\server.log^).
 echo.
 echo  AI 전략 생성을 쓰려면 명령 프롬프트에서 아래를 한 번 실행하세요.
 echo    setx ANTHROPIC_API_KEY sk-ant-여기에키
