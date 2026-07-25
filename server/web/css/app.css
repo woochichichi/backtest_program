@@ -600,7 +600,8 @@ pre.code {
 }
 
 /* ---------- 헤더 신선도 ---------- */
-.pill .pill-sub { color: var(--tx-dim); font-family: var(--mono); font-size: 11px; }
+/* pill 배경(--bg-2)은 --bg-1 보다 밝으므로 --tx-dim 이 아니라 --tx-sub 를 쓴다 */
+.pill .pill-sub { color: var(--tx-sub); font-family: var(--mono); font-size: 11px; }
 
 /* ---------- 빈 상태 ---------- */
 .empty-state {
