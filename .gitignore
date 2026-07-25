@@ -1,4 +1,5 @@
 # marcap 데이터 저장소 (update_marcap.bat 이 clone/pull)
+/marcap
 /marcap/
 
 # 서버 PID (KRX백테스터.vbs 가 생성)
