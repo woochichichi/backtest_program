@@ -1,0 +1,102 @@
+{
+  "schema": "krx-backtest-strategy/v1",
+  "id": "strategy2",
+  "name": "전략2 — 전략1 + 45일선 하향 돌파 손절",
+  "description": "전략1과 종목 선정·매수 규칙은 완전히 같다. 손절 규칙만 다르다. 전략1은 '45일선에 도달하면' 매도인데, 기준일 시가까지 눌린 종목은 이미 45일선 아래인 경우가 많아 매수 직후 조건이 성립해버린다. 이 전략은 '주가가 45일선을 위에서 아래로 뚫을 때'만 손절한다.",
+  "author": "user",
+  "created_at": "2026-07-25",
+  "enabled": true,
+
+  "market": {
+    "country": "KR",
+    "asset": "stock",
+    "bar": "1d",
+    "trade_resolution": "1m"
+  },
+
+  "universe": {
+    "markets": ["KOSPI", "KOSDAQ"],
+    "exclude": ["ETF", "ETN", "SPAC", "PREFERRED", "ADMIN_ISSUE", "TRADE_HALT"],
+    "reference_day": {
+      "rule": "amount_spike",
+      "lookback_days": 20,
+      "spike_amount_krw_eok": 1000,
+      "prev_day_amount_max_eok": 200,
+      "comment": "lookback_days 안에서 거래대금 >= spike_amount 인 날을 기준일로 삼는다. 기준일 직전 영업일 거래대금이 prev_day_amount_max 이하여야 한다. 조건을 만족하는 날이 복수면 가장 최근 날을 기준일로 채택한다."
+    },
+    "condition": "close_below_reference_open",
+    "valid_days_after_reference": 60
+  },
+
+  "entries": [
+    {
+      "id": "B1",
+      "label": "1차 매수 (기준일 시가 도달)",
+      "when": { "op": "<=", "left": "low", "right": "ref.open" },
+      "price": "ref.open",
+      "size_pct": 50,
+      "size_of": "planned_position"
+    },
+    {
+      "id": "B2",
+      "label": "2차 매수 (1차 매수가 -10%)",
+      "requires": ["B1"],
+      "trigger_pct": -10,
+      "when": { "op": "<=", "left": "low", "right": { "expr": "fill.B1.price * (1 + trigger_pct / 100)" } },
+      "price": { "expr": "fill.B1.price * (1 + trigger_pct / 100)" },
+      "size_pct": 50,
+      "size_of": "planned_position"
+    }
+  ],
+
+  "exits": [
+    {
+      "id": "TP",
+      "label": "익절 (평단 +10%)",
+      "type": "take_profit",
+      "target_pct": 10,
+      "when": { "op": ">=", "left": "high", "right": { "expr": "position.avg_price * (1 + target_pct / 100)" } },
+      "price": { "expr": "position.avg_price * (1 + target_pct / 100)" },
+      "size_pct": 100
+    },
+    {
+      "id": "SL",
+      "label": "손절 (45일선 하향 돌파)",
+      "type": "stop_loss",
+      "ma_period": 45,
+      "when": { "op": "cross_below", "left": "close", "right": { "indicator": "SMA", "period": 45, "source": "close" } },
+      "price": { "indicator": "SMA", "period": 45, "source": "close" },
+      "size_pct": 100,
+      "comment": "전략1과 유일하게 다른 부분. '<=' 가 아니라 'cross_below' 라서 매수 시점에 이미 45일선 아래여도 즉시 손절되지 않는다. 전일 종가가 45일선 위였고 당일 종가가 아래로 내려간 날에만 발동한다."
+    }
+  ],
+
+  "exit_priority": ["SL", "TP"],
+
+  "indicators": [
+    { "key": "MA45", "type": "SMA", "period": 45, "source": "close", "plot": true },
+    { "key": "MA20", "type": "SMA", "period": 20, "source": "close", "plot": true }
+  ],
+
+  "portfolio": {
+    "initial_capital_manwon": 10000,
+    "max_positions": 10,
+    "position_sizing": "equal_weight",
+    "allow_duplicate_symbol": false
+  },
+
+  "execution": {
+    "resolution": "1m",
+    "fill_model": "touch",
+    "same_day_exit": "loss_only",
+    "slippage_pct": 0.1,
+    "fee_pct": 0.23,
+    "comment": "fee_pct는 매도 시 증권거래세 0.18% + 양방향 수수료 근사치를 합산한 값이다.",
+    "same_day_exit_comment": "일봉만으로는 하루 안의 가격 순서를 알 수 없어, 이익이 나는 청산은 진입 당일 차단한다. 1분봉이 연결되면 always 로 되돌린다."
+  },
+
+  "period": {
+    "start": "2018-01-02",
+    "end": "auto"
+  }
+}
