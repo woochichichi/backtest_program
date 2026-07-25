@@ -479,7 +479,9 @@ export class CandleChart {
         if (which !== pass) continue;
         const bh = amt[b] * scale;
         if (!(bh > 0)) continue;
-        ctx.rect(cx[b] - bw / 2, base - bh, bw, bh);
+        // 정수 정렬 — 안티에일리어싱된 가장자리를 없애 채우기 비용을 낮춘다
+        const y = Math.round(base - bh);
+        ctx.rect(Math.round(cx[b] - bw / 2), y, Math.max(1, Math.round(bw)), Math.max(1, Math.round(base) - y));
         any = true;
       }
       if (!any) continue;
@@ -509,6 +511,27 @@ export class CandleChart {
     const thin = cw < 2.6;                  // 폭이 좁으면 몸통 없이 고저선만
     const bw = Math.max(1, Math.floor(cw * 0.72));
 
+    if (thin) {
+      /* 다운샘플 구간에서는 stroke 대신 정수 좌표 fillRect 를 쓴다.
+         세로선을 path 로 stroke 하면 안티에일리어싱 때문에 소프트웨어
+         래스터라이저에서 비용이 몇 배로 뛴다. 정수 정렬된 사각형은 AA 가 없다. */
+      for (const up of [0, 1]) {
+        ctx.beginPath();
+        let any = false;
+        for (let b = 0; b < cols; b++) {
+          if (((F[b] & 1) !== 0) !== !!up) continue;
+          const x = Math.round(cx[b]);
+          const y0 = Math.round(Y(H[b])), y1 = Math.round(Y(L[b]));
+          ctx.rect(x, y0, 1, Math.max(1, y1 - y0));
+          any = true;
+        }
+        if (!any) continue;
+        ctx.fillStyle = up ? C.up : C.dn;
+        ctx.fill();
+      }
+      return;
+    }
+
     // --- 심지: 상승 1회, 하락 1회 ---
     ctx.lineWidth = 1;
     for (const up of [0, 1]) {
@@ -521,10 +544,9 @@ export class CandleChart {
         any = true;
       }
       if (!any) continue;
-      ctx.strokeStyle = thin ? (up ? C.up : C.dn) : (up ? C.upWick : C.dnWick);
+      ctx.strokeStyle = up ? C.upWick : C.dnWick;
       ctx.stroke();
     }
-    if (thin) return;
 
     // --- 몸통: 상승 1회, 하락 1회 ---
     for (const up of [0, 1]) {

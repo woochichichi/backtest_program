@@ -82,19 +82,37 @@ echo  [1/4] 파이썬을 찾았습니다: !PYVER!
 echo.
 
 rem ---- [2/4] 가상환경 ----
-if exist "!PYEXE!" (
-    echo  [2/4] 기존 가상환경을 그대로 사용합니다.
-) else (
-    echo  [2/4] 가상환경을 만듭니다 ^(수십 초 걸립니다^).
-    !PYCMD! -m venv "!VENV!"
-    if !errorlevel! neq 0 (
-        echo.
-        echo  [오류] 가상환경 생성에 실패했습니다.
-        echo         .venv 폴더를 지우고 다시 실행해 보세요.
-        goto :end
+rem  기존 가상환경이 지원하지 않는 파이썬으로 만들어졌으면 지우고 다시 만든다.
+if not exist "!PYEXE!" goto :mkvenv
+
+set "VENVVER="
+for /f "tokens=2" %%a in ('"!PYEXE!" --version 2^>^&1') do set "VENVVER=%%a"
+set "VENVOK="
+for /f "tokens=1,2 delims=." %%a in ("!VENVVER!") do (
+    if "%%a"=="3" (
+        if %%b geq 10 if %%b leq 13 set "VENVOK=1"
     )
-    echo  [2/4] 가상환경 생성 완료.
 )
+if defined VENVOK (
+    echo  [2/4] 기존 가상환경을 그대로 사용합니다 ^(!VENVVER!^).
+    goto :venvdone
+)
+echo  [2/4] 기존 가상환경이 지원하지 않는 버전입니다 ^(!VENVVER!^).
+echo        지우고 다시 만듭니다.
+rmdir /s /q "!VENV!"
+
+:mkvenv
+echo  [2/4] 가상환경을 만듭니다 ^(수십 초 걸립니다^).
+!PYCMD! -m venv "!VENV!"
+if !errorlevel! neq 0 (
+    echo.
+    echo  [오류] 가상환경 생성에 실패했습니다.
+    echo         .venv 폴더를 직접 지우고 다시 실행해 보세요.
+    goto :end
+)
+echo  [2/4] 가상환경 생성 완료.
+
+:venvdone
 
 if not exist "!PYEXE!" (
     echo.
