@@ -22,7 +22,7 @@ import pandas as pd
 from .dsl import EvalContext, evaluate_condition, evaluate_operand
 from .errors import DataUnavailable, DSLError, StrategyError
 from .indicators import REGISTRY
-from .metrics import build_equity, by_stock_summary, compute_metrics, monthly_returns
+from .metrics import _i, build_equity, by_stock_summary, compute_metrics, monthly_returns
 from .validate import validate_strategy
 
 __all__ = ["run_backtest", "EOK"]
@@ -844,7 +844,7 @@ def _close(w: dict, rec: dict, code: str, rule: Mapping, price: float, qty: int,
         "code": code,
         "name": rec["name"],
         "ref_date": w["ref_date"].isoformat(),
-        "ref_amount_eok": _r(w["ref"].get("amount", 0.0) / EOK, 0),
+        "ref_amount_eok": _i(w["ref"].get("amount", 0.0) / EOK),
         "ref_open": _r(w["ref"].get("open"), 2),
         "fills": list(w["fill_log"]),
         "avg_price": _r(avg_paid, 2),
@@ -854,7 +854,7 @@ def _close(w: dict, rec: dict, code: str, rule: Mapping, price: float, qty: int,
         "exit_reason": reason,
         "hold_days": int(hold_days),
         "return_pct": _r(ret_pct),
-        "pnl": _r(pnl, 0),
+        "pnl": _i(pnl),
     }
     return trade, proceeds
 

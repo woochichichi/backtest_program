@@ -210,7 +210,8 @@ class MarcapStore:
         for p in (self.status_file, Path("data_status.json")):
             try:
                 if p and p.is_file():
-                    return json.loads(p.read_text(encoding="utf-8"))
+                    # utf-8-sig: PowerShell 이 BOM 을 붙여 쓴 경우도 읽는다
+                    return json.loads(p.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 continue
         return {}

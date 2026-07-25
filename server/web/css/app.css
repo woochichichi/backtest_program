@@ -201,7 +201,8 @@ a { color: var(--accent-tx); }
 }
 .tag.ai { background: var(--accent-2-soft); color: var(--accent-2-tx); border: 1px solid var(--accent-2); }
 .tag.live { background: var(--ok-soft); color: var(--ok-tx); border: 1px solid var(--ok); }
-.tag.off { background: var(--bg-3); color: var(--tx-dim); border: 1px solid var(--bd); }
+/* bg-3 위에 얹히므로 --tx-dim 이 아니라 한 단계 밝은 --tx-sub 를 쓴다 */
+.tag.off { background: var(--bg-3); color: var(--tx-sub); border: 1px solid var(--bd); }
 
 /* ===================== 좌측: 파라미터 폼 ===================== */
 .grp { margin-top: 10px; }
@@ -230,7 +231,7 @@ a { color: var(--accent-tx); }
 .inp:hover { border-color: var(--bd-str); }
 .inp:focus { border-color: var(--accent); background: var(--bg-inset); outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
 .inp.w-full { width: 100%; flex: 1 1 auto; text-align: left; }
-.inp.wide { width: 118px; flex-basis: 118px; }
+.inp.wide { width: 132px; flex-basis: 132px; }
 .inp[aria-invalid="true"] { border-color: var(--danger); background: var(--danger-soft); }
 select.inp { text-align: left; cursor: pointer; padding-right: 4px; }
 .unit { width: 28px; flex: 0 0 28px; font-size: 11px; color: var(--tx-dim); font-family: var(--mono); }
@@ -326,11 +327,17 @@ select.inp { text-align: left; cursor: pointer; padding-right: 4px; }
 .chart-empty[hidden] { display: none; }
 .chart-empty svg { color: var(--tx-dim); }
 
+/* 조작 안내 — 평소에는 숨기고 차트에 마우스를 올리거나 포커스했을 때만 보인다.
+   (시간축 라벨과 겹치지 않도록 우측 상단, 가격축 왼쪽에 둔다) */
 .chart-hint {
-  position: absolute; right: 10px; bottom: 26px; z-index: 2;
-  font-size: 10.5px; color: var(--tx-dim); pointer-events: none;
-  text-shadow: 0 0 4px var(--ch-bg), 0 0 6px var(--ch-bg);
+  position: absolute; right: 70px; top: 8px; z-index: 2;
+  font-size: 10.5px; color: var(--tx-sub); pointer-events: none;
+  padding: 2px 7px; border-radius: 10px;
+  background: var(--bg-2); border: 1px solid var(--bd);
+  opacity: 0; transition: opacity var(--dur) var(--ease);
 }
+.chart-wrap:hover .chart-hint,
+.chart-wrap:focus-within .chart-hint { opacity: 1; }
 
 /* ===================== 우측: 성과 ===================== */
 .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--bd); }
@@ -524,7 +531,7 @@ pre.code {
   .pane-l { width: 236px; flex-basis: 236px; }
   .pane-r { width: 250px; flex-basis: 250px; }
   .inp { width: 76px; flex-basis: 76px; }
-  .inp.wide { width: 104px; flex-basis: 104px; }
+  .inp.wide { width: 116px; flex-basis: 116px; }
   .kpi .v { font-size: 15px; }
   .hd { gap: 7px; }
   /* 헤더가 넘치지 않도록 부가 정보 축약 */

@@ -5,7 +5,7 @@
 
 # engine/ — 데이터·지표·백테스트 (순수 파이썬, 웹 의존성 없음)
 numpy>=1.24
-pandas>=2.0
+pandas>=2.2            # 월별 리샘플에 "ME" 별칭을 쓴다
 pyarrow>=14.0          # parquet 읽기 + feather 캐시
 
 # server/ — FastAPI 정적 프런트 호스팅 + API

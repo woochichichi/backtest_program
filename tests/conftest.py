@@ -132,8 +132,8 @@ def make_frame(
     market: str = "KOSPI",
     dept: str = "",
 ) -> pd.DataFrame:
-    rows = price_path(kind)[: len(dates)]
-    amt = amount_path(kind)[: len(dates)]
+    rows = price_path(kind, len(dates))
+    amt = amount_path(kind, len(dates))
     o = np.array([r[0] for r in rows], dtype="float64")
     h = np.array([r[1] for r in rows], dtype="float64")
     lo = np.array([r[2] for r in rows], dtype="float64")

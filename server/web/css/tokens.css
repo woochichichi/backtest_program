@@ -149,8 +149,8 @@
 
   --tx: #171c29;
   --tx-str: #080b12;
-  --tx-sub: #545d72;
-  --tx-dim: #6f7890;
+  --tx-sub: #545d72;        /* 흰 배경 대비 6.4:1 */
+  --tx-dim: #6b7489;        /* 흰 배경 대비 4.7:1 — 다크의 --tx-dim 을 그대로 쓰지 않는다 */
   --tx-on-accent: #ffffff;
 
   /* 흰 배경에서 채도를 낮춘 적/청. 순수 #f23645 는 흰 위에서 번져 보인다. */
@@ -195,12 +195,13 @@
   --code-key: #1f4bb8;
   --code-str: #16704a;
   --code-num: #a34a12;
-  --code-cmt: #7b849a;
+  --code-cmt: #656e84;      /* 흰 배경 대비 5.1:1 */
 
   /* ---- 차트 (라이트) ---- */
   --ch-bg: #ffffff;
-  --ch-grid: #e8ecf4;
-  --ch-grid-str: #d5dae4;
+  /* 흰 배경에서는 다크와 같은 명도차로는 격자가 사라진다. 한 단계 진하게. */
+  --ch-grid: #dde3ee;
+  --ch-grid-str: #c6cedd;
   --ch-axis-tx: #545d72;
   --ch-axis-bg: #f3f6fb;
   --ch-label-bg: #3a4257;
@@ -208,10 +209,11 @@
 
   --ch-up: #c62436;
   --ch-dn: #1a56c4;
-  --ch-up-wick: #c6243699;
-  --ch-dn-wick: #1a56c499;
-  --ch-vol-up: rgba(198, 36, 54, .34);
-  --ch-vol-dn: rgba(26, 86, 196, .34);
+  /* 반투명 색은 흰 배경에서 훨씬 옅어 보이므로 다크보다 불투명도를 높인다 */
+  --ch-up-wick: #c62436cc;
+  --ch-dn-wick: #1a56c4cc;
+  --ch-vol-up: rgba(198, 36, 54, .55);
+  --ch-vol-dn: rgba(26, 86, 196, .55);
   --ch-vol-hi: #b06a00;
 
   --ch-cross: rgba(60, 70, 94, .55);

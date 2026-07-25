@@ -10,6 +10,16 @@ export const fmt = (n) => (Number.isFinite(+n) ? nf.format(Math.round(+n)) : '�
 export const fmt1 = (n) => (Number.isFinite(+n) ? (+n).toFixed(1) : '—');
 export const pct = (n) => (Number.isFinite(+n) ? ((+n >= 0 ? '+' : '') + (+n).toFixed(2) + '%') : '—');
 export const pct1 = (n) => (Number.isFinite(+n) ? ((+n >= 0 ? '+' : '') + (+n).toFixed(1) + '%') : '—');
+/** 원 단위 금액을 한국식 단위로. 1억 이상이면 억, 아니면 만. */
+export const krw = (won) => {
+  if (!Number.isFinite(+won)) return '—';
+  const v = +won;
+  if (Math.abs(v) >= 1e8) {
+    const e = v / 1e8;
+    return (Math.abs(e) >= 100 ? fmt(e) : e.toFixed(2).replace(/\.?0+$/, '')) + '억';
+  }
+  return fmt(v / 1e4) + '만';
+};
 export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -184,15 +194,26 @@ export function clearFieldErrors() {
    4. 좌측 — 지표 칩 (/api/indicators 응답으로만 렌더. 하드코딩 금지)
    ============================================================ */
 
-/** 지표 인스턴스 → 차트 API 키 ("SMA:20", "MACD:12,26,9", "OBV") */
+/**
+ * 지표 인스턴스 → 차트 API 키.
+ * ARCHITECTURE 4-6 의 `indicators=SMA:20,SMA:45` 형식을 정확히 맞춘다.
+ * source / anchor 같은 문자열 파라미터는 키에 넣지 않는다 (숫자 파라미터만).
+ */
+const NUMERIC = new Set(['int', 'float', 'number']);
 export function indKey(spec, params) {
-  const ps = (spec.params || []).map((p) => params[p.name]).filter((v) => v !== undefined && v !== null);
+  const ps = (spec.params || [])
+    .filter((p) => NUMERIC.has(p.type) || (p.type === undefined && typeof params[p.name] === 'number'))
+    .map((p) => params[p.name])
+    .filter((v) => v !== undefined && v !== null);
   return ps.length ? `${spec.key}:${ps.join(',')}` : spec.key;
 }
 
 /** 지표 인스턴스 → 화면 라벨 */
 export function indLabel(spec, params) {
-  const ps = (spec.params || []).map((p) => params[p.name]).filter((v) => v !== undefined && v !== null);
+  const ps = (spec.params || [])
+    .filter((p) => NUMERIC.has(p.type) || (p.type === undefined && typeof params[p.name] === 'number'))
+    .map((p) => params[p.name])
+    .filter((v) => v !== undefined && v !== null);
   return ps.length ? `${spec.label || spec.key} ${ps.join('/')}` : (spec.label || spec.key);
 }
 
@@ -263,8 +284,7 @@ export function renderKpis(m) {
   set('kWin', Number.isFinite(m.win_rate_pct) ? (+m.win_rate_pct).toFixed(1) + '%' : '—');
   set('kPf', Number.isFinite(m.profit_factor) ? (+m.profit_factor).toFixed(2) : '—');
 
-  const manwon = (won) => Number.isFinite(won) ? fmt(won / 1e4) + '만' : '—';
-  $('kRetSub').textContent = `${manwon(m.initial_capital)} → ${manwon(m.final_capital)}`;
+  $('kRetSub').textContent = `${krw(m.initial_capital)} → ${krw(m.final_capital)}`;
   $('kCagrSub').textContent = m.period && m.period.years ? `${(+m.period.years).toFixed(2)}년` : '—';
   $('kMddSub').textContent = '최대 낙폭';
   $('kPfSub').textContent = `평균 ${pct1(m.avg_win_pct)} / ${pct1(m.avg_loss_pct)}`;

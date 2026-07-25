@@ -30,6 +30,17 @@ RISK_FREE_RATE = 0.03
 TRADING_DAYS = 252
 
 
+def _i(v):
+    """원 단위 정수. None/NaN 안전."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(round(f)) if math.isfinite(f) else None
+
+
 def _r(v, nd=2):
     """None/NaN 안전 반올림."""
     if v is None:
@@ -164,8 +175,8 @@ def trade_stats(trades: Iterable[Dict]) -> Dict:
         "avg_win_pct": _r(rets[win_mask].mean()) if wins else 0.0,
         "avg_loss_pct": _r(rets[loss_mask].mean()) if losses else 0.0,
         "avg_hold_days": _r(holds.mean(), 1) if n else 0.0,
-        "gross_profit": _r(gross_profit, 0),
-        "gross_loss": _r(gross_loss, 0),
+        "gross_profit": _i(gross_profit),
+        "gross_loss": _i(gross_loss),
     }
 
 
@@ -205,8 +216,8 @@ def compute_metrics(
         "avg_win_pct": st["avg_win_pct"],
         "avg_loss_pct": st["avg_loss_pct"],
         "avg_hold_days": st["avg_hold_days"],
-        "initial_capital": _r(initial_capital, 0),
-        "final_capital": _r(final, 0),
+        "initial_capital": _i(initial_capital),
+        "final_capital": _i(final),
         "period": {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -235,7 +246,7 @@ def by_stock_summary(trades: Iterable[Dict]) -> List[Dict]:
                 "name": row["name"],
                 "trades": row["trades"],
                 "win_rate": _r(row["wins"] / row["trades"] * 100.0) if row["trades"] else 0.0,
-                "pnl": _r(row["pnl"], 0),
+                "pnl": _i(row["pnl"]),
             }
         )
     out.sort(key=lambda r: (r["pnl"] is None, -(r["pnl"] or 0.0)))

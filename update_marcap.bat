@@ -64,7 +64,7 @@ if not exist "!REPO!\.git" (
 :finish
 rem ---- 상태 파일 기록 ^(웹에서 마지막 갱신 시각 표시^) ----
 echo  [2/2] 상태 파일 기록 중...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='!REPO!\data'; $f=@(); if(Test-Path $p){$f=@(Get-ChildItem -LiteralPath $p -Filter 'marcap-*' | Sort-Object Name)}; $latest=''; if($f.Count -gt 0){$latest=$f[-1].Name}; $rev=''; if(Test-Path '!REPO!\.git'){$rev=(git -C '!REPO!' rev-parse --short HEAD 2>$null)}; $o=[ordered]@{last_sync=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss');result='!RESULT!';repo_path='marcap';latest_file=$latest;file_count=$f.Count;git_rev=$rev}; ($o|ConvertTo-Json) | Set-Content -LiteralPath '!STATUS!' -Encoding UTF8"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='!REPO!\data'; $f=@(); if(Test-Path $p){$f=@(Get-ChildItem -LiteralPath $p -Filter 'marcap-*' | Sort-Object Name)}; $latest=''; if($f.Count -gt 0){$latest=$f[-1].Name}; $rev=''; if(Test-Path '!REPO!\.git'){$rev=(git -C '!REPO!' rev-parse --short HEAD 2>$null)}; $o=[ordered]@{last_sync=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss');result='!RESULT!';repo_path='marcap';latest_file=$latest;file_count=$f.Count;git_rev=$rev}; $json=($o|ConvertTo-Json); [System.IO.File]::WriteAllText('!STATUS!', $json, (New-Object System.Text.UTF8Encoding($false)))"
 
 echo  [2/2] 완료: !STATUS!
 echo.

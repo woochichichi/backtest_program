@@ -23,12 +23,18 @@ echo  설치 위치 : !ROOT!
 echo  가상환경  : !VENV!
 echo.
 
-rem ---- [1/4] 파이썬 확인 ----
+rem ---- [1/4] 파이썬 확인 ^(3.10 ~ 3.13 지원^) ----
+rem  numpy/pandas 는 정식 릴리스 버전에만 미리 빌드된 휠을 제공합니다.
+rem  3.14 이상이나 베타 버전에서는 소스 빌드를 시도하다 컴파일러가 없어 실패합니다.
 set "PYCMD="
 where py >nul 2>&1
 if !errorlevel! equ 0 (
-    py -3 --version >nul 2>&1
-    if !errorlevel! equ 0 set "PYCMD=py -3"
+    for %%v in (3.13 3.12 3.11 3.10) do (
+        if not defined PYCMD (
+            py -%%v --version >nul 2>&1
+            if !errorlevel! equ 0 set "PYCMD=py -%%v"
+        )
+    )
 )
 if not defined PYCMD (
     where python >nul 2>&1
@@ -45,8 +51,34 @@ if not defined PYCMD (
     goto :end
 )
 
-echo  [1/4] 파이썬을 찾았습니다.
-!PYCMD! --version
+rem ---- 버전 검증 ----
+set "PYVER="
+for /f "tokens=2" %%a in ('!PYCMD! --version 2^>^&1') do set "PYVER=%%a"
+set "PYOK="
+for /f "tokens=1,2 delims=." %%a in ("!PYVER!") do (
+    if "%%a"=="3" (
+        if %%b geq 10 if %%b leq 13 set "PYOK=1"
+    )
+)
+if not defined PYOK (
+    echo  [오류] 지원하지 않는 파이썬 버전입니다: !PYVER!
+    echo.
+    echo         numpy / pandas 는 정식 릴리스 버전에만 미리 빌드된 파일을 제공합니다.
+    echo         3.14 이상이나 베타^(b^) 버전에서는 직접 컴파일을 시도하다 실패합니다.
+    echo.
+    echo         해결 방법: Python 3.13 을 설치하세요.
+    echo         https://www.python.org/downloads/release/python-3130/
+    echo         페이지 하단의 "Windows installer ^(64-bit^)" 를 받으면 됩니다.
+    echo         설치 화면 맨 아래 "Add python.exe to PATH" 를 반드시 체크하세요.
+    echo.
+    echo         기존 !PYVER! 를 지울 필요는 없습니다. 3.13 을 추가로 설치하면
+    echo         이 스크립트가 자동으로 3.13 을 골라 씁니다.
+    echo.
+    echo         설치 후 이 창을 닫고 install.bat 을 다시 실행하세요.
+    goto :end
+)
+
+echo  [1/4] 파이썬을 찾았습니다: !PYVER!
 echo.
 
 rem ---- [2/4] 가상환경 ----

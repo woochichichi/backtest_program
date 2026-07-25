@@ -384,19 +384,23 @@ function newStrategy() {
    4. 차트
    ============================================================ */
 
-async function loadChart() {
+/**
+ * @param {object} o {code, start, end, n, name}  생략하면 현재 종목 + 기간 세그먼트 값
+ */
+async function loadChart(o = {}) {
   if (!S.chart) return;
   const r = rangeParams();
-  const code = S.symbol.code || firstTradeCode() || '';
+  const code = o.code || S.symbol.code || firstTradeCode() || '';
+  const start = o.start || r.start, end = o.end || r.end, n = o.n || r.n;
   $('chartEmpty').hidden = false;
   $('chartEmptyMsg').textContent = '차트 데이터를 불러오는 중입니다…';
   try {
     const payload = await api.getChart({
-      code, start: r.start, end: r.end, n: r.n,
+      code, start, end, n,
       indicators: S.active.map((a) => a.key),
       run_id: S.result ? S.result.run_id : undefined,
     });
-    S.symbol = { code: payload.code || code, name: payload.name || '' };
+    S.symbol = { code: payload.code || code, name: payload.name || o.name || '' };
     $('symCode').textContent = S.symbol.code || '—';
     $('symName').textContent = S.symbol.name || (S.symbol.code ? '' : '종목을 선택하세요');
     S.chart.setData(payload, S.active);
@@ -415,10 +419,14 @@ function firstTradeCode() {
   return S.result && S.result.trades && S.result.trades.length ? S.result.trades[0].code : '';
 }
 
-/** t 배열(YYYYMMDD 정수)에서 날짜에 가장 가까운 인덱스 */
+/**
+ * t 배열(YYYYMMDD 정수)에서 날짜에 해당하는 인덱스.
+ * 배열 범위를 벗어나면 -1 을 돌려준다 (0 으로 뭉개면 엉뚱한 구간을 확대하게 된다).
+ */
 function indexOfDate(t, dateStr) {
   const target = ymdInt(dateStr);
   if (!target || !t || !t.length) return -1;
+  if (target < t[0] || target > t[t.length - 1]) return -1;
   let lo = 0, hi = t.length - 1;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
@@ -427,7 +435,27 @@ function indexOfDate(t, dateStr) {
   return lo;
 }
 
-/** 거래 내역 행 클릭 → 해당 종목·구간으로 이동 + 마커 강조 */
+/** 거래의 시작/끝 날짜 (기준일 ~ 청산일) */
+function tradeSpan(t) {
+  const fills = t.fills || [];
+  return {
+    from: t.ref_date || (fills[0] && fills[0].date) || t.exit_date,
+    to: t.exit_date || (fills[fills.length - 1] && fills[fills.length - 1].date) || t.ref_date,
+  };
+}
+
+/** 날짜 문자열에 개월 수를 더한다 */
+function shiftMonths(dateStr, months) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return dateStr;
+  d.setMonth(d.getMonth() + months);
+  return isoOf(d);
+}
+
+/**
+ * 거래 내역 행 클릭 → 해당 종목·구간으로 차트 이동 + 마커 강조.
+ * 거래 구간이 반드시 들어오도록 조회 기간을 거래 기준으로 다시 계산해서 받는다.
+ */
 async function gotoTrade(no) {
   const trades = (S.result && S.result.trades) || [];
   const t = trades.find((x) => x.no === no);
@@ -436,22 +464,38 @@ async function gotoTrade(no) {
   $('tradeIdxLabel').textContent = `${no} / ${trades.length}`;
   P.selectTradeRow(no);
 
-  if (t.code !== S.symbol.code) {
-    S.symbol = { code: t.code, name: t.name || '' };
-    // 거래 구간이 확실히 들어오도록 기간을 넓힌다
-    if (S.rangeMonths && S.rangeMonths < 12) setRange(12);
-    else await loadChart();
+  const span = tradeSpan(t);
+  const d0 = S.chart.d;
+  const covered = d0 && d0.n
+    && S.symbol.code === t.code
+    && indexOfDate(d0.t, span.from) >= 0
+    && indexOfDate(d0.t, span.to) >= 0;
+
+  if (!covered) {
+    // 거래 앞뒤로 2개월씩 여유를 두고 다시 받는다 (await 필수 —
+    // 기다리지 않으면 새 데이터가 도착하면서 setHighlight 가 지워진다)
+    const start = shiftMonths(span.from, -2);
+    const end = shiftMonths(span.to, 2);
+    const days = Math.max(40, Math.round((ymdDate(end) - ymdDate(start)) / 86400000 * 0.69));
+    await loadChart({ code: t.code, name: t.name, start, end, n: days });
   }
   focusTrade(t);
 }
 
+function ymdDate(s) { return new Date(s + 'T00:00:00').getTime(); }
+
 function focusTrade(t) {
   const d = S.chart && S.chart.d;
-  if (!d) return;
-  const from = indexOfDate(d.t, t.ref_date || (t.fills && t.fills[0] && t.fills[0].date));
-  const to = indexOfDate(d.t, t.exit_date || (t.fills && t.fills[t.fills.length - 1] && t.fills[t.fills.length - 1].date));
+  if (!d || !d.n) return;
+  const span = tradeSpan(t);
+  const from = indexOfDate(d.t, span.from);
+  const to = indexOfDate(d.t, span.to);
   if (from < 0 || to < 0) {
-    P.toast(`${t.name || t.code} 거래 구간이 현재 조회 기간 밖입니다. "전체"를 눌러 보세요.`, 'err', 3600);
+    // 폴백 모드에서는 차트와 거래 내역이 서로 다른 예시 데이터라 날짜가 맞지 않는 게 정상이다
+    P.toast(api.isFallback()
+      ? '예시 데이터에서는 거래 구간과 차트 구간이 서로 맞지 않습니다. 실제 결과는 백엔드를 띄운 뒤 확인하세요.'
+      : `${t.name || t.code} 거래 구간(${span.from} ~ ${span.to})이 차트 데이터 범위 밖입니다.`,
+    api.isFallback() ? '' : 'err', 4000);
     return;
   }
   S.chart.focusRange(from, to);
@@ -489,8 +533,8 @@ async function runBacktest() {
   btn.disabled = true;
   $('btnRunLabel').textContent = '실행 중…';
 
-  // SSE 진행률이 있으면 쓰고, 없으면 인디터미닛 진행바
-  let es = api.backtestProgressStream();
+  // 서버가 진행률 SSE 를 지원한다고 알린 경우에만 연결. 아니면 인디터미닛 진행바.
+  let es = api.backtestProgressStream(S.status);
   let gotProgress = false;
   P.progress(null);
   if (es) {

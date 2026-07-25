@@ -213,12 +213,16 @@ export function runBacktest(strategy, period) {
 }
 
 /**
- * 백테스트 진행률 SSE. 서버에 엔드포인트가 없으면 조용히 null 을 반환하고
- * 호출부는 인디터미닛 진행바로 대체한다.
+ * 백테스트 진행률 SSE.
+ * ARCHITECTURE 4장에 SSE 엔드포인트가 정의되어 있지 않으므로 무조건 열지 않는다.
+ * (없는 URL 로 EventSource 를 열면 콘솔에 404 에러가 남는다)
+ * `GET /api/status` 응답에 features.backtest_progress_sse: true 가 있을 때만 연결하고,
+ * 그 외에는 null 을 돌려 호출부가 인디터미닛 진행바를 쓰게 한다.
  * @returns {EventSource|null}
  */
-export function backtestProgressStream(runId) {
-  if (fallback || typeof EventSource === 'undefined') return null;
+export function backtestProgressStream(status, runId) {
+  const on = status && status.features && status.features.backtest_progress_sse === true;
+  if (!on || fallback || typeof EventSource === 'undefined') return null;
   try {
     return new EventSource(`${BASE}/backtest/progress${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`);
   } catch {
