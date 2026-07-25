@@ -25,13 +25,23 @@ from .indicators import REGISTRY
 from .metrics import _i, build_equity, by_stock_summary, compute_metrics, monthly_returns
 from .validate import validate_strategy
 
-__all__ = ["run_backtest", "EOK"]
+__all__ = ["run_backtest", "EOK", "SAME_DAY_EXIT_MODES", "DEFAULT_SAME_DAY_EXIT"]
 
 #: 1억
 EOK = 100_000_000.0
 
 #: signals 배열 최대 길이 (프런트 로그 탭 보호)
 MAX_SIGNALS = 4000
+
+#: ``execution.same_day_exit`` — 진입 체결 당일의 청산 평가 정책
+SAME_DAY_EXIT_MODES = ("loss_only", "never", "always")
+
+#: 기본값. 일봉만으로는 저가·고가 순서를 알 수 없으므로 보수적으로 잡는다.
+DEFAULT_SAME_DAY_EXIT = "loss_only"
+
+#: ``same_day_exit="loss_only"`` 에서 진입 당일 평가를 **막는** 청산 타입.
+#: type 이 없는 커스텀 규칙은 손실 방향으로 간주해 당일 평가를 허용한다(보수적).
+_PROFIT_EXIT_TYPES = frozenset({"take_profit"})
 
 _PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount"]
 
@@ -725,6 +735,78 @@ def run_backtest(
 # ======================================================================================
 
 
+def _same_day_allowed(mode: str, rule: Mapping) -> bool:
+    """진입 체결 당일에 이 청산 규칙을 평가해도 되는가.
+
+    * ``always``    — 전부 허용 (낙관적)
+    * ``never``     — 전부 차단 (가장 보수적)
+    * ``loss_only`` — ``type: "take_profit"`` 만 차단. type 이 없는 커스텀 규칙은
+      손실 방향으로 간주해 허용한다.
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return str(rule.get("type") or "") not in _PROFIT_EXIT_TYPES
+
+
+_FILL_MODEL_NOTES = {
+    "touch": "체결가는 목표가 그대로 잡되, 갭으로 목표가를 지나쳐 시작한 날은 당일 시가로 체결했습니다.",
+    "next_open": "조건이 성립한 다음 거래일 시가로 체결했습니다.",
+    "close": "조건이 성립한 당일 종가로 체결했습니다.",
+}
+
+_SAME_DAY_NOTES = {
+    "loss_only": (
+        "진입 체결이 있었던 날에는 손절 계열만 평가하고 익절은 다음 거래일부터 평가했습니다 "
+        "(same_day_exit=loss_only). 같은 봉에서 매수가와 익절가가 모두 닿았더라도 "
+        "익절이 먼저였다고 단정할 수 없기 때문입니다."
+    ),
+    "never": (
+        "진입 체결이 있었던 날에는 어떤 청산도 평가하지 않고 다음 거래일부터 판정했습니다 "
+        "(same_day_exit=never). 세 가지 설정 중 가장 보수적입니다."
+    ),
+    "always": (
+        "진입 체결이 있었던 날에도 익절·손절을 모두 평가했습니다 (same_day_exit=always). "
+        "같은 봉에서 매수가와 익절가가 모두 닿으면 매수가 먼저였다고 가정하므로 "
+        "결과가 실제보다 좋게 나올 수 있습니다."
+    ),
+}
+
+
+def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit: str,
+                      slippage: float, fee: float, ordered_exits: Sequence[Mapping],
+                      stats: Mapping) -> List[str]:
+    """사용자에게 그대로 보여줄 실행 가정 문장들."""
+    notes = [
+        "일봉 데이터만 사용했습니다. 하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.",
+    ]
+    if requested_resolution != "1d":
+        notes.append(
+            f"전략은 {requested_resolution} 해상도 체결을 요청했지만 marcap 은 일봉만 제공합니다. "
+            "분봉 매매는 추후 지원 예정이며, 그 전까지는 일봉 근사로 동작합니다."
+        )
+    notes.append(_FILL_MODEL_NOTES.get(fill_model, f"fill_model={fill_model} 로 체결했습니다."))
+    notes.append(_SAME_DAY_NOTES.get(same_day_exit, ""))
+    notes.append(
+        f"매수는 체결가 +{slippage * 100:g}%, 매도는 -{slippage * 100:g}% 슬리피지를 적용하고 "
+        f"매도 대금에 {fee * 100:g}% 비용(수수료+거래세)을 부과했습니다."
+    )
+    ids = [r.get("id") for r in ordered_exits]
+    if len(ids) > 1:
+        notes.append(
+            f"같은 봉에서 여러 청산이 동시에 성립하면 {' → '.join(str(i) for i in ids)} 순서로 평가했습니다."
+        )
+    amb = int(stats.get("ambiguous_bars") or 0)
+    if amb:
+        notes.append(
+            f"진입과 청산 조건이 같은 봉 안에서 모두 성립한 경우가 {amb:,}건 있었습니다. "
+            "이 봉들은 순서를 확정할 수 없어 위 가정에 의존합니다. 건수가 많을수록 결과 신뢰도는 낮습니다."
+        )
+    notes.append("미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).")
+    return [n for n in notes if n]
+
+
 def _order_exits(exits: Sequence[Mapping], priority: Sequence[str]) -> List[Mapping]:
     by_id = {r.get("id"): r for r in exits}
     ordered = [by_id[i] for i in priority if i in by_id]
@@ -745,6 +827,7 @@ def _new_watch(code: str, ref_date: dt.date, ref_li: int, ref_gi: int, refbar: d
         "cost": 0.0,
         "planned": None,
         "entry_date": None,
+        "last_entry_date": None,
         "peak": None,
     }
 
@@ -938,7 +1021,8 @@ def _mtm(active: Mapping[str, dict], recs: Mapping[str, dict], day: dt.date) -> 
     return total
 
 
-def _empty_result(run_id, t0, warnings, sig, calendar, initial_capital, start, end, note) -> dict:
+def _empty_result(run_id, t0, warnings, sig, calendar, initial_capital, start, end,
+                  note, assumptions) -> dict:
     warnings = list(warnings) + [note]
     values = [initial_capital] * len(calendar)
     sig.add(calendar[-1] if calendar else None, "DONE", None, note, "15:30:00")
@@ -946,6 +1030,7 @@ def _empty_result(run_id, t0, warnings, sig, calendar, initial_capital, start, e
         "run_id": run_id,
         "elapsed_sec": _r(time.perf_counter() - t0, 3),
         "warnings": warnings,
+        "assumptions": assumptions,
         "metrics": compute_metrics(calendar, values, [], initial_capital, start, end),
         "equity": build_equity(calendar, values, initial_capital),
         "monthly": monthly_returns(calendar, values),

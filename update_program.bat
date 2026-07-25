@@ -50,9 +50,9 @@ if exist "!ROOT!\.server.pid" (
     taskkill /PID !SRVPID! /T /F >nul 2>&1
     del /q "!ROOT!\.server.pid" >nul 2>&1
 )
-if exist "!PYEXE!" (
-    wmic process where "ExecutablePath='!PYEXE:\=\\!'" call terminate >nul 2>&1
-)
+rem  wmic 은 최신 Windows 에서 제거되어 쓰지 않는다.
+rem  VBS 로 켠 경우 위의 PID 종료로 충분하고,
+rem  파이썬 소스는 잠기지 않으므로 pull 자체는 어차피 성공한다.
 echo  [1/4] 완료.
 echo.
 

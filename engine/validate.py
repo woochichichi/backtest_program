@@ -31,6 +31,7 @@ _SIZE_OF = {"planned_position", "equity", "position"}
 _EXIT_TYPES = {"take_profit", "stop_loss", "trailing_stop", "time_exit", "signal"}
 _SIZING = {"equal_weight", "fixed_amount", "fixed_qty"}
 _FILL_MODELS = {"touch", "next_open", "close"}
+_SAME_DAY_EXIT = {"loss_only", "never", "always"}
 _RESOLUTIONS = {"1m", "1d"}
 _BARS = {"1d"}
 
@@ -440,6 +441,8 @@ def _check_execution(obj: Mapping, err: _Errors):
         return
     _enum(e.get("resolution", "1d"), _RESOLUTIONS, "execution.resolution", err, "해상도")
     _enum(e.get("fill_model", "touch"), _FILL_MODELS, "execution.fill_model", err, "fill_model")
+    _enum(e.get("same_day_exit", "loss_only"), _SAME_DAY_EXIT,
+          "execution.same_day_exit", err, "same_day_exit")
     _num(e, "slippage_pct", "execution", err, minimum=0, maximum=100)
     _num(e, "fee_pct", "execution", err, minimum=0, maximum=100)
 

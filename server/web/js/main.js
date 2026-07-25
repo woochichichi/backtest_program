@@ -392,6 +392,20 @@ async function loadChart(o = {}) {
   const r = rangeParams();
   const code = o.code || S.symbol.code || firstTradeCode() || '';
   const start = o.start || r.start, end = o.end || r.end, n = o.n || r.n;
+
+  // 종목이 정해지기 전에는 요청하지 않는다.
+  // (code 없이 부르면 /api/chart 가 필수 파라미터 누락으로 422 를 낸다)
+  if (!code) {
+    S.chart.setData(null);
+    $('symCode').textContent = '—';
+    $('symName').textContent = '종목 미선택';
+    $('chartEmpty').hidden = false;
+    $('chartEmptyMsg').textContent =
+      '표시할 종목이 없습니다. 백테스트를 실행하면 첫 거래 종목의 차트가 자동으로 표시되고, 거래 내역의 행을 클릭하면 그 구간으로 이동합니다.';
+    P.renderLegend(null, [], () => '', '');
+    return;
+  }
+
   $('chartEmpty').hidden = false;
   $('chartEmptyMsg').textContent = '차트 데이터를 불러오는 중입니다…';
   try {
