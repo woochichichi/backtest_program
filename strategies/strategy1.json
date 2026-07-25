@@ -1,0 +1,99 @@
+{
+  "schema": "krx-backtest-strategy/v1",
+  "id": "strategy1",
+  "name": "전략1 — 거래대금 급증 눌림목",
+  "description": "최근 20영업일 안에 일 거래대금 1,000억 이상이 발생한 날(기준일)을 찾는다. 기준일 직전일 거래대금이 200억 이하이고, 기준일 이후 주가가 기준일 시가까지 하락하면 시가에 50% 매수한다. 1차 매수가 대비 -10%에서 나머지 50%를 추가 매수한다. 평단가 +10%에서 전량 익절하고, 45일 이동평균선에 도달하면 전량 손절한다.",
+  "author": "user",
+  "created_at": "2026-07-25",
+  "enabled": true,
+
+  "market": {
+    "country": "KR",
+    "asset": "stock",
+    "bar": "1d",
+    "trade_resolution": "1m"
+  },
+
+  "universe": {
+    "markets": ["KOSPI", "KOSDAQ"],
+    "exclude": ["ETF", "ETN", "SPAC", "PREFERRED", "ADMIN_ISSUE", "TRADE_HALT"],
+    "reference_day": {
+      "rule": "amount_spike",
+      "lookback_days": 20,
+      "spike_amount_krw_eok": 1000,
+      "prev_day_amount_max_eok": 200,
+      "comment": "lookback_days 안에서 거래대금 >= spike_amount 인 날을 기준일로 삼는다. 기준일 직전 영업일 거래대금이 prev_day_amount_max 이하여야 한다. 조건을 만족하는 날이 복수면 가장 최근 날을 기준일로 채택한다."
+    },
+    "condition": "close_below_reference_open",
+    "valid_days_after_reference": 60
+  },
+
+  "entries": [
+    {
+      "id": "B1",
+      "label": "1차 매수 (기준일 시가 도달)",
+      "when": { "op": "<=", "left": "low", "right": "ref.open" },
+      "price": "ref.open",
+      "size_pct": 50,
+      "size_of": "planned_position"
+    },
+    {
+      "id": "B2",
+      "label": "2차 매수 (1차 매수가 -10%)",
+      "requires": ["B1"],
+      "trigger_pct": -10,
+      "when": { "op": "<=", "left": "low", "right": { "expr": "fill.B1.price * (1 + trigger_pct / 100)" } },
+      "price": { "expr": "fill.B1.price * (1 + trigger_pct / 100)" },
+      "size_pct": 50,
+      "size_of": "planned_position"
+    }
+  ],
+
+  "exits": [
+    {
+      "id": "TP",
+      "label": "익절 (평단 +10%)",
+      "type": "take_profit",
+      "target_pct": 10,
+      "when": { "op": ">=", "left": "high", "right": { "expr": "position.avg_price * (1 + target_pct / 100)" } },
+      "price": { "expr": "position.avg_price * (1 + target_pct / 100)" },
+      "size_pct": 100
+    },
+    {
+      "id": "SL",
+      "label": "손절 (45일선 도달)",
+      "type": "stop_loss",
+      "ma_period": 45,
+      "when": { "op": "<=", "left": "low", "right": { "indicator": "SMA", "period": 45, "source": "close" } },
+      "price": { "indicator": "SMA", "period": 45, "source": "close" },
+      "size_pct": 100
+    }
+  ],
+
+  "exit_priority": ["SL", "TP"],
+
+  "indicators": [
+    { "key": "MA45", "type": "SMA", "period": 45, "source": "close", "plot": true, "color": "#ba68c8" },
+    { "key": "MA20", "type": "SMA", "period": 20, "source": "close", "plot": true, "color": "#ffb74d" }
+  ],
+
+  "portfolio": {
+    "initial_capital_manwon": 10000,
+    "max_positions": 10,
+    "position_sizing": "equal_weight",
+    "allow_duplicate_symbol": false
+  },
+
+  "execution": {
+    "resolution": "1m",
+    "fill_model": "touch",
+    "slippage_pct": 0.1,
+    "fee_pct": 0.23,
+    "comment": "fee_pct는 매도 시 증권거래세 0.18% + 양방향 수수료 근사치를 합산한 값이다."
+  },
+
+  "period": {
+    "start": "2025-01-02",
+    "end": "auto"
+  }
+}

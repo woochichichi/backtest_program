@@ -1,0 +1,16 @@
+# marcap 데이터 저장소 (update_marcap.bat 이 clone/pull)
+/marcap/
+
+# 갱신 로그
+/logs/
+
+# 캐시
+/cache/
+__pycache__/
+*.pyc
+
+# 편집기
+.vscode/
+.idea/
+*.swp
+.DS_Store
