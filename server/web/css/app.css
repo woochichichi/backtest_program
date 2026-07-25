@@ -6,6 +6,15 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 
+/* display 를 지정한 컴포넌트(.btn 은 inline-flex)에서도 hidden 속성이 이겨야 한다.
+   UA 스타일시트의 [hidden]{display:none} 은 작성자 규칙에 밀린다. */
+[hidden] { display: none !important; }
+
+/* 한국어는 단어 중간에서 줄바꿈하면 읽기 어렵다. 어절 단위로 끊는다. */
+/* overflow-wrap 은 break-word 로 둔다. anywhere 는 flex/grid 의 min-content 계산까지
+   바꿔 레이아웃이 흔들린다. */
+body { word-break: keep-all; overflow-wrap: break-word; }
+
 body {
   background: var(--bg-0);
   color: var(--tx);
@@ -290,7 +299,8 @@ select.inp { text-align: left; cursor: pointer; padding-right: 4px; }
 }
 .sym { display: flex; align-items: center; gap: 7px; padding-right: 4px; min-width: 0; }
 .sym-cd { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--tx); }
-.sym-nm { font-size: 12px; color: var(--tx-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sym-nm { font-size: 12px; color: var(--tx-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.sym-cd { flex: 0 0 auto; }
 
 /* ===================== 차트 ===================== */
 .chart-wrap {
@@ -669,7 +679,7 @@ pre.code .sk-line { margin: 6px 0; }
 .assume-body { padding: 0 12px 12px; border-top: 1px solid var(--bd); margin-top: 2px; padding-top: 10px; }
 .as-rows { display: flex; flex-direction: column; gap: 1px; }
 .as-row {
-  display: grid; grid-template-columns: 84px 1fr; gap: 2px 8px;
+  display: grid; grid-template-columns: 92px 1fr; gap: 2px 8px;
   padding: 5px 7px; border-radius: var(--r-sm); background: var(--bg-1);
 }
 .as-row.warn { background: var(--warn-soft); }
@@ -701,9 +711,10 @@ pre.code .sk-line { margin: 6px 0; }
 }
 
 /* ---------- 종목 검색 ---------- */
-.sym-picker { position: relative; min-width: 0; }
+/* 좁은 화면에서 툴바의 다음 요소를 밀지 않도록 줄어들 수 있어야 한다 */
+.sym-picker { position: relative; min-width: 0; flex: 0 1 auto; }
 .sym {
-  display: flex; align-items: center; gap: 7px;
+  display: flex; align-items: center; gap: 7px; max-width: 100%;
   height: 28px; padding: 0 8px; border-radius: var(--r);
   border: 1px solid transparent; min-width: 0;
   transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
@@ -743,13 +754,16 @@ pre.code .sk-line { margin: 6px 0; }
 
 /* ---------- 차트 위 알림 (기간 잘림 등) ---------- */
 .chart-note {
-  position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 3;
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 4;
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 12px;
   background: var(--warn-soft); border: 1px solid var(--warn);
-  color: var(--tx); font-size: 11px; white-space: nowrap; max-width: 90%;
+  color: var(--tx); font-size: 11px; white-space: nowrap;
+  max-width: 62%; overflow: hidden; text-overflow: ellipsis;
 }
-.chart-note[hidden] { display: none; }
+.chart-note svg { flex: 0 0 auto; }
+/* 알림이 떠 있으면 좌상단 범례를 아래로 내려 겹치지 않게 한다 */
+.chart-wrap.has-note .legend { top: 34px; }
 .chart-empty {
   position: absolute; inset: 0; z-index: 3;
   display: flex; align-items: center; justify-content: center;
@@ -850,6 +864,9 @@ table.diff .mono { font-family: var(--mono); font-size: 10px; }
 
 @media (max-width: 1180px) {
   .next-step { padding: 9px 12px; }
+  /* 우측 패널이 좁아지면 라벨/값을 한 줄에 못 넣는다 → 위아래로 쌓는다 */
+  .as-row { grid-template-columns: 1fr; }
+  .as-n { grid-column: 1; }
   .stg-actions { grid-template-columns: repeat(2, 1fr); }
   #btnSave { grid-column: span 2; }
 }

@@ -225,16 +225,21 @@ export async function postSync(signal) {
 
 /**
  * GET /api/sync/status — 진행률 폴링.
- * 서버가 이 기능을 알리지 않으면 호출하지 않는다 (없는 URL 을 찌르지 않는다).
+ * 현재 서버는 이 엔드포인트를 갖고 있지만 features 로 알려 주지는 않는다.
+ * 그래서 기본값은 "있다"로 두되, 한 번이라도 실패하면 그 세션에서는 다시 부르지 않는다.
+ * (없는 서버에서 매 2초마다 404 를 찍어 콘솔을 더럽히지 않기 위해)
  * @returns {Promise<object|null>} 지원하지 않으면 null
  */
+let syncStatusOk = true;
 export async function getSyncStatus() {
-  if (fallback) return null;
-  if (!hasFeature('sync_status', false)) return null;
+  if (fallback) return mock.mockSyncStatus(1);
+  if (!syncStatusOk || !hasFeature('sync_status', true)) return null;
   try {
     return await request('/sync/status', {}, 8000);
-  } catch {
-    return null;   // 폴링 실패는 조용히 무시하고 인디터미닛으로 되돌린다
+  } catch (e) {
+    // 404/405 는 "이 서버엔 없다"는 뜻이므로 더 이상 찌르지 않는다
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405)) syncStatusOk = false;
+    return null;
   }
 }
 

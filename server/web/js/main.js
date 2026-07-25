@@ -37,6 +37,7 @@ const S = {
   running: false,
   syncing: false,
   syncFailed: false,
+  noAutoSymbol: false,   // 서버가 code 없는 /api/chart 를 거절했는가
   abort: null,             // 실행 중인 백테스트의 AbortController
   chart: null, eq: null, mo: null,
 };
@@ -76,6 +77,11 @@ function rangeParams() {
  */
 function handleError(e, ctx) {
   if (e && e.aborted) return;                 // 사용자가 취소한 건 오류가 아니다
+  // "데이터 없음" 은 이미 상단에 전용 안내가 떠 있다. 같은 말을 두 번 하지 않는다.
+  if (e instanceof ApiError && e.kind === 'nodata' && document.querySelector('[data-bid="no-data"]')) {
+    P.toast(e.message, 'err', 3600);
+    return;
+  }
   console.error(`[${ctx}]`, e);
   const isApi = e instanceof ApiError;
   const tone = isApi && (e.kind === 'network' || e.kind === 'nodata' || e.kind === 'slow') ? 'warn' : 'err';
@@ -156,14 +162,14 @@ async function startSync(o = {}) {
   paint();
   const tick = setInterval(paint, 1000);
 
-  // 서버가 진행 상황을 알려 주면 log_tail 까지 보여 준다
-  let poll = 0;
-  if (api.hasFeature('sync_status', false)) {
-    poll = setInterval(async () => {
-      const s = await api.getSyncStatus();
-      if (s && s.log_tail) { logTail = String(s.log_tail).split('\n').slice(-3).join('\n'); paint(); }
-    }, 2000);
-  }
+  // 서버가 진행 상황을 알려 주면 log_tail 까지 보여 준다.
+  // 지원하지 않는 서버면 getSyncStatus() 가 null 을 돌려주고 경과 시간만 표시된다.
+  const pollOnce = async () => {
+    const s = await api.getSyncStatus();
+    if (s && s.log_tail) { logTail = String(s.log_tail).split('\n').slice(-3).join('\n'); paint(); }
+  };
+  pollOnce();                              // 첫 진행 상황은 기다리지 않고 바로 보여 준다
+  const poll = setInterval(pollOnce, 2000);
 
   try {
     const st = await api.postSync();
@@ -627,9 +633,27 @@ async function loadChart(o = {}) {
   const code = o.code || S.symbol.code || firstTradeCode() || '';
   const start = o.start || r.start, end = o.end || r.end, n = o.n || r.n;
   $('chartNote').hidden = true;
+  $('chartWrap').classList.remove('has-note');
 
-  // 종목이 정해지기 전에는 요청하지 않는다 (code 없이 부르면 서버가 422 를 낸다)
-  if (!code) {
+  // 서버가 "데이터 없음"이라고 이미 알려 줬으면 실패가 확정된 요청을 보내지 않는다
+  // (콘솔에 503 을 남기지 않고, 같은 안내를 두 번 띄우지도 않는다)
+  if (S.status && S.status.available === false) {
+    S.chart.setData(null);
+    $('symCode').textContent = '—';
+    $('symName').textContent = '종목 선택';
+    showChartEmpty({
+      icon: 'alert',
+      title: '주가 데이터가 없어 차트를 그릴 수 없습니다',
+      desc: '화면 위 안내대로 update_marcap.bat 을 실행해 데이터를 받은 뒤 이 화면을 새로고침하세요.',
+    });
+    P.renderLegend(null, [], () => '', '');
+    return;
+  }
+
+  // code 는 선택 파라미터다. 비워서 보내면 서버가 기본 종목(최근 실행의 첫 거래 종목
+  // → 시가총액 1위)을 골라 준다. 이 기능이 없는 구버전 서버는 400/422 를 내므로
+  // 그때는 한 번만 시도하고 이후에는 종목 선택 안내로 대체한다.
+  if (!code && S.noAutoSymbol) {
     S.chart.setData(null);
     $('symCode').textContent = '—';
     $('symName').textContent = '종목 선택';
@@ -643,7 +667,10 @@ async function loadChart(o = {}) {
     return;
   }
 
-  showChartEmpty({ icon: 'chart', title: '차트를 불러오는 중입니다…', desc: `${code} 의 시세를 받고 있습니다.` });
+  showChartEmpty({
+    icon: 'chart', title: '차트를 불러오는 중입니다…',
+    desc: code ? `${code} 의 시세를 받고 있습니다.` : '표시할 종목을 고르는 중입니다.',
+  });
   try {
     const payload = await api.getChart({
       code, start, end, n,
@@ -660,6 +687,7 @@ async function loadChart(o = {}) {
       // 서버가 요청한 기간을 다 주지 못했으면 알린다
       if (payload.truncated) {
         $('chartNote').hidden = false;
+        $('chartWrap').classList.add('has-note');   // 범례를 아래로 밀어 겹침 방지
         $('chartNote').innerHTML =
           `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>` +
           `요청한 기간 전체가 표시되지 않았습니다 — 실제 표시 구간 ${P.esc(payload.start || '')} ~ ${P.esc(payload.end || '')}`;
@@ -674,6 +702,18 @@ async function loadChart(o = {}) {
     P.renderLegend(null, [], () => '', `${S.symbol.code} ${S.symbol.name}`);
     P.clearBanner('err-차트 불러오기');
   } catch (e) {
+    // 종목을 안 보내서 거절당한 경우는 오류가 아니라 "종목을 골라야 한다"는 뜻이다
+    if (!code && e instanceof ApiError && (e.status === 400 || e.status === 422)) {
+      S.noAutoSymbol = true;
+      S.chart.setData(null);
+      showChartEmpty({
+        icon: 'symbol',
+        title: '먼저 볼 종목을 골라 주세요',
+        desc: '이 서버는 종목을 지정해야 차트를 보여 줍니다. 백테스트를 실행하면 첫 거래 종목이 자동으로 표시됩니다.',
+        action: { label: '종목 고르기', act: 'pickSymbol', primary: true },
+      });
+      return;
+    }
     handleError(e, '차트 불러오기');
     showChartEmpty({
       icon: 'alert', tone: 'err',
