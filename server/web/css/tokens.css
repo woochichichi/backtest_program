@@ -1,0 +1,238 @@
+/* ============================================================
+   KRX Backtester — 디자인 토큰
+   색상은 오직 이 파일에서만 정의한다. app.css / chart.js 는
+   전부 여기 정의된 CSS 변수를 통해서만 색을 참조한다.
+
+   - :root                      → 다크 (기본)
+   - :root[data-theme="light"]  → 라이트 (독립 설계, 단순 반전 아님)
+
+   상승=적색 / 하락=청색 (국내 증시 관행) 은 두 테마 모두 유지하되
+   라이트에서는 채도를 낮추고 명도를 내려 흰 배경에서 눈이 덜 피로하게 한다.
+   ============================================================ */
+
+:root {
+  /* ---- 형태 ---- */
+  --r: 6px;
+  --r-sm: 4px;
+  --r-lg: 10px;
+  --mono: "JetBrains Mono", "D2Coding", "Cascadia Mono", Consolas, "SF Mono", ui-monospace, monospace;
+  --sans: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+  --z-nav: 20;
+  --z-pop: 30;
+  --z-modal: 50;
+  --z-toast: 60;
+  --dur: 180ms;
+  --ease: cubic-bezier(.4, 0, .2, 1);
+
+  /* ============ 다크 테마 ============ */
+  --bg-0: #0b0e11;          /* 앱 최하단 */
+  --bg-1: #131722;          /* 패널 */
+  --bg-2: #1b2130;          /* 카드 / 입력 */
+  --bg-3: #232a3b;          /* hover */
+  --bg-4: #2c344a;          /* active / 눌림 */
+  --bg-inset: #0f131d;      /* 입력 포커스 / 코드 블록 */
+
+  --bd: #2a3143;            /* 기본 보더 */
+  --bd-str: #3a4359;        /* 강조 보더 */
+  --bd-soft: #1f2534;       /* 표 내부 구분선 */
+
+  --tx: #d9dde7;            /* 본문 */
+  --tx-str: #f2f5fa;        /* 강조 본문 */
+  --tx-sub: #8b93a7;        /* 보조 (4.5:1 이상) */
+  --tx-dim: #6b7488;        /* 흐림 (3:1 이상) */
+  --tx-on-accent: #ffffff;
+
+  --up: #f23645;            /* 상승 */
+  --up-soft: rgba(242, 54, 69, .16);
+  --dn: #4886ff;            /* 하락 */
+  --dn-soft: rgba(72, 134, 255, .16);
+  --buy: #00c853;           /* 매수 마커 */
+  --buy-soft: rgba(0, 200, 83, .16);
+  --buy-tx: #4ade80;
+  --sell: #ffab00;          /* 매도 마커 */
+  --sell-soft: rgba(255, 171, 0, .16);
+  --sell-tx: #fbbf24;
+
+  --accent: #2962ff;
+  --accent-hi: #1e50d8;
+  --accent-soft: rgba(41, 98, 255, .16);
+  --accent-bd: rgba(41, 98, 255, .5);
+  --accent-tx: #8fb0ff;
+  --accent-2: #00bcd4;
+  --accent-2-tx: #4dd0e1;
+  --accent-2-soft: rgba(0, 188, 212, .14);
+
+  --warn: #ff9800;
+  --warn-soft: rgba(255, 152, 0, .14);
+  --warn-tx: #ffb74d;
+  --danger: #f23645;
+  --danger-soft: rgba(242, 54, 69, .14);
+  --danger-tx: #ff7b86;
+  --ok: #26a69a;
+  --ok-soft: rgba(38, 166, 154, .14);
+  --ok-tx: #4db6ac;
+
+  --shadow-1: 0 2px 8px rgba(0, 0, 0, .40);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, .55);
+  --shadow-3: 0 18px 48px rgba(0, 0, 0, .65);
+  --scrim: rgba(4, 6, 10, .62);
+  --scrollbar: #333c52;
+  --scrollbar-hi: #465172;
+
+  /* 코드 하이라이트 */
+  --code-tx: #c3cadb;
+  --code-key: #82aaff;
+  --code-str: #c3e88d;
+  --code-num: #f78c6c;
+  --code-cmt: #5f6779;
+
+  /* ============ 차트 (canvas 가 읽는 값) ============
+     여기 값은 전부 불투명 hex 또는 rgba 이며 chart.js 가
+     getComputedStyle 로 읽어 캐시한다. 테마 전환 시 캐시 무효화. */
+  --ch-bg: #131722;
+  --ch-grid: #202639;
+  --ch-grid-str: #2a3143;
+  --ch-axis-tx: #8b93a7;
+  --ch-axis-bg: #1b2130;
+  --ch-label-bg: #39415a;
+  --ch-label-tx: #f2f5fa;
+
+  --ch-up: #f23645;
+  --ch-dn: #4886ff;
+  --ch-up-wick: #f2364580;
+  --ch-dn-wick: #4886ff80;
+  --ch-vol-up: rgba(242, 54, 69, .48);
+  --ch-vol-dn: rgba(72, 134, 255, .48);
+  --ch-vol-hi: #ffab00;
+
+  --ch-cross: rgba(160, 170, 195, .55);
+  --ch-buy: #00c853;
+  --ch-sell: #ffab00;
+  --ch-ref: #ffab00;
+  --ch-hold: rgba(0, 200, 83, .07);
+  --ch-hold-bd: rgba(0, 200, 83, .28);
+  --ch-marker-tx: #08130a;
+  --ch-hilite: #00e5ff;
+
+  --ch-ma-1: #ffb74d;
+  --ch-ma-2: #ba68c8;
+  --ch-ma-3: #4dd0e1;
+  --ch-ma-4: #f06292;
+  --ch-ma-5: #81c784;
+  --ch-ma-6: #90a4ae;
+
+  --ch-eq-line: #f23645;
+  --ch-eq-fill-0: rgba(242, 54, 69, .30);
+  --ch-eq-fill-1: rgba(242, 54, 69, 0);
+  --ch-dd-fill: rgba(72, 134, 255, .22);
+  --ch-base-line: rgba(139, 147, 167, .5);
+}
+
+/* ============================================================
+   라이트 테마 — 독립 설계
+   본문 #171c29 (배경 #fff 대비 15.9:1)
+   보조 #545d72 (대비 6.4:1)  → WCAG AA 본문/보조 모두 통과
+   흐림 #6f7890 (대비 4.6:1)  → 다크의 --tx-dim 을 그대로 쓰지 않는다
+   보더 #d5dae4 → 흰 패널 위에서 실제로 보이는 회색
+   ============================================================ */
+:root[data-theme="light"] {
+  --bg-0: #e9edf4;          /* 앱 최하단 — 패널과 구분되는 옅은 청회색 */
+  --bg-1: #ffffff;          /* 패널 */
+  --bg-2: #f3f6fb;          /* 카드 / 입력 */
+  --bg-3: #e6ebf4;          /* hover */
+  --bg-4: #d9e0ec;          /* active */
+  --bg-inset: #ffffff;
+
+  --bd: #d5dae4;
+  --bd-str: #b4bccd;
+  --bd-soft: #e6eaf1;
+
+  --tx: #171c29;
+  --tx-str: #080b12;
+  --tx-sub: #545d72;
+  --tx-dim: #6f7890;
+  --tx-on-accent: #ffffff;
+
+  /* 흰 배경에서 채도를 낮춘 적/청. 순수 #f23645 는 흰 위에서 번져 보인다. */
+  --up: #c62436;
+  --up-soft: rgba(198, 36, 54, .10);
+  --dn: #1a56c4;
+  --dn-soft: rgba(26, 86, 196, .10);
+  --buy: #0a7d3c;
+  --buy-soft: rgba(10, 125, 60, .11);
+  --buy-tx: #076630;
+  --sell: #9a6400;
+  --sell-soft: rgba(154, 100, 0, .12);
+  --sell-tx: #7d5100;
+
+  --accent: #1a56d6;
+  --accent-hi: #1244ad;
+  --accent-soft: rgba(26, 86, 214, .10);
+  --accent-bd: rgba(26, 86, 214, .42);
+  --accent-tx: #1244ad;
+  --accent-2: #0b7f96;
+  --accent-2-tx: #076073;
+  --accent-2-soft: rgba(11, 127, 150, .11);
+
+  --warn: #a55b00;
+  --warn-soft: rgba(165, 91, 0, .11);
+  --warn-tx: #864900;
+  --danger: #c62436;
+  --danger-soft: rgba(198, 36, 54, .10);
+  --danger-tx: #a51b2b;
+  --ok: #0f7a70;
+  --ok-soft: rgba(15, 122, 112, .11);
+  --ok-tx: #0b5f57;
+
+  --shadow-1: 0 1px 3px rgba(23, 28, 41, .10), 0 1px 2px rgba(23, 28, 41, .06);
+  --shadow-2: 0 6px 18px rgba(23, 28, 41, .13), 0 2px 5px rgba(23, 28, 41, .07);
+  --shadow-3: 0 16px 44px rgba(23, 28, 41, .20), 0 4px 10px rgba(23, 28, 41, .08);
+  --scrim: rgba(30, 38, 56, .38);
+  --scrollbar: #c3cad8;
+  --scrollbar-hi: #a3adc0;
+
+  --code-tx: #26304a;
+  --code-key: #1f4bb8;
+  --code-str: #16704a;
+  --code-num: #a34a12;
+  --code-cmt: #7b849a;
+
+  /* ---- 차트 (라이트) ---- */
+  --ch-bg: #ffffff;
+  --ch-grid: #e8ecf4;
+  --ch-grid-str: #d5dae4;
+  --ch-axis-tx: #545d72;
+  --ch-axis-bg: #f3f6fb;
+  --ch-label-bg: #3a4257;
+  --ch-label-tx: #ffffff;
+
+  --ch-up: #c62436;
+  --ch-dn: #1a56c4;
+  --ch-up-wick: #c6243699;
+  --ch-dn-wick: #1a56c499;
+  --ch-vol-up: rgba(198, 36, 54, .34);
+  --ch-vol-dn: rgba(26, 86, 196, .34);
+  --ch-vol-hi: #b06a00;
+
+  --ch-cross: rgba(60, 70, 94, .55);
+  --ch-buy: #0a7d3c;
+  --ch-sell: #a56a00;
+  --ch-ref: #a56a00;
+  --ch-hold: rgba(10, 125, 60, .075);
+  --ch-hold-bd: rgba(10, 125, 60, .30);
+  --ch-marker-tx: #ffffff;
+  --ch-hilite: #0b7f96;
+
+  --ch-ma-1: #b5620a;
+  --ch-ma-2: #7b3fbf;
+  --ch-ma-3: #0b7f96;
+  --ch-ma-4: #bf3573;
+  --ch-ma-5: #2c7a3d;
+  --ch-ma-6: #5c6880;
+
+  --ch-eq-line: #c62436;
+  --ch-eq-fill-0: rgba(198, 36, 54, .20);
+  --ch-eq-fill-1: rgba(198, 36, 54, 0);
+  --ch-dd-fill: rgba(26, 86, 196, .16);
+  --ch-base-line: rgba(84, 93, 114, .5);
+}

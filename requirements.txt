@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────
+# KRX 백테스터 — 파이썬 의존성
+#   pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────
+
+# engine/ — 데이터·지표·백테스트 (순수 파이썬, 웹 의존성 없음)
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0          # parquet 읽기 + feather 캐시
+
+# server/ — FastAPI 정적 프런트 호스팅 + API
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+
+# POST /api/ai/strategy (ANTHROPIC_API_KEY 없으면 이 엔드포인트만 실패)
+anthropic>=0.40
+
+# 개발/테스트
+pytest>=8.0

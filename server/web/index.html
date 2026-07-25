@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>KRX Backtester</title>
+<script>
+/* FOUC 방지 — CSS 보다 먼저 data-theme 을 확정한다.
+   theme.js 가 나중에 같은 규칙으로 다시 계산하므로 결과는 항상 일치한다. */
+(function () {
+  try {
+    var s = localStorage.getItem('theme');
+    if (s !== 'dark' && s !== 'light') {
+      s = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+    document.documentElement.dataset.theme = s;
+    document.documentElement.style.colorScheme = s;
+  } catch (e) { /* localStorage 차단 환경 — 기본 다크 유지 */ }
+})();
+</script>
+<link rel="stylesheet" href="./css/tokens.css">
+<link rel="stylesheet" href="./css/app.css">
+</head>
+<body>
+
+<div class="app">
+  <div class="prog" id="prog" role="progressbar" aria-label="진행률" aria-hidden="true"></div>
+
+  <!-- ================= 헤더 ================= -->
+  <header class="hd">
+    <div class="logo">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 3v18h18"/><path d="m7 14 3-4 3 3 5-7"/>
+      </svg>
+      <span>KRX Backtester</span>
+    </div>
+    <div class="vr" aria-hidden="true"></div>
+
+    <div class="pill" id="pillSync" title="marcap 저장소 마지막 갱신 시각">
+      <span class="dot" id="dataDot" aria-hidden="true"></span>
+      <span class="lbl-sync">데이터 갱신</span><b id="lastSync">—</b>
+    </div>
+    <div class="pill" title="데이터셋에 포함된 마지막 거래일">
+      <span class="lbl-sync">최신 거래일</span><b id="lastTrade">—</b>
+    </div>
+
+    <button class="btn" id="btnSync" title="marcap 저장소를 지금 갱신합니다">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>
+      </svg>
+      지금 갱신
+    </button>
+
+    <label class="pill" style="cursor:pointer" title="Windows 작업 스케줄러 등록 상태">
+      <span class="sw"><input type="checkbox" id="autoSync"><i></i></span>
+      <span class="lbl-sync">매일 자동</span><b id="autoTime">—</b>
+    </label>
+
+    <span class="badge-mock" id="mockBadge" hidden title="백엔드에 연결하지 못해 개발용 예시 데이터를 표시하고 있습니다">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+      </svg>
+      예시 데이터
+    </span>
+
+    <div class="spacer"></div>
+
+    <div class="seg" id="themeSeg" role="group" aria-label="화면 테마">
+      <button type="button" data-theme="dark" aria-pressed="true">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        다크
+      </button>
+      <button type="button" data-theme="light" aria-pressed="false">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        라이트
+      </button>
+    </div>
+
+    <button class="btn btn-primary" id="btnRun">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4.5v15l13-7.5z"/></svg>
+      <span id="btnRunLabel">백테스트 실행</span>
+    </button>
+  </header>
+
+  <!-- ================= 전역 안내 배너 ================= -->
+  <div class="banners" id="banners" role="status" aria-live="polite"></div>
+
+  <div class="body">
+    <!-- ================= 좌측: 전략 ================= -->
+    <aside class="pane-l">
+      <div class="sec">
+        <div class="sec-hd">
+          전략
+          <div class="spacer"></div>
+          <button class="btn btn-ghost btn-sm" id="btnNewStrategy" aria-label="전략 추가" title="전략 추가">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <div class="sec-bd" style="padding-top:0" id="stgList" role="listbox" aria-label="전략 목록"></div>
+      </div>
+
+      <div class="sec scroll" style="flex:1">
+        <div class="sec-hd">
+          파라미터
+          <div class="spacer"></div>
+          <span class="note">수정 시 JSON 탭 반영</span>
+        </div>
+        <div class="sec-bd" id="paramForm">
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">1</span>종목 선정</div>
+            <div class="fld">
+              <label for="p_amt"><b>기준일 거래대금</b>이 금액 이상 발생한 날</label>
+              <input class="inp" id="p_amt" type="number" step="10" data-path="universe.reference_day.spike_amount_krw_eok">
+              <span class="unit">억</span>
+            </div>
+            <div class="fld">
+              <label for="p_look"><b>탐색 기간</b>기준일을 찾는 최근 영업일 수</label>
+              <input class="inp" id="p_look" type="number" step="1" data-path="universe.reference_day.lookback_days">
+              <span class="unit">일</span>
+            </div>
+            <div class="fld">
+              <label for="p_prev"><b>전일 거래대금</b>기준일 직전일이 이 금액 이하</label>
+              <input class="inp" id="p_prev" type="number" step="10" data-path="universe.reference_day.prev_day_amount_max_eok">
+              <span class="unit">억</span>
+            </div>
+            <div class="fld">
+              <label for="p_valid"><b>유효 기간</b>기준일 이후 이 안에 미체결이면 폐기</label>
+              <input class="inp" id="p_valid" type="number" step="1" data-path="universe.valid_days_after_reference">
+              <span class="unit">일</span>
+            </div>
+            <div class="fld">
+              <label for="p_mkt"><b>대상 시장</b></label>
+              <select class="inp wide" id="p_mkt" data-path="universe.markets" data-kind="markets">
+                <option value="KOSPI,KOSDAQ">KOSPI + KOSDAQ</option>
+                <option value="KOSPI">KOSPI</option>
+                <option value="KOSDAQ">KOSDAQ</option>
+              </select>
+              <span class="unit"></span>
+            </div>
+          </div>
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">2</span>진입 (분할 매수)</div>
+            <div class="fld">
+              <label for="p_b1"><b>1차 매수</b>기준일 시가 도달 시 비중</label>
+              <input class="inp" id="p_b1" type="number" step="5" data-path="entries[0].size_pct">
+              <span class="unit">%</span>
+            </div>
+            <div class="fld">
+              <label for="p_b2d"><b>2차 트리거</b>1차 매수가 대비 하락률</label>
+              <input class="inp" id="p_b2d" type="number" step="1" data-path="entries[1].trigger_pct">
+              <span class="unit">%</span>
+            </div>
+            <div class="fld">
+              <label for="p_b2"><b>2차 매수</b>추가 매수 비중</label>
+              <input class="inp" id="p_b2" type="number" step="5" data-path="entries[1].size_pct">
+              <span class="unit">%</span>
+            </div>
+          </div>
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">3</span>청산</div>
+            <div class="fld">
+              <label for="p_tp"><b>익절</b>평단가 대비 수익률 도달 시 전량</label>
+              <input class="inp" id="p_tp" type="number" step="1" data-path="exits[0].target_pct">
+              <span class="unit">%</span>
+            </div>
+            <div class="fld">
+              <label for="p_sl"><b>손절</b>이 이동평균선 도달 시 전량</label>
+              <input class="inp" id="p_sl" type="number" step="1" data-path="exits[1].ma_period">
+              <span class="unit">일선</span>
+            </div>
+          </div>
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">4</span>실행 · 비용</div>
+            <div class="fld">
+              <label for="p_res"><b>체결 해상도</b></label>
+              <select class="inp wide" id="p_res" data-path="execution.resolution">
+                <option value="1m">1분봉</option>
+                <option value="1d">일봉 (근사)</option>
+              </select><span class="unit"></span>
+            </div>
+            <div class="fld">
+              <label for="p_cap"><b>초기 자본</b></label>
+              <input class="inp" id="p_cap" type="number" step="100" data-path="portfolio.initial_capital_manwon">
+              <span class="unit">만</span>
+            </div>
+            <div class="fld">
+              <label for="p_pos"><b>최대 동시 보유</b></label>
+              <input class="inp" id="p_pos" type="number" step="1" data-path="portfolio.max_positions">
+              <span class="unit">종목</span>
+            </div>
+            <div class="fld">
+              <label for="p_slip"><b>슬리피지</b></label>
+              <input class="inp" id="p_slip" type="number" step="0.05" data-path="execution.slippage_pct">
+              <span class="unit">%</span>
+            </div>
+            <div class="fld">
+              <label for="p_fee"><b>수수료+세금</b></label>
+              <input class="inp" id="p_fee" type="number" step="0.01" data-path="execution.fee_pct">
+              <span class="unit">%</span>
+            </div>
+          </div>
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">5</span>백테스트 구간</div>
+            <div class="fld">
+              <label for="p_start"><b>시작일</b></label>
+              <input class="inp wide" id="p_start" type="date" data-path="period.start">
+              <span class="unit"></span>
+            </div>
+            <div class="fld">
+              <label for="p_end"><b>종료일</b>비우면 최신 거래일 (auto)</label>
+              <input class="inp wide" id="p_end" type="date" data-path="period.end" data-kind="autodate">
+              <span class="unit"></span>
+            </div>
+          </div>
+
+          <div class="grp">
+            <div class="grp-t"><span class="n">6</span>표시 지표 (LAG)</div>
+            <div class="chips" id="indChips" aria-label="차트에 표시할 지표"></div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="sec" style="border-bottom:none">
+        <div class="sec-bd" style="padding:10px 12px;display:flex;gap:7px">
+          <button class="btn btn-sm" id="btnSave" style="flex:1">저장</button>
+          <button class="btn btn-sm" id="btnClone" style="flex:1">복제</button>
+          <button class="btn btn-sm" id="btnExport" style="flex:1">내보내기</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ================= 중앙: 차트 ================= -->
+    <main class="pane-c">
+      <div class="tb">
+        <div class="sym">
+          <span class="sym-cd" id="symCode">—</span>
+          <span class="sym-nm" id="symName">종목을 선택하세요</span>
+        </div>
+        <div class="vr" aria-hidden="true"></div>
+        <div class="seg" role="group" aria-label="봉 주기">
+          <button type="button" aria-pressed="true">일</button>
+          <button type="button" aria-pressed="false" disabled title="현재 엔진은 일봉만 지원합니다">주</button>
+          <button type="button" aria-pressed="false" disabled title="현재 엔진은 일봉만 지원합니다">월</button>
+        </div>
+        <div class="seg" id="rangeSeg" role="group" aria-label="조회 기간">
+          <button type="button" data-months="3" aria-pressed="false">3M</button>
+          <button type="button" data-months="6" aria-pressed="true">6M</button>
+          <button type="button" data-months="12" aria-pressed="false">1Y</button>
+          <button type="button" data-months="0" aria-pressed="false">전체</button>
+        </div>
+        <div class="vr" aria-hidden="true"></div>
+        <button class="btn btn-ghost btn-sm" id="btnAddInd">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          지표
+        </button>
+        <div class="spacer"></div>
+        <span class="pill btn-sm pill-trade" style="height:26px;font-size:11px">거래 <b id="tradeIdxLabel">—</b></span>
+        <button class="btn btn-ghost btn-sm" id="prevTrade" aria-label="이전 거래로 이동">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+        </button>
+        <button class="btn btn-ghost btn-sm" id="nextTrade" aria-label="다음 거래로 이동">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
+      </div>
+
+      <div class="chart-wrap" id="chartWrap">
+        <!-- base / overlay 캔버스는 chart.js 가 삽입한다 -->
+        <div class="legend" id="legend" aria-hidden="true"></div>
+        <div class="chart-hint">휠 = 줌 · 드래그 = 팬 · 더블클릭 = 전체 보기</div>
+        <div class="tt" id="tt" role="tooltip"></div>
+        <div class="chart-empty" id="chartEmpty">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 3v18h18"/><path d="M7 15v-4M11 17V8M15 15v-6M19 17v-3"/>
+          </svg>
+          <span id="chartEmptyMsg">차트 데이터를 불러오는 중입니다…</span>
+        </div>
+      </div>
+
+      <!-- ================= 하단 독 ================= -->
+      <div class="dock">
+        <div class="tabs" role="tablist" aria-label="하단 패널">
+          <button class="tab" role="tab" id="tab-pnTrades" aria-selected="true" aria-controls="pnTrades" data-pane="pnTrades">거래 내역<span class="cnt" id="tradeCnt">0</span></button>
+          <button class="tab" role="tab" id="tab-pnSignals" aria-selected="false" aria-controls="pnSignals" data-pane="pnSignals">시그널 로그</button>
+          <button class="tab" role="tab" id="tab-pnJson" aria-selected="false" aria-controls="pnJson" data-pane="pnJson">전략 JSON</button>
+          <button class="tab" role="tab" id="tab-pnAI" aria-selected="false" aria-controls="pnAI" data-pane="pnAI">AI 전략 생성</button>
+          <button class="tab" role="tab" id="tab-pnData" aria-selected="false" aria-controls="pnData" data-pane="pnData">데이터 상태</button>
+        </div>
+
+        <div class="tabpane on" id="pnTrades" role="tabpanel" aria-labelledby="tab-pnTrades" tabindex="0">
+          <table>
+            <thead><tr>
+              <th class="l">#</th><th class="l">종목</th><th class="l">기준일</th>
+              <th>기준일 거래대금</th><th class="l">매수1</th><th>매수1가</th>
+              <th class="l">매수2</th><th>매수2가</th><th>평단</th>
+              <th class="l">매도일</th><th>매도가</th><th class="l">사유</th>
+              <th>보유일</th><th>수익률</th><th>손익</th>
+            </tr></thead>
+            <tbody id="tradeBody"></tbody>
+          </table>
+        </div>
+
+        <div class="tabpane" id="pnSignals" role="tabpanel" aria-labelledby="tab-pnSignals" tabindex="0">
+          <pre class="code" id="sigLog"></pre>
+        </div>
+
+        <div class="tabpane" id="pnJson" role="tabpanel" aria-labelledby="tab-pnJson" tabindex="0">
+          <pre class="code" id="jsonView"></pre>
+        </div>
+
+        <div class="tabpane" id="pnAI" role="tabpanel" aria-labelledby="tab-pnAI" tabindex="0">
+          <div class="ai-box">
+            <div class="hint">자연어로 조건을 쓰면 <b>전략 DSL v1</b> JSON 으로 변환됩니다. 변환 결과는 좌측 파라미터 패널에 그대로 로드됩니다.</div>
+            <label class="sr-only" for="aiIn">전략 자연어 설명</label>
+            <textarea class="ai-in" id="aiIn" placeholder="예) 20일 안에 거래대금 1000억 넘은 날이 있고, 그 전날은 200억 이하였던 종목 중에서 기준일 시가까지 눌린 종목을 시가에 절반 매수. 매수가보다 10% 더 빠지면 나머지 절반 매수. 평단 +10%면 전량 익절, 45일선 닿으면 전량 손절."></textarea>
+            <div class="ai-row">
+              <button class="btn btn-primary" id="btnAI">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+                DSL로 변환
+              </button>
+              <button class="btn" id="btnAiExample">예시 불러오기</button>
+              <span class="hint" id="aiStat">DSL v1 · 검증은 <code>POST /api/strategies/validate</code></span>
+            </div>
+            <div id="aiResult"></div>
+          </div>
+        </div>
+
+        <div class="tabpane" id="pnData" role="tabpanel" aria-labelledby="tab-pnData" tabindex="0">
+          <table>
+            <thead><tr><th class="l">항목</th><th class="l">값</th><th class="l">비고</th></tr></thead>
+            <tbody id="dataBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+
+    <!-- ================= 우측: 성과 ================= -->
+    <aside class="pane-r">
+      <div class="sec">
+        <div class="sec-hd">백테스트 요약
+          <div class="spacer"></div>
+          <span class="note" id="kPeriod">—</span>
+        </div>
+        <div class="kpi-grid" id="kpiGrid">
+          <div class="kpi"><div class="k">총 수익률</div><div class="v" id="kRet">—</div><div class="s" id="kRetSub">—</div></div>
+          <div class="kpi"><div class="k">CAGR</div><div class="v" id="kCagr">—</div><div class="s" id="kCagrSub">—</div></div>
+          <div class="kpi"><div class="k">MDD</div><div class="v" id="kMdd">—</div><div class="s" id="kMddSub">—</div></div>
+          <div class="kpi"><div class="k">샤프</div><div class="v" id="kSharpe">—</div><div class="s">위험조정 수익</div></div>
+          <div class="kpi"><div class="k">승률</div><div class="v" id="kWin">—</div>
+            <div class="bar"><i class="w" id="kWinBar" style="width:0"></i><i class="l" id="kLossBar" style="width:0"></i></div>
+            <div class="s" style="margin-top:3px" id="kWinSub">—</div>
+          </div>
+          <div class="kpi"><div class="k">손익비</div><div class="v" id="kPf">—</div><div class="s" id="kPfSub">—</div></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-hd">누적 수익 곡선</div>
+        <div class="mini-cv" style="height:118px;padding:0 6px 8px"><canvas id="eq" aria-label="누적 수익 곡선"></canvas></div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-hd">월별 수익률</div>
+        <div class="mini-cv" style="height:96px;padding:0 6px 8px"><canvas id="mo" aria-label="월별 수익률"></canvas></div>
+      </div>
+
+      <div class="sec scroll" style="flex:1;border-bottom:none">
+        <div class="sec-hd">종목별 기여도 Top</div>
+        <table>
+          <thead><tr><th class="l">종목</th><th>거래</th><th>승률</th><th>손익</th></tr></thead>
+          <tbody id="byStock"></tbody>
+        </table>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- ================= 모달 ================= -->
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-hd"><span id="modalTitle">알림</span><div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" id="modalX" aria-label="닫기">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-bd" id="modalBody"></div>
+    <div class="modal-ft" id="modalFoot"></div>
+  </div>
+</div>
+
+<div class="toast-host" id="toastHost" role="status" aria-live="polite"></div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
