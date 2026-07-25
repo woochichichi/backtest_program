@@ -176,6 +176,63 @@ def error_response(
     return SafeJSONResponse(status_code=status, content=body)
 
 
+# ------------------------------------------------- errors[].path 표기 통일
+_PATH_DOT_INDEX_RE = re.compile(r"\.(\d+)(?=\.|$)")
+_PATH_LEADING_DOT_RE = re.compile(r"^\.+")
+
+
+def normalize_error_path(path: Any) -> str:
+    """검증 오류 경로를 `entries[0].size_pct` 형식으로 고정한다.
+
+    프런트 폼의 ``data-path`` 와 1:1 로 맞춰야 하므로 표기가 섞이면 안 된다.
+      - `/entries/0/size_pct`  -> `entries[0].size_pct`
+      - `entries.0.size_pct`   -> `entries[0].size_pct`
+      - `entries[0].size_pct`  -> 그대로
+    """
+    if path is None:
+        return ""
+    if isinstance(path, (list, tuple)):
+        parts: List[str] = []
+        for seg in path:
+            if isinstance(seg, int) or (isinstance(seg, str) and seg.isdigit()):
+                parts.append(f"[{int(seg)}]")
+            else:
+                parts.append(("." if parts else "") + str(seg))
+        return "".join(parts).lstrip(".")
+
+    text = str(path).strip()
+    if not text:
+        return ""
+
+    # JSON Pointer / 슬래시 표기 -> 점 표기
+    if "/" in text:
+        text = text.lstrip("#").lstrip("/")
+        text = ".".join(seg for seg in text.split("/") if seg != "")
+
+    # `.0.` / 끝의 `.0` -> `[0]`
+    prev = None
+    while prev != text:
+        prev = text
+        text = _PATH_DOT_INDEX_RE.sub(r"[\1]", text)
+
+    text = _PATH_LEADING_DOT_RE.sub("", text)
+    return text.replace(".[", "[")
+
+
+def normalize_errors(errors: Any) -> List[Dict[str, Any]]:
+    """errors 배열의 모든 path 를 정규 표기로 바꾼다."""
+    out: List[Dict[str, Any]] = []
+    for item in list(errors or []):
+        if isinstance(item, dict):
+            fixed = dict(item)
+            fixed["path"] = normalize_error_path(item.get("path"))
+            fixed.setdefault("message", "")
+            out.append(fixed)
+        else:
+            out.append({"path": "", "message": str(item)})
+    return out
+
+
 # ================================================================= 앱 생성
 app = FastAPI(
     title="KRX Backtester",
@@ -411,7 +468,20 @@ def build_status() -> Dict[str, Any]:
         for key in ("latest_trade_date", "first_trade_date", "row_count"):
             payload.setdefault(key, None)
     payload["auto_sync"] = query_auto_sync()
+    payload["features"] = build_features()
     return payload
+
+
+def build_features() -> Dict[str, bool]:
+    """프런트가 기능 유무를 추측하지 않도록 서버가 명시한다.
+
+    ``ai_available`` 은 키 존재 + 패키지 import 가능 여부만 본다 (실제 API 호출 없음).
+    """
+    return {
+        "backtest_progress_sse": True,
+        "ai_available": bool(ai_module.is_available()),
+        "symbol_search": True,
+    }
 
 
 @app.get("/api/status")
@@ -423,6 +493,103 @@ def api_status() -> Dict[str, Any]:
 # ==================================================== 4-2. POST /api/sync
 _SYNC_LOCK = threading.Lock()
 
+# 프런트가 2초 간격으로 폴링하는 진행 상태. 실행 중에는 log_tail 이 계속 갱신된다.
+_SYNC_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_sec": 0,
+    "log_tail": "",
+    "ok": None,
+    "result": None,
+}
+_SYNC_STATE_LOCK = threading.Lock()
+
+
+def _sync_set(**fields: Any) -> None:
+    with _SYNC_STATE_LOCK:
+        _SYNC_STATE.update(fields)
+
+
+def _sync_snapshot() -> Dict[str, Any]:
+    with _SYNC_STATE_LOCK:
+        return dict(_SYNC_STATE)
+
+
+def _clean_log(raw: bytes) -> str:
+    """git 진행 표시는 \\r 로 갱신되므로 줄바꿈으로 정규화한다."""
+    text = _decode(raw)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    return "\n".join(ln for ln in lines if ln.strip())
+
+
+def _run_sync_process(cmd: List[str]) -> Tuple[int, str]:
+    """동기화 명령을 실행하면서 출력을 실시간으로 _SYNC_STATE 에 반영한다."""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+
+    buf = bytearray()
+    buf_lock = threading.Lock()
+
+    def pump() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        while True:
+            try:
+                chunk = stream.read(4096)
+            except Exception:
+                break
+            if not chunk:
+                break
+            with buf_lock:
+                buf.extend(chunk)
+                if len(buf) > 262144:  # 256KB 넘으면 앞부분을 버린다
+                    del buf[: len(buf) - 131072]
+
+    reader = threading.Thread(target=pump, name="sync-log", daemon=True)
+    reader.start()
+
+    started = time.monotonic()
+    timed_out = False
+    while True:
+        if proc.poll() is not None:
+            break
+        if time.monotonic() - started > SYNC_TIMEOUT_SEC:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            break
+        with buf_lock:
+            snapshot = bytes(buf)
+        _sync_set(
+            elapsed_sec=int(time.monotonic() - started),
+            log_tail=_tail(_clean_log(snapshot), 2000),
+        )
+        time.sleep(0.2)
+
+    reader.join(timeout=3)
+    with buf_lock:
+        snapshot = bytes(buf)
+    log_tail = _tail(_clean_log(snapshot), 4000)
+    code = -1 if timed_out else int(proc.returncode or 0)
+    if timed_out:
+        raise ApiError(
+            504,
+            f"데이터 갱신이 {SYNC_TIMEOUT_SEC}초 안에 끝나지 않았습니다.",
+            "최초 clone 은 수 분이 걸립니다. update_marcap.bat 을 직접 실행해 진행 상황을 확인하세요.",
+            {"log_tail": log_tail},
+        )
+    return code, log_tail
+
 
 @app.post("/api/sync")
 def api_sync() -> Any:
@@ -430,35 +597,47 @@ def api_sync() -> Any:
         raise ApiError(
             409,
             "이미 데이터 갱신이 진행 중입니다.",
-            "진행 중인 갱신이 끝난 뒤 다시 시도하세요.",
+            "진행 중인 갱신이 끝난 뒤 다시 시도하세요. 진행 상황은 GET /api/sync/status 로 확인할 수 있습니다.",
         )
+
+    started_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    started_mono = time.monotonic()
+    _sync_set(
+        running=True,
+        started_at=started_at,
+        finished_at=None,
+        elapsed_sec=0,
+        log_tail="",
+        ok=None,
+        result=None,
+    )
+
+    def finish(ok: bool, result: str, log_tail: str) -> None:
+        _sync_set(
+            running=False,
+            finished_at=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            elapsed_sec=int(time.monotonic() - started_mono),
+            log_tail=log_tail,
+            ok=ok,
+            result=result,
+        )
+
     try:
         if IS_WINDOWS:
             if not UPDATE_BAT.exists():
-                raise ApiError(
-                    503,
-                    "update_marcap.bat 을 찾을 수 없습니다.",
-                    f"경로: {UPDATE_BAT}",
-                )
+                finish(False, "bat_not_found", "")
+                raise ApiError(503, "update_marcap.bat 을 찾을 수 없습니다.", f"경로: {UPDATE_BAT}")
             cmd: List[str] = ["cmd", "/c", str(UPDATE_BAT), "/silent"]
         else:
             cmd = ["git", "-C", "marcap", "pull", "--ff-only"]
 
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(ROOT),
-                capture_output=True,
-                timeout=SYNC_TIMEOUT_SEC,
-            )
-        except subprocess.TimeoutExpired:
-            raise ApiError(
-                504,
-                f"데이터 갱신이 {SYNC_TIMEOUT_SEC}초 안에 끝나지 않았습니다.",
-                "최초 clone 은 수 분이 걸립니다. update_marcap.bat 을 직접 실행해 진행 상황을 확인하세요.",
-                {"log_tail": ""},
-            )
+            code, log_tail = _run_sync_process(cmd)
+        except ApiError as exc:
+            finish(False, "timeout", str(exc.extra.get("log_tail", "")))
+            raise
         except FileNotFoundError as exc:
+            finish(False, "command_not_found", "")
             raise ApiError(
                 503,
                 "갱신 명령을 실행할 수 없습니다. git 이 설치되어 있는지 확인하세요.",
@@ -466,26 +645,46 @@ def api_sync() -> Any:
                 {"log_tail": ""},
             ) from exc
 
-        log_tail = _tail(_decode(proc.stdout) + "\n" + _decode(proc.stderr))
-
-        if proc.returncode != 0:
+        if code != 0:
+            finish(False, "failed", log_tail)
             return error_response(
                 500,
                 "데이터 갱신에 실패했습니다. update_marcap.bat 을 직접 실행해 로그를 확인하세요.",
-                f"exit code {proc.returncode}",
+                f"exit code {code}",
                 log_tail=log_tail,
             )
 
-        # 갱신 후 상태 재조회 — 캐시된 store 는 버린다.
+        # 갱신 후 캐시 전부 무효화
         global _STORE
         with _STORE_LOCK:
             _STORE = None
+        _symbols_invalidate()
 
+        finish(True, "updated", log_tail)
         payload = build_status()
         payload["log_tail"] = log_tail
         return payload
     finally:
+        with _SYNC_STATE_LOCK:
+            if _SYNC_STATE.get("running"):
+                _SYNC_STATE["running"] = False
+                _SYNC_STATE["finished_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _SYNC_LOCK.release()
+
+
+@app.get("/api/sync/status")
+def api_sync_status() -> Dict[str, Any]:
+    """동기화 진행 상황 폴링 (프런트가 2초 간격으로 호출)."""
+    state = _sync_snapshot()
+    return {
+        "running": bool(state.get("running")),
+        "started_at": state.get("started_at"),
+        "finished_at": state.get("finished_at"),
+        "elapsed_sec": int(state.get("elapsed_sec") or 0),
+        "log_tail": state.get("log_tail") or "",
+        "ok": state.get("ok"),
+        "result": state.get("result"),
+    }
 
 
 def _decode(raw: Optional[bytes]) -> str:
@@ -768,6 +967,169 @@ def api_indicators() -> List[Dict[str, Any]]:
             }
         )
     return out
+
+
+# ==================================================== GET /api/symbols (신설)
+_SYMBOLS_CACHE: Dict[str, Any] = {"key": None, "rows": []}
+_SYMBOLS_LOCK = threading.Lock()
+
+SYMBOLS_DEFAULT_LIMIT = 50
+SYMBOLS_MAX_LIMIT = 500
+
+
+def _symbols_invalidate() -> None:
+    with _SYMBOLS_LOCK:
+        _SYMBOLS_CACHE["key"] = None
+        _SYMBOLS_CACHE["rows"] = []
+
+
+def _symbols_cache_key(store: Any) -> str:
+    """data_status.json 의 last_sync 와 최신 거래일이 바뀌면 캐시를 버린다."""
+    last_sync = str(_read_data_status().get("last_sync") or "")
+    try:
+        latest = store.latest_date().isoformat()
+    except Exception:
+        latest = ""
+    return f"{last_sync}|{latest}"
+
+
+def _build_symbol_snapshot(store: Any) -> List[Dict[str, Any]]:
+    """최신 거래일 전종목 스냅샷. 그 날 거래된 종목만 담기므로 상장폐지 종목은 빠진다."""
+    latest = store.latest_date()
+    year_df = store.load_year(latest.year)
+
+    try:
+        import pandas as pd  # engine 이 있으면 반드시 존재한다
+    except Exception as exc:  # pragma: no cover
+        raise ApiError(503, MSG_NO_ENGINE, f"pandas 를 불러올 수 없습니다: {exc}") from exc
+
+    snap = year_df.loc[year_df["Date"] == pd.Timestamp(latest)]
+    if snap.empty:
+        raise ApiError(
+            503,
+            MSG_NO_DATA,
+            f"최신 거래일({latest.isoformat()}) 스냅샷이 비어 있습니다.",
+        )
+
+    wanted = [c for c in ("Code", "Name", "Market", "Marcap") if c in snap.columns]
+    snap = snap[wanted]
+
+    last_date = latest.isoformat()
+    rows: List[Dict[str, Any]] = []
+    for rec in snap.to_dict("records"):
+        code = str(rec.get("Code") or "").strip()
+        if not code:
+            continue
+        name = rec.get("Name")
+        name = "" if name is None or name != name else str(name).strip()
+        marcap = rec.get("Marcap")
+        try:
+            marcap_eok = (
+                None
+                if marcap is None or marcap != marcap
+                else int(round(float(marcap) / 1e8))
+            )
+        except Exception:
+            marcap_eok = None
+        market = rec.get("Market")
+        market = "" if market is None or market != market else str(market)
+        rows.append(
+            {
+                "code": code,
+                "name": name,
+                "market": market,
+                "marcap_eok": marcap_eok,
+                "last_date": last_date,
+            }
+        )
+
+    rows.sort(key=lambda r: (r["marcap_eok"] is None, -(r["marcap_eok"] or 0), r["code"]))
+    return rows
+
+
+def get_symbol_rows() -> List[Dict[str, Any]]:
+    """최신 거래일 종목 스냅샷 (시가총액 내림차순). 프로세스 메모리에 캐시한다."""
+    store = get_store()
+    key = _symbols_cache_key(store)
+    with _SYMBOLS_LOCK:
+        if _SYMBOLS_CACHE["key"] == key and _SYMBOLS_CACHE["rows"]:
+            return _SYMBOLS_CACHE["rows"]
+
+    try:
+        rows = _build_symbol_snapshot(store)
+    except ApiError:
+        raise
+    except Exception as exc:
+        if _is_data_unavailable(exc):
+            raise ApiError(503, MSG_NO_DATA, str(exc)) from exc
+        raise ApiError(
+            500, "종목 목록을 만들지 못했습니다.", f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    with _SYMBOLS_LOCK:
+        _SYMBOLS_CACHE["key"] = key
+        _SYMBOLS_CACHE["rows"] = rows
+    return rows
+
+
+def _rank(row: Dict[str, Any], q_upper: str) -> Optional[int]:
+    """검색 우선순위. 낮을수록 먼저. None 이면 매칭 실패."""
+    code = row["code"].upper()
+    name = row["name"].upper()
+    if code == q_upper:
+        return 0
+    if name == q_upper:
+        return 1
+    if name.startswith(q_upper):
+        return 2
+    if code.startswith(q_upper):
+        return 3
+    if q_upper in name:
+        return 4
+    if q_upper in code:
+        return 5
+    return None
+
+
+@app.get("/api/symbols")
+def api_symbols(q: Optional[str] = None, limit: int = SYMBOLS_DEFAULT_LIMIT) -> Dict[str, Any]:
+    """종목 검색. q 없으면 시가총액 상위, 있으면 코드 완전일치 > 이름 시작일치 > 부분일치 순."""
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = SYMBOLS_DEFAULT_LIMIT
+    limit = max(1, min(limit, SYMBOLS_MAX_LIMIT))
+
+    rows = get_symbol_rows()
+    query = (q or "").strip()
+
+    if not query:
+        return {"total": len(rows), "symbols": rows[:limit]}
+
+    q_upper = query.upper()
+    scored: List[Tuple[int, int, str, Dict[str, Any]]] = []
+    for row in rows:
+        rank = _rank(row, q_upper)
+        if rank is None:
+            continue
+        scored.append((rank, -(row["marcap_eok"] or 0), row["code"], row))
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    return {"total": len(scored), "symbols": [item[3] for item in scored[:limit]]}
+
+
+def default_chart_code(run_id: Optional[str] = None) -> str:
+    """code 가 생략됐을 때 쓸 기본 종목: run_id 첫 거래 종목 -> 시가총액 1위."""
+    if run_id:
+        result = RUNS.get(run_id)
+        if result:
+            for trade in result.get("trades") or []:
+                code = str(trade.get("code") or "").strip()
+                if code:
+                    return code.zfill(6)
+    rows = get_symbol_rows()
+    if not rows:
+        raise ApiError(503, MSG_NO_DATA, "종목 스냅샷이 비어 있습니다.")
+    return rows[0]["code"]
 
 
 # =================================================== 4-5. POST /api/backtest

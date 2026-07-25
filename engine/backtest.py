@@ -39,10 +39,6 @@ SAME_DAY_EXIT_MODES = ("loss_only", "never", "always")
 #: 기본값. 일봉만으로는 저가·고가 순서를 알 수 없으므로 보수적으로 잡는다.
 DEFAULT_SAME_DAY_EXIT = "loss_only"
 
-#: ``same_day_exit="loss_only"`` 에서 진입 당일 평가를 **막는** 청산 타입.
-#: type 이 없는 커스텀 규칙은 손실 방향으로 간주해 당일 평가를 허용한다(보수적).
-_PROFIT_EXIT_TYPES = frozenset({"take_profit"})
-
 _PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount"]
 
 _MARKET_ALIASES = {
@@ -613,6 +609,7 @@ def run_backtest(
                 ctx = _ctx(rec, w, bar=bar, day=day)
                 entry_today = w["last_entry_date"] == day
                 ambiguous_here = False
+                blocked_here = False
                 for rule in ordered_exits:
                     if w["qty"] <= 0:
                         break
@@ -620,17 +617,6 @@ def run_backtest(
                     hit, forced_price = _exit_hit(rule, ctx, li, bar, w, day)
                     if not hit:
                         continue
-                    if entry_today:
-                        # 진입과 청산이 같은 봉 안에서 모두 성립 — 일봉으로는 순서를 알 수 없다
-                        ambiguous_here = True
-                        if not _same_day_allowed(same_day_exit, rule):
-                            sig.add(
-                                day, "POS", code,
-                                f"{code} {rule.get('label') or rule.get('id')} 조건이 진입 당일 성립했으나 "
-                                f"same_day_exit={same_day_exit} 규칙에 따라 다음 거래일로 이월",
-                                "15:31:00",
-                            )
-                            continue
                     px = forced_price
                     if px is None:
                         px = _fill_price(rule, ctx, li, bar, nxt, "sell", fill_model)
@@ -640,6 +626,26 @@ def run_backtest(
                     qty_out = _exit_qty(rule, w["qty"])
                     if qty_out <= 0:
                         continue
+
+                    if entry_today:
+                        # 진입과 청산이 같은 봉 안에서 모두 성립 — 일봉으로는 순서를 알 수 없다
+                        ambiguous_here = True
+                        allowed, net = _same_day_allowed(
+                            same_day_exit, w, px, qty_out, slippage, fee
+                        )
+                        if not allowed:
+                            if net > 0 and not blocked_here:
+                                stats["same_day_profit_exits_blocked"] += 1
+                                blocked_here = True
+                            sig.add(
+                                day, "POS", code,
+                                f"{code} {rule.get('label') or rule.get('id')} 조건이 진입 당일 성립했으나 "
+                                f"순손익 {net:+,.0f}원 · same_day_exit={same_day_exit} 규칙에 따라 "
+                                "다음 거래일로 이월",
+                                "15:31:00",
+                            )
+                            continue
+
                     trade, proceeds = _close(
                         w, rec, code, rule, px, qty_out, exit_date, slippage, fee,
                         len(trades) + 1, rule.get("label") or rule.get("id"),
@@ -735,19 +741,33 @@ def run_backtest(
 # ======================================================================================
 
 
-def _same_day_allowed(mode: str, rule: Mapping) -> bool:
-    """진입 체결 당일에 이 청산 규칙을 평가해도 되는가.
+def _net_exit_pnl(w: Mapping, price: float, qty: int, slippage: float, fee: float) -> float:
+    """이 청산이 실현할 **순손익** (슬리피지·수수료 반영). ``_close`` 와 같은 계산식."""
+    if not qty or not w["qty"]:
+        return 0.0
+    proceeds = price * (1.0 - slippage) * qty * (1.0 - fee)
+    cost_basis = (w["cost"] / w["qty"]) * qty
+    return proceeds - cost_basis
+
+
+def _same_day_allowed(mode: str, w: Mapping, price: float, qty: int,
+                      slippage: float, fee: float) -> Tuple[bool, float]:
+    """진입 체결 당일에 이 청산을 실행해도 되는가. ``(허용여부, 순손익)`` 을 돌려준다.
 
     * ``always``    — 전부 허용 (낙관적)
     * ``never``     — 전부 차단 (가장 보수적)
-    * ``loss_only`` — ``type: "take_profit"`` 만 차단. type 이 없는 커스텀 규칙은
-      손실 방향으로 간주해 허용한다.
+    * ``loss_only`` — **체결가 기준 순손익이 이익이면 차단**, 손실·본전이면 허용.
+
+    ``loss_only`` 는 규칙의 ``type`` 을 보지 않는다. ``type: "stop_loss"`` 라도
+    손절선이 평단가 위에 있으면 실질은 익절이므로 같이 차단된다
+    (전략1의 "45일선 도달 손절"이 정확히 그 사례다).
     """
+    net = _net_exit_pnl(w, price, qty, slippage, fee)
     if mode == "always":
-        return True
+        return True, net
     if mode == "never":
-        return False
-    return str(rule.get("type") or "") not in _PROFIT_EXIT_TYPES
+        return False, net
+    return (net <= 0.0), net
 
 
 _FILL_MODEL_NOTES = {

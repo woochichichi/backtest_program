@@ -13,6 +13,7 @@ ARCHITECTURE.md 4-7 계약:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -70,6 +71,33 @@ _USER_TEMPLATE_WITH_BASE = """아래는 사용자가 편집 중인 기존 전략
 \"\"\"
 
 기존 전략을 위 요청대로 수정한 DSL v1 JSON 하나만 출력해라. 요청과 무관한 필드는 그대로 유지한다."""
+
+
+# ------------------------------------------------------------- 사용 가능 여부
+_HAS_SDK: Optional[bool] = None
+
+
+def has_sdk() -> bool:
+    """anthropic 패키지를 import 할 수 있는지. **모듈을 실제로 실행하지 않는다.**"""
+    global _HAS_SDK
+    if _HAS_SDK is None:
+        try:
+            _HAS_SDK = importlib.util.find_spec("anthropic") is not None
+        except Exception:
+            _HAS_SDK = False
+    return bool(_HAS_SDK)
+
+
+def has_key() -> bool:
+    return bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+
+
+def is_available() -> bool:
+    """`GET /api/status` 의 features.ai_available.
+
+    키 존재 여부와 패키지 import 가능 여부만 본다. **API 호출은 하지 않는다.**
+    """
+    return has_key() and has_sdk()
 
 
 # ----------------------------------------------------------------- 스키마

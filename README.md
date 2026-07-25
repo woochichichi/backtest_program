@@ -17,7 +17,11 @@ REM 2. 매일 자동 갱신 등록 (선택, 기본 18:30)
 setup_daily_update.bat
 ```
 
-목업 화면은 `mockup/index.html`을 브라우저로 열면 된다. 서버·빌드 없이 바로 열린다.
+이후로는 `KRX백테스터.vbs` 하나만 더블클릭하면 된다. 검은 콘솔 없이 서버가 뜨고 브라우저가 열린다.
+한 번 더 누르면 종료 여부를 묻는다.
+
+최종 사용자에게 전달할 설명서는 [`사용설명서.txt`](사용설명서.txt) 하나면 된다.
+메모장으로 열리는 평문이고, 설치부터 문제 해결까지 한 페이지로 정리되어 있다.
 
 ---
 
@@ -30,9 +34,14 @@ backtest_program/
 ├─ strategies/
 │   ├─ strategy1.json         # 전략1 — 거래대금 급증 눌림목 (등록 완료)
 │   └─ SCHEMA.md              # 전략 DSL v1 명세 (AI 생성용 포맷)
+├─ KRX백테스터.vbs            # 프로그램 켜기/끄기 (콘솔 없음) — 평소엔 이것만
+├─ 사용설명서.txt             # 최종 사용자용 설명서
+├─ install.bat                # 최초 설치 (가상환경 + 의존성)
 ├─ update_marcap.bat          # 데이터 수동 갱신
+├─ update_program.bat         # 프로그램 코드 갱신 (git pull)
 ├─ setup_daily_update.bat     # 매일 자동 갱신 등록 (작업 스케줄러)
 ├─ remove_daily_update.bat    # 자동 갱신 해제
+├─ run_web.bat                # 콘솔을 보면서 실행 (문제 확인용)
 ├─ data_status.json           # 마지막 갱신 시각 (웹 헤더에 표시)
 └─ logs/                      # 갱신 로그
 ```
