@@ -642,6 +642,8 @@ def run_backtest(
                     sig.add(day, "PNL", code,
                             f"{code} 실현손익 {trade['pnl']:+,.0f}원 ({trade['return_pct']:+.2f}%) "
                             f"· 보유 {trade['hold_days']}일", "15:30:00")
+                if ambiguous_here:
+                    stats["ambiguous_bars"] += 1
                 if w["qty"] <= 0:
                     active.pop(code, None)
 
@@ -688,13 +690,27 @@ def run_backtest(
         "15:30:00",
     )
     if sig.truncated:
-        warnings.append(f"시그널 로그가 {MAX_SIGNALS}건을 넘어 이후 기록은 생략했습니다.")
+        warnings.append(
+            f"시그널 로그가 {MAX_SIGNALS}건을 넘어 이후 {sig.dropped:,}건은 생략했습니다."
+        )
+
+    stats["same_day_entry_exit"] = sum(1 for t in trades if t["hold_days"] == 0)
+    stats["same_day_entry_exit_pct"] = (
+        _r(stats["same_day_entry_exit"] / len(trades) * 100.0) if trades else 0.0
+    )
+    if stats["same_day_entry_exit"]:
+        warnings.append(
+            f"진입일과 청산일이 같은 거래가 {stats['same_day_entry_exit']:,}건"
+            f"(전체 {len(trades):,}건 중 {stats['same_day_entry_exit_pct']}%)입니다. "
+            "일봉만으로는 하루 안의 체결 순서를 확정할 수 없습니다."
+        )
 
     report(100, "완료")
     return {
         "run_id": run_id,
         "elapsed_sec": _r(time.perf_counter() - t0, 3),
         "warnings": warnings,
+        "assumptions": make_assumptions(),
         "metrics": metrics,
         "equity": equity,
         "monthly": monthly,
