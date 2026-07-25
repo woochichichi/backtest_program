@@ -21,8 +21,15 @@ from engine.errors import DataUnavailable, StrategyError
 from engine.validate import validate_strategy
 
 RESULT_KEYS = {
-    "run_id", "elapsed_sec", "warnings", "metrics", "equity",
+    "run_id", "elapsed_sec", "warnings", "assumptions", "metrics", "equity",
     "monthly", "trades", "by_stock", "signals",
+}
+ASSUMPTION_KEYS = {
+    "resolution", "requested_resolution", "fill_model", "same_day_exit",
+    "slippage_pct", "fee_pct", "exit_priority", "notes", "stats",
+}
+ASSUMPTION_STAT_KEYS = {
+    "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
 }
 METRIC_KEYS = {
     "total_return_pct", "cagr_pct", "mdd_pct", "sharpe", "win_rate_pct",
@@ -181,6 +188,18 @@ def test_result_matches_api_schema(strategy1, tp_store):
     assert set(res) == RESULT_KEYS
     assert res["run_id"].startswith("r_")
     assert isinstance(res["elapsed_sec"], float)
+    a = res["assumptions"]
+    assert set(a) == ASSUMPTION_KEYS
+    assert a["resolution"] == "1d"
+    assert a["requested_resolution"] == "1m"
+    assert a["fill_model"] == "touch"
+    assert a["same_day_exit"] == "loss_only"
+    assert a["slippage_pct"] == pytest.approx(0.1)
+    assert a["fee_pct"] == pytest.approx(0.23)
+    assert a["exit_priority"] == ["SL", "TP"]
+    assert isinstance(a["notes"], list) and all(isinstance(n, str) and n for n in a["notes"])
+    assert set(a["stats"]) == ASSUMPTION_STAT_KEYS
+    assert all(isinstance(v, (int, float)) for v in a["stats"].values())
     assert set(res["metrics"]) == METRIC_KEYS
     assert set(res["metrics"]["period"]) == {"start", "end", "years"}
     assert set(res["equity"]) == {"dates", "values", "drawdown"}
@@ -202,7 +221,51 @@ def test_result_matches_api_schema(strategy1, tp_store):
 
 def test_warns_about_1m_resolution(strategy1, tp_store):
     res = run_backtest(strategy1, tp_store)
-    assert any("일봉 근사" in w for w in res["warnings"])
+    assert any("일봉으로 근사" in w for w in res["warnings"])
+    assert any("일봉 데이터만 사용했습니다" in n for n in res["assumptions"]["notes"])
+    assert any("분봉 매매는 추후 지원 예정" in n for n in res["assumptions"]["notes"])
+
+
+def test_assumption_notes_change_with_mode(strategy1, tp_store):
+    for mode, needle in [
+        ("loss_only", "손절 계열만 평가"),
+        ("never", "어떤 청산도 평가하지 않고"),
+        ("always", "실제보다 좋게 나올 수 있습니다"),
+    ]:
+        s = json.loads(json.dumps(strategy1))
+        s["execution"]["same_day_exit"] = mode
+        res = run_backtest(s, tp_store)
+        assert res["assumptions"]["same_day_exit"] == mode
+        assert any(needle in n for n in res["assumptions"]["notes"]), (mode, res["assumptions"]["notes"])
+
+
+def test_always_mode_emits_optimism_warning(strategy1, tp_store):
+    s = json.loads(json.dumps(strategy1))
+    s["execution"]["same_day_exit"] = "always"
+    res = run_backtest(s, tp_store)
+    assert any("좋게 나올 수 있습니다" in w for w in res["warnings"])
+    # 보수적 기본값에서는 그 경고가 없어야 한다
+    assert not any("좋게 나올 수 있습니다" in w for w in run_backtest(strategy1, tp_store)["warnings"])
+
+
+def test_same_day_exit_default_is_loss_only(strategy1_json, tp_store, dates):
+    """execution 에서 키를 빼도 기본값은 loss_only 다."""
+    s = json.loads(json.dumps(strategy1_json))
+    s["period"] = {"start": dates[90].isoformat(), "end": "auto"}
+    s["execution"].pop("same_day_exit", None)
+    assert run_backtest(s, tp_store)["assumptions"]["same_day_exit"] == "loss_only"
+
+
+def test_strategy1_declares_same_day_exit(strategy1_json):
+    assert strategy1_json["execution"]["same_day_exit"] == "loss_only"
+
+
+def test_validation_rejects_bad_same_day_exit(strategy1_json):
+    s = json.loads(json.dumps(strategy1_json))
+    s["execution"]["same_day_exit"] = "sometimes"
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "execution.same_day_exit" for e in errors)
 
 
 def test_progress_callback(strategy1, tp_store):
@@ -405,6 +468,114 @@ def test_equity_curve_and_monthly(strategy1, tp_store, dates):
     assert all(d <= 0.0 for d in eq["drawdown"])
     assert res["monthly"]
     assert all(len(m["month"]) == 7 for m in res["monthly"])
+
+
+# ======================================================================================
+# ★ execution.same_day_exit — 진입 당일 청산 정책
+# ======================================================================================
+
+
+def _mode(strategy1, mode):
+    s = json.loads(json.dumps(strategy1))
+    s["execution"]["same_day_exit"] = mode
+    return s
+
+
+def _same_day_tp_store(dates):
+    """B2 체결 봉(107)에서 익절가까지 함께 닿는 프레임 — 순서를 알 수 없는 애매한 봉."""
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100010", "테스트에이", "tp", dates)
+    f.loc[B2_BAR, ["Open", "High", "Low", "Close"]] = [3710.0, 4300.0, 3550.0, 4200.0]
+    return FakeStore([f])
+
+
+def _same_day_sl_store(dates):
+    """B2 체결 봉(107)에서 45일선까지 함께 무너지는 프레임."""
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100020", "테스트비", "sl", dates)
+    f.loc[B2_BAR, ["Open", "High", "Low", "Close"]] = [3710.0, 3730.0, 2000.0, 2100.0]
+    return FakeStore([f])
+
+
+def test_same_day_take_profit_only_with_always(strategy1, dates):
+    """같은 봉에서 진입+익절 — always 만 당일 체결, loss_only/never 는 다음 거래일로 이월."""
+    store_of = {m: _same_day_tp_store(dates) for m in ("always", "loss_only", "never")}
+
+    res = run_backtest(_mode(strategy1, "always"), store_of["always"])
+    t = res["trades"][0]
+    assert t["exit_rule"] == "TP"
+    assert t["exit_date"] == dates[B2_BAR].isoformat()      # B2 체결 당일 익절
+
+    for mode in ("loss_only", "never"):
+        res = run_backtest(_mode(strategy1, mode), store_of[mode])
+        t = res["trades"][0]
+        assert t["exit_rule"] == "TP"
+        assert t["exit_date"] > dates[B2_BAR].isoformat(), mode
+        assert t["exit_date"] == dates[TP_BAR].isoformat(), mode
+
+    # 세 경우 모두 "순서를 알 수 없는 봉" 으로 집계된다
+    for mode in ("always", "loss_only", "never"):
+        res = run_backtest(_mode(strategy1, mode), _same_day_tp_store(dates))
+        assert res["assumptions"]["stats"]["ambiguous_bars"] >= 1, mode
+
+
+def test_same_day_stop_loss_fires_under_loss_only(strategy1, dates):
+    """loss_only 는 진입 당일에도 손절을 발동시킨다. never 만 다음 거래일로 미룬다."""
+    for mode in ("always", "loss_only"):
+        res = run_backtest(_mode(strategy1, mode), _same_day_sl_store(dates))
+        t = res["trades"][0]
+        assert t["exit_rule"] == "SL", mode
+        assert t["exit_date"] == dates[B2_BAR].isoformat(), mode
+
+    res = run_backtest(_mode(strategy1, "never"), _same_day_sl_store(dates))
+    t = res["trades"][0]
+    assert t["exit_rule"] == "SL"
+    assert t["exit_date"] > dates[B2_BAR].isoformat()
+
+
+def test_loss_only_blocks_tp_but_not_sl(strategy1, dates):
+    """같은 설정(loss_only)에서 TP 는 막히고 SL 은 통과한다 — 손실 방향만 허용."""
+    tp = run_backtest(_mode(strategy1, "loss_only"), _same_day_tp_store(dates))["trades"][0]
+    sl = run_backtest(_mode(strategy1, "loss_only"), _same_day_sl_store(dates))["trades"][0]
+    assert tp["exit_date"] > dates[B2_BAR].isoformat()      # 익절은 이월
+    assert sl["exit_date"] == dates[B2_BAR].isoformat()     # 손절은 당일
+
+
+def test_deferred_exit_is_logged(strategy1, dates):
+    res = run_backtest(_mode(strategy1, "loss_only"), _same_day_tp_store(dates))
+    assert any("이월" in s["message"] and "same_day_exit=loss_only" in s["message"]
+               for s in res["signals"])
+
+
+def test_untyped_exit_rule_is_treated_as_loss_side(strategy1, dates):
+    """type 이 없는 커스텀 청산은 loss_only 에서 당일 평가를 허용한다 (보수적)."""
+    s = _mode(strategy1, "loss_only")
+    for r in s["exits"]:
+        if r["id"] == "TP":
+            r.pop("type")
+    res = run_backtest(s, _same_day_tp_store(dates))
+    assert res["trades"][0]["exit_date"] == dates[B2_BAR].isoformat()
+
+
+def test_same_day_stats(strategy1, dates):
+    res = run_backtest(_mode(strategy1, "always"), _same_day_tp_store(dates))
+    st = res["assumptions"]["stats"]
+    assert st["ambiguous_bars"] >= 1
+    assert st["same_day_entry_exit"] == sum(1 for t in res["trades"] if t["hold_days"] == 0)
+    assert 0.0 <= st["same_day_entry_exit_pct"] <= 100.0
+
+
+def test_signal_truncation_reports_dropped_count(strategy1, dates, monkeypatch):
+    import engine.backtest as bt
+
+    monkeypatch.setattr(bt, "MAX_SIGNALS", 3)
+    res = run_backtest(strategy1, _same_day_tp_store(dates))
+    assert len(res["signals"]) == 3
+    dropped = [w for w in res["warnings"] if "생략했습니다" in w]
+    assert dropped and "3건을 넘어" in dropped[0]
+    assert "0건은 생략" not in dropped[0]
 
 
 def test_performance_budget(strategy1, dates):

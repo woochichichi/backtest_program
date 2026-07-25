@@ -80,9 +80,9 @@ def _d(v) -> dt.date:
 class _Signals:
     """SCAN / MATCH / WATCH / FILL / POS / PNL / DONE 로그 수집기."""
 
-    def __init__(self, limit: int = MAX_SIGNALS):
+    def __init__(self, limit: Optional[int] = None):
         self.items: List[dict] = []
-        self.limit = limit
+        self.limit = int(limit if limit is not None else MAX_SIGNALS)
         self.truncated = False
         self.dropped = 0
 
@@ -701,7 +701,7 @@ def run_backtest(
     )
     if sig.truncated:
         warnings.append(
-            f"시그널 로그가 {MAX_SIGNALS}건을 넘어 이후 {sig.dropped:,}건은 생략했습니다."
+            f"시그널 로그가 {sig.limit:,}건을 넘어 이후 {sig.dropped:,}건은 생략했습니다."
         )
 
     stats["same_day_entry_exit"] = sum(1 for t in trades if t["hold_days"] == 0)
