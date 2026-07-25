@@ -74,10 +74,12 @@ class _Signals:
         self.items: List[dict] = []
         self.limit = limit
         self.truncated = False
+        self.dropped = 0
 
     def add(self, day, level: str, code: Optional[str], message: str, hhmmss="09:00:00"):
         if len(self.items) >= self.limit:
             self.truncated = True
+            self.dropped += 1
             return
         d = _d(day) if day is not None else None
         self.items.append(
@@ -351,9 +353,41 @@ def run_backtest(
     ucondition = str(universe.get("condition") or "none")
     pullback_pct = universe.get("pullback_pct")
 
-    resolutions = {str(market.get("trade_resolution") or ""), str(execution.get("resolution") or "")}
-    if "1m" in resolutions:
-        warnings.append("1분봉 데이터가 없어 일봉 근사로 체결했습니다.")
+    same_day_exit = str(execution.get("same_day_exit") or DEFAULT_SAME_DAY_EXIT)
+    if same_day_exit not in SAME_DAY_EXIT_MODES:
+        same_day_exit = DEFAULT_SAME_DAY_EXIT
+
+    requested_resolution = str(
+        market.get("trade_resolution") or execution.get("resolution") or "1d"
+    )
+    if requested_resolution != "1d":
+        warnings.append(
+            f"{requested_resolution} 체결을 요청했지만 일봉 데이터만 있어 일봉으로 근사했습니다. "
+            "실행 가정은 assumptions 를 확인하세요."
+        )
+    if same_day_exit == "always":
+        warnings.append(
+            "same_day_exit=always 는 진입 당일 익절을 허용합니다. "
+            "일봉만으로는 저가·고가 순서를 알 수 없어 성과가 실제보다 좋게 나올 수 있습니다."
+        )
+
+    stats = {"same_day_entry_exit": 0, "same_day_entry_exit_pct": 0.0, "ambiguous_bars": 0}
+
+    def make_assumptions() -> dict:
+        return {
+            "resolution": "1d",
+            "requested_resolution": requested_resolution,
+            "fill_model": fill_model,
+            "same_day_exit": same_day_exit,
+            "slippage_pct": _r(slippage * 100.0, 4),
+            "fee_pct": _r(fee * 100.0, 4),
+            "exit_priority": [r.get("id") for r in ordered_exits],
+            "notes": _assumption_notes(
+                requested_resolution, fill_model, same_day_exit, slippage, fee,
+                ordered_exits, stats,
+            ),
+            "stats": dict(stats),
+        }
 
     # ---------------------------------------------------------------- 기간
     report(2, "기간 확정")
@@ -396,7 +430,7 @@ def run_backtest(
     if events.empty:
         return _empty_result(
             run_id, t0, warnings, sig, calendar, initial_capital, start, end,
-            "기준일 조건을 만족하는 종목이 없습니다.",
+            "기준일 조건을 만족하는 종목이 없습니다.", make_assumptions(),
         )
 
     cand_codes = pd.Index(events["Code"].unique())
@@ -552,6 +586,7 @@ def run_backtest(
                 w["fill_log"].append(
                     {"rule": rid, "date": fill_date.isoformat(), "price": _r(buy_px, 2), "qty": int(qty)}
                 )
+                w["last_entry_date"] = fill_date
                 if w["entry_date"] is None:
                     w["entry_date"] = fill_date
                     w["peak"] = bar["high"]
@@ -566,6 +601,8 @@ def run_backtest(
             if w["qty"] > 0:
                 w["peak"] = max(w["peak"] or bar["high"], bar["high"])
                 ctx = _ctx(rec, w, bar=bar, day=day)
+                entry_today = w["last_entry_date"] == day
+                ambiguous_here = False
                 for rule in ordered_exits:
                     if w["qty"] <= 0:
                         break
@@ -573,6 +610,17 @@ def run_backtest(
                     hit, forced_price = _exit_hit(rule, ctx, li, bar, w, day)
                     if not hit:
                         continue
+                    if entry_today:
+                        # 진입과 청산이 같은 봉 안에서 모두 성립 — 일봉으로는 순서를 알 수 없다
+                        ambiguous_here = True
+                        if not _same_day_allowed(same_day_exit, rule):
+                            sig.add(
+                                day, "POS", code,
+                                f"{code} {rule.get('label') or rule.get('id')} 조건이 진입 당일 성립했으나 "
+                                f"same_day_exit={same_day_exit} 규칙에 따라 다음 거래일로 이월",
+                                "15:31:00",
+                            )
+                            continue
                     px = forced_price
                     if px is None:
                         px = _fill_price(rule, ctx, li, bar, nxt, "sell", fill_model)

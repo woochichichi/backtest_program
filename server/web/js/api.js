@@ -47,10 +47,14 @@ export class ApiError extends Error {
   }
 }
 
-/** 상태 코드별 기본 한국어 문구 */
+/**
+ * 상태 코드별 기본 한국어 문구.
+ * 서버 규약: `error` = 사용자에게 보여줄 한국어, `detail` = 기술적 원인.
+ * 따라서 error 를 먼저 쓰고, 없을 때만 detail 로 내려간다.
+ */
 function messageFor(status, path, body) {
-  const detail = body && (body.detail || body.error || body.message);
-  if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  const msg = body && (body.error || body.detail || body.message);
+  if (typeof msg === 'string' && msg.trim()) return msg.trim();
   switch (status) {
     case 400: return `요청이 올바르지 않습니다. (${path})`;
     case 404: return `요청한 리소스를 찾을 수 없습니다. (${path})`;
@@ -115,6 +119,8 @@ async function request(path, init = {}, timeoutMs = TIMEOUT_MS) {
       errors: body && Array.isArray(body.errors) ? body.errors : null,
       payload: body,
       path,
+      // detail 은 원인 설명이라 error 와 다를 때만 안내로 덧붙인다
+      howTo: body && typeof body.detail === 'string' && body.detail !== body.error ? body.detail : '',
     });
   }
   return body;
