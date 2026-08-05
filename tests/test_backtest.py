@@ -1414,3 +1414,192 @@ def test_strategy3_declares_requires_dart():
             assert p.get("available") is not False, "파일에 available:false 를 박아두지 않는다"
             assert p.get("unavailable_reason")
     assert doc["universe"]["filters"]["on_missing"] == "include"
+
+
+# ======================================================================================
+# ★ 차트 조회 성능 경로 — bars() 푸시다운 + 종목 캐시
+# ======================================================================================
+
+
+def _write_marcap_years(tmp_path, dates, codes_by_year):
+    """연도별 parquet 를 만든다. ``codes_by_year`` 는 ``{year: [(raw_code, name), ...]}``."""
+    from conftest import make_frame
+
+    data_dir = tmp_path / "marcap" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for year, entries in codes_by_year.items():
+        rows = []
+        yd = [d for d in dates if d.year == year]
+        if not yd:
+            continue
+        for raw, name in entries:
+            f = make_frame(str(raw).zfill(6), name, "flat", yd)
+            f["Code"] = str(raw)          # 파일에는 원본 표기 그대로 (앞자리 0 없이 저장된 옛 파일 재현)
+            rows.append(f)
+        pd.concat(rows, ignore_index=True).to_parquet(
+            data_dir / f"marcap-{year}.parquet", index=False
+        )
+    return tmp_path / "marcap"
+
+
+@pytest.fixture
+def multiyear_store(tmp_path):
+    """2023~2025년 3개 파일. 2023년만 앞자리 0 을 뗀 옛 표기('5930')."""
+    import pandas as pd  # noqa: F811
+
+    dates = [d.date() for d in pd.bdate_range("2023-01-02", "2025-12-31")]
+    root = _write_marcap_years(tmp_path, dates, {
+        2023: [("5930", "삼성전자"), ("660", "SK하이닉스")],       # 옛 표기
+        2024: [("005930", "삼성전자"), ("000660", "SK하이닉스")],
+        2025: [("005930", "삼성전자"), ("000660", "SK하이닉스")],
+    })
+    return MarcapStore(root=root, cache_dir=tmp_path / "cache")
+
+
+def test_code_variants():
+    from engine.data import code_variants
+
+    assert code_variants("005930") == ["005930", "05930", "5930"]
+    assert code_variants("000660") == ["000660", "00660", "0660", "660"]
+    assert code_variants("373220") == ["373220"]
+    assert code_variants("5930") == ["005930", "05930", "5930"]
+
+
+def test_bars_includes_zero_stripped_old_rows(multiyear_store):
+    """1995~2000년 파일은 Code 를 '5930' 처럼 저장한다. 이 행이 누락되면 안 된다."""
+    df = multiyear_store.bars("005930")
+    years = sorted(set(df.index.year))
+    assert years == [2023, 2024, 2025], "옛 표기 연도가 빠졌다"
+    assert (df["Code"] == "005930").all(), "Code 가 6자리로 정규화돼야 한다"
+
+    naive = multiyear_store.bars("000660")
+    assert sorted(set(naive.index.year)) == [2023, 2024, 2025]
+
+
+def test_bars_matches_full_scan(multiyear_store):
+    """푸시다운 결과가 연도 전체를 읽어 거른 것과 완전히 같아야 한다."""
+    got = multiyear_store.bars("005930", use_cache=False)
+
+    ref = []
+    for y in (2023, 2024, 2025):
+        df = multiyear_store.load_year(y)
+        ref.append(df[df["Code"] == "005930"])
+    want = pd.concat(ref, ignore_index=True).set_index("Date").sort_index()
+
+    assert len(got) == len(want)
+    for col in ("Open", "High", "Low", "Close", "Volume", "Amount"):
+        np.testing.assert_allclose(
+            got[col].to_numpy("float64"), want[col].to_numpy("float64")
+        )
+
+
+def test_bars_does_not_pollute_year_cache(multiyear_store):
+    """차트 조회가 백테스트용 연도 캐시를 밀어내면 안 된다."""
+    assert multiyear_store._years == {}
+    multiyear_store.bars("005930")
+    assert multiyear_store._years == {}, "푸시다운 읽기는 _years 에 넣지 않는다"
+
+
+def test_bars_uses_year_cache_when_already_loaded(multiyear_store):
+    """이미 메모리에 올라온 연도가 있으면 그걸 쓴다 (다시 읽지 않는다)."""
+    multiyear_store.load_year(2024)
+    assert len(multiyear_store._years) == 1
+    df = multiyear_store.bars("005930", "2024-01-01", "2024-12-31")
+    assert len(df) > 0
+    assert len(multiyear_store._years) == 1
+
+
+def test_symbol_cache_created_and_reused(multiyear_store):
+    multiyear_store.bars("005930")
+    cache_files = list(multiyear_store.symbol_cache_dir.glob("005930.parquet"))
+    assert cache_files, "종목 캐시 파일이 만들어져야 한다"
+    assert (multiyear_store.symbol_cache_dir / "005930.meta.json").is_file()
+
+    # 원본을 못 읽게 만들어도 캐시로 답해야 한다
+    hidden = multiyear_store.root / "data"
+    moved = multiyear_store.root / "data_hidden"
+    df_before = multiyear_store.bars("005930")
+    hidden.rename(moved)
+    try:
+        with pytest.raises(DataUnavailable):
+            multiyear_store.bars("005930")     # _require() 가 먼저 막는다
+    finally:
+        moved.rename(hidden)
+    assert len(multiyear_store.bars("005930")) == len(df_before)
+
+
+def test_symbol_cache_invalidated_on_source_change(multiyear_store):
+    import os
+
+    first = multiyear_store.bars("005930")
+    meta_path = multiyear_store.symbol_cache_dir / "005930.meta.json"
+    meta_before = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    newest = multiyear_store.root / "data" / "marcap-2025.parquet"
+    os.utime(newest, (0, 0))                  # 원본이 갱신된 것처럼
+
+    again = multiyear_store.bars("005930")
+    assert len(again) == len(first)
+    meta_after = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta_after["files"] != meta_before["files"], "지문이 갱신돼야 한다"
+
+
+def test_symbol_cache_incremental_growth(multiyear_store):
+    """범위 조회 → 더 넓은 범위 조회 시 부족한 연도만 읽어 이어붙인다 (점진 로딩)."""
+    part = multiyear_store.bars("005930", "2025-01-01", "2025-12-31")
+    meta = json.loads((multiyear_store.symbol_cache_dir / "005930.meta.json").read_text(encoding="utf-8"))
+    assert meta["years"] == [2025]
+
+    whole = multiyear_store.bars("005930")
+    meta = json.loads((multiyear_store.symbol_cache_dir / "005930.meta.json").read_text(encoding="utf-8"))
+    assert meta["years"] == [2023, 2024, 2025]
+    assert len(whole) > len(part)
+    assert sorted(set(whole.index.year)) == [2023, 2024, 2025]
+
+    # 좁은 구간을 다시 물어도 값이 같아야 한다
+    again = multiyear_store.bars("005930", "2025-01-01", "2025-12-31")
+    assert len(again) == len(part)
+    np.testing.assert_allclose(
+        again["Close"].to_numpy("float64"), part["Close"].to_numpy("float64")
+    )
+
+
+def test_bars_columns_option(multiyear_store):
+    lean = multiyear_store.bars("005930", columns=["Date", "Code", "Close"])
+    assert set(lean.columns) == {"Code", "Close"}
+
+    allc = multiyear_store.bars("005930", columns="all", use_cache=False)
+    assert {"Marcap", "Dept", "Market"} <= set(allc.columns)
+
+    default = multiyear_store.bars("005930", use_cache=False)
+    assert {"Open", "High", "Low", "Close", "Volume", "Amount", "Name"} <= set(default.columns)
+
+
+def test_bars_range_and_errors(multiyear_store):
+    r = multiyear_store.bars("005930", "2024-01-01", "2024-12-31")
+    assert set(r.index.year) == {2024}
+    with pytest.raises(DataUnavailable):
+        multiyear_store.bars("005930", "2030-01-01", "2030-12-31")
+    with pytest.raises(DataUnavailable):
+        multiyear_store.bars("999999")
+    with pytest.raises(DataUnavailable):
+        multiyear_store.bars("005930", "2025-01-01", "2024-01-01")
+
+
+def test_clear_symbol_cache(multiyear_store):
+    multiyear_store.bars("005930")
+    assert list(multiyear_store.symbol_cache_dir.glob("*.parquet"))
+    assert multiyear_store.clear_symbol_cache() > 0
+    assert not list(multiyear_store.symbol_cache_dir.glob("*"))
+    assert len(multiyear_store.bars("005930")) > 0      # 다시 만들어진다
+
+
+def test_symbol_cache_trim(multiyear_store):
+    from engine.data import MarcapStore as MS
+
+    multiyear_store.bars("005930")
+    multiyear_store.bars("000660")
+    assert len(list(multiyear_store.symbol_cache_dir.glob("*.parquet"))) == 2
+    multiyear_store._trim_symbol_cache(max_bytes=1)
+    left = list(multiyear_store.symbol_cache_dir.glob("*.parquet"))
+    assert len(left) <= 1, "상한을 넘으면 오래된 것부터 지운다"

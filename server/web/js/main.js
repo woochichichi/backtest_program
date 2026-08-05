@@ -776,16 +776,126 @@ function applyRangeViewport() {
   else S.chart.showLast(bars, false);
 }
 
+/* ---------------- 점진 로딩 ----------------
+   전체 히스토리를 한 번에 받으면 서버가 32개 연도 파일을 모두 읽어야 해서
+   12초가 걸린다. 그래서:
+     1) 최근 구간만 먼저 받아 즉시 그리고 (0.3초 수준)
+     2) 나머지 과거는 배경으로 이어붙이고
+     3) 아직 안 받은 과거로 팬하면 그때 추가로 받는다.
+   붙이는 동안에도 팬·줌은 막지 않는다.                                     */
+
+const CHART_INITIAL_YEARS = 2;    // 처음에 바로 받는 최근 구간
+const CHART_CHUNK_YEARS = 5;      // 배경으로 이어받는 한 덩어리
+const CHART_MAX_BARS = 12000;     // 무한정 붙이지 않는다 (약 48년)
+const EDGE_TRIGGER_BARS = 60;     // 왼쪽 끝 이만큼 남으면 미리 받는다
+
+let histBusy = false;             // 과거 구간 요청은 한 번에 하나만
+
+function shiftYears(dateStr, years) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return dateStr;
+  d.setFullYear(d.getFullYear() + years);
+  return isoOf(d);
+}
+function prevDay(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return dateStr;
+  d.setDate(d.getDate() - 1);
+  return isoOf(d);
+}
+function firstAvailableDate() {
+  return (S.status && S.status.first_trade_date) || '1995-01-01';
+}
+function latestDate() {
+  return (S.status && S.status.latest_trade_date) || isoOf(new Date());
+}
+
+function setEdgeLoading(on, text) {
+  const el = $('chartEdgeLoad');
+  if (!el) return;
+  el.hidden = !on;
+  if (on) el.querySelector('.edge-tx').textContent = text || '이전 데이터를 불러오는 중';
+}
+
+/** 더 과거 구간이 남아 있는가 */
+function hasMoreHistory() {
+  if (!S.chart || !S.chart.hasData()) return false;
+  if (S.chart.n >= CHART_MAX_BARS) return false;
+  const oldest = S.chart.oldestDate;
+  return !!oldest && oldest > firstAvailableDate();
+}
+
+/**
+ * 과거 한 덩어리를 받아 앞에 붙인다.
+ * @returns {Promise<number>} 붙은 봉 수 (0 이면 더 없음/실패)
+ */
+async function fetchOlderChunk(seq, code) {
+  if (histBusy || !hasMoreHistory()) return 0;
+  if (seq !== S.chartSeq) return 0;
+  histBusy = true;
+  setEdgeLoading(true);
+  try {
+    const end = prevDay(S.chart.oldestDate);
+    const floor = firstAvailableDate();
+    let start = shiftYears(end, -CHART_CHUNK_YEARS);
+    if (start < floor) start = floor;
+    if (start > end) return 0;
+
+    const payload = await api.getChart({
+      code, start, end,
+      indicators: S.active.map((a) => a.key),
+      run_id: S.result ? S.result.run_id : undefined,
+      signal: S.chartAbort ? S.chartAbort.signal : undefined,
+    });
+    if (seq !== S.chartSeq) return 0;          // 종목이 바뀌었으면 버린다
+    if (!payload || !payload.n) {
+      S.histExhausted = true;                  // 이 구간에 데이터가 없다 = 상장 전
+      return 0;
+    }
+    const added = S.chart.prependData(payload, S.active);
+    if (!added) S.histExhausted = true;
+    return added;
+  } catch (e) {
+    if (!(e && e.aborted)) {
+      // 배경 작업이라 배너로 방해하지 않는다. 다음 팬에서 다시 시도된다.
+      console.warn('[과거 구간 이어받기 실패]', e && e.message);
+    }
+    return 0;
+  } finally {
+    histBusy = false;
+    setEdgeLoading(false);
+  }
+}
+
+/** 배경으로 과거를 끝까지 이어붙인다 (사용자 조작을 막지 않는다) */
+async function backfillHistory(seq, code) {
+  let guard = 0;
+  while (seq === S.chartSeq && !S.histExhausted && hasMoreHistory() && guard++ < 20) {
+    const added = await fetchOlderChunk(seq, code);
+    if (!added) break;
+    // 다음 청크 전에 한 프레임 양보 — 팬·줌이 끊기지 않게 한다
+    await new Promise((r) => setTimeout(r, 60));
+  }
+}
+
+/** 왼쪽 끝 가까이 팬하면 즉시 이어받는다 */
+function onChartViewport(i0) {
+  if (i0 > EDGE_TRIGGER_BARS) return;
+  if (S.histExhausted || histBusy || !hasMoreHistory()) return;
+  fetchOlderChunk(S.chartSeq, S.symbol.code);
+}
+
 /**
  * 차트 로드.
- * 종목의 **가용 전체 구간**을 받고, 기간 버튼은 뷰포트만 바꾼다.
- * (선택 기간만 받으면 로드된 봉 수 == 보이는 봉 수가 되어 좌우로 이동할 데이터가 없다)
+ * 최근 구간을 먼저 받아 즉시 그리고, 과거는 배경으로 이어붙인다.
+ * 기간 버튼은 데이터 재요청이 아니라 뷰포트 변경으로 처리한다.
  */
 async function loadChart(o = {}) {
   if (!S.chart) return;
   const code = o.code || S.symbol.code || firstTradeCode() || '';
   $('chartNote').hidden = true;
   $('chartWrap').classList.remove('has-note');
+  setEdgeLoading(false);
 
   // 서버가 "데이터 없음"이라고 이미 알려 줬으면 실패가 확정된 요청을 보내지 않는다
   // (콘솔에 503 을 남기지 않고, 같은 안내를 두 번 띄우지도 않는다)
@@ -823,23 +933,49 @@ async function loadChart(o = {}) {
     icon: 'chart', title: '차트를 불러오는 중입니다…',
     desc: code ? `${code} 의 시세를 받고 있습니다.` : '표시할 종목을 고르는 중입니다.',
   });
+
+  // 종목을 빠르게 여러 번 바꾸면 이전 요청은 실제로 끊는다
+  if (S.chartAbort) S.chartAbort.abort();
+  S.chartAbort = new AbortController();
+  const signal = S.chartAbort.signal;
+  const seq = ++S.chartSeq;
+  S.histExhausted = false;
+  S.lastChartArgs = o;            // 재시도 버튼용
+
+  // 3초 넘게 걸리면 왜 기다리는지 알려 준다
+  const slowTimer = setTimeout(() => {
+    if (seq !== S.chartSeq) return;
+    showChartEmpty({
+      icon: 'chart', title: '데이터를 불러오는 중입니다…',
+      desc: '처음 보는 종목이라 과거 시세를 읽고 있습니다. 잠시만 기다려 주세요.',
+    });
+  }, 3000);
+
   try {
-    // start/end 를 보내지 않는다 = 상장 이후 전체 히스토리.
-    // 기간 버튼은 데이터 재요청이 아니라 뷰포트 변경으로 처리한다.
-    const seq = ++S.chartSeq;
+    // 1) 최근 구간만 먼저 받는다 — 전체를 받으면 서버에서 10초를 넘긴다
+    const end = latestDate();
+    let start = shiftYears(end, -CHART_INITIAL_YEARS);
+    const floor = firstAvailableDate();
+    if (start < floor) start = floor;
+
     const payload = await api.getChart({
-      code,
-      n: 4000,                    // 폴백 mockdata 전용 (실서버는 이 값을 쓰지 않는다)
+      code, start, end,
+      n: Math.round(CHART_INITIAL_YEARS * 250),   // 폴백 mockdata 전용
       indicators: S.active.map((a) => a.key),
       run_id: S.result ? S.result.run_id : undefined,
+      signal,
     });
-    // 지표를 연달아 추가하면 요청이 겹친다. 늦게 도착한 예전 응답은 버린다.
+    clearTimeout(slowTimer);
+    // 지표를 연달아 바꾸거나 종목을 여러 번 누르면 요청이 겹친다. 예전 응답은 버린다.
     if (seq !== S.chartSeq) return;
     S.symbol = { code: payload.code || code, name: payload.name || o.name || '' };
     $('symCode').textContent = S.symbol.code || '—';
     $('symName').textContent = S.symbol.name || '이름 없음';
     S.chart.setData(payload, S.active);
-    applyRangeViewport();         // 전체를 들고 있되 보이는 구간만 기간 버튼에 맞춘다
+    applyRangeViewport();         // 보이는 구간만 기간 버튼에 맞춘다
+
+    // 2) 나머지 과거는 배경으로 이어붙인다 (await 하지 않는다 — 화면을 막지 않는다)
+    if (payload && payload.n) backfillHistory(seq, S.symbol.code);
 
     if (payload && payload.n) {
       $('chartEmpty').hidden = true;

@@ -141,6 +141,102 @@ export class CandleChart {
    */
   setData(p, indicatorMeta = []) {
     if (!p || !p.n) { this.d = null; this.i0 = this.i1 = 0; this.requestBase(); return; }
+    this.d = this._build(p, indicatorMeta);
+    this.hover = -1;
+    this.highlight = null;
+    this.fitAll(false);
+  }
+
+  /**
+   * 더 오래된 구간을 앞에 이어 붙인다 (점진 로딩).
+   * 화면이 튀지 않도록 뷰포트·강조·호버 인덱스를 붙인 개수만큼 밀어 준다.
+   * @returns {number} 실제로 앞에 붙은 봉 수 (0 이면 새로 붙은 게 없다)
+   */
+  prependData(p, indicatorMeta = []) {
+    if (!p || !p.n) return 0;
+    if (!this.d || !this.d.n) { this.setData(p, indicatorMeta); return this.d ? this.d.n : 0; }
+
+    const old = this._build(p, indicatorMeta);
+    const cur = this.d;
+
+    // 겹치는 구간은 버린다. 기존 첫 봉보다 과거인 것만 남긴다.
+    const firstT = cur.t[0];
+    let cut = old.n;
+    while (cut > 0 && old.t[cut - 1] >= firstT) cut--;
+    if (cut <= 0) return 0;
+
+    const n = cut + cur.n;
+    const catI32 = (a, b) => { const o = new Int32Array(n); o.set(a.subarray(0, cut)); o.set(b, cut); return o; };
+    const catF64 = (a, b) => { const o = new Float64Array(n); o.set(a.subarray(0, cut)); o.set(b, cut); return o; };
+    const catU8 = (a, b) => { const o = new Uint8Array(n); o.set(a.subarray(0, cut)); o.set(b, cut); return o; };
+
+    // 지표는 양쪽 키의 합집합. 한쪽에만 있으면 없는 구간은 NaN 으로 채운다.
+    const byKey = new Map();
+    for (const x of cur.ind) byKey.set(x.key, { meta: x, cur: x.arr, old: null });
+    for (const x of old.ind) {
+      const e = byKey.get(x.key);
+      if (e) e.old = x.arr;
+      else byKey.set(x.key, { meta: x, cur: null, old: x.arr });
+    }
+    const ind = [];
+    for (const [key, e] of byKey) {
+      const arr = new Float64Array(n);
+      if (e.old) arr.set(e.old.subarray(0, cut)); else arr.fill(NaN, 0, cut);
+      if (e.cur) arr.set(e.cur, cut); else arr.fill(NaN, cut, n);
+      ind.push({ ...e.meta, key, arr });
+    }
+    ind.sort((a, b) => a.slot - b.slot);
+
+    // 마커: 과거 청크의 것(인덱스 < cut) + 기존 것(cut 만큼 이동)
+    const keepOld = [];
+    for (let k = 0; k < old.markers.n; k++) if (old.markers.i[k] < cut) keepOld.push(k);
+    const mn = keepOld.length + cur.markers.n;
+    const markers = {
+      n: mn,
+      i: new Int32Array(mn), type: new Uint8Array(mn), price: new Float64Array(mn),
+      label: new Array(mn), note: new Array(mn),
+    };
+    keepOld.forEach((k, j) => {
+      markers.i[j] = old.markers.i[k]; markers.type[j] = old.markers.type[k];
+      markers.price[j] = old.markers.price[k];
+      markers.label[j] = old.markers.label[k]; markers.note[j] = old.markers.note[k];
+    });
+    for (let k = 0; k < cur.markers.n; k++) {
+      const j = keepOld.length + k;
+      markers.i[j] = cur.markers.i[k] + cut; markers.type[j] = cur.markers.type[k];
+      markers.price[j] = cur.markers.price[k];
+      markers.label[j] = cur.markers.label[k]; markers.note[j] = cur.markers.note[k];
+    }
+
+    const shiftBand = (b) => ({ ...b, from: (b.from | 0) + cut, to: (b.to | 0) + cut });
+    const shiftLevel = (l) => ({ ...l, from: (l.from | 0) + cut });
+
+    this.d = {
+      code: cur.code, name: cur.name, n,
+      t: catI32(old.t, cur.t),
+      o: catF64(old.o, cur.o), h: catF64(old.h, cur.h),
+      l: catF64(old.l, cur.l), c: catF64(old.c, cur.c),
+      v: catF64(old.v, cur.v), amt: catF64(old.amt, cur.amt),
+      flag: catU8(old.flag, cur.flag),
+      ind, markers,
+      bands: old.bands.filter((b) => (b.to | 0) < cut).concat(cur.bands.map(shiftBand)),
+      levels: old.levels.filter((l) => (l.from | 0) < cut).concat(cur.levels.map(shiftLevel)),
+    };
+
+    // 보고 있던 구간이 그대로 유지되도록 인덱스를 민다 (화면이 튀면 안 된다)
+    this.i0 += cut; this.i1 += cut;
+    if (this.highlight) { this.highlight.from += cut; this.highlight.to += cut; }
+    if (this.hover >= 0) this.hover += cut;
+    this.requestBase();
+    return cut;
+  }
+
+  /** 로드된 가장 오래된 / 최신 봉 날짜 (YYYY-MM-DD) */
+  get oldestDate() { return this.d && this.d.n ? ymd(this.d.t[0]) : null; }
+  get newestDate() { return this.d && this.d.n ? ymd(this.d.t[this.d.n - 1]) : null; }
+
+  /** 응답 페이로드 → 내부 데이터 객체 (setData / prependData 공용) */
+  _build(p, indicatorMeta = []) {
     const n = p.n | 0;
 
     const t = new Int32Array(n);
@@ -193,16 +289,12 @@ export class CandleChart {
       markers.note[k] = m.note || '';
     });
 
-    this.d = {
+    return {
       code: p.code || '', name: p.name || '', n,
       t, o, h, l, c, v, amt, flag, ind, markers,
       bands: Array.isArray(p.bands) ? p.bands : [],
       levels: Array.isArray(p.levels) ? p.levels : [],
     };
-
-    this.hover = -1;
-    this.highlight = null;
-    this.fitAll(false);
   }
 
   hasData() { return !!(this.d && this.d.n); }

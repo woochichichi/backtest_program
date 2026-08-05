@@ -2,7 +2,10 @@
 
     python -m tools.fetch_dart --from 2015 --to 2026 [--out dart] [--batch 50]
     python -m tools.fetch_dart --force            # 이미 받은 분기까지 전부 다시
+    python -m tools.fetch_dart --only 2015-1,2015-2   # 이 분기만 콕 집어 다시
     python -m tools.fetch_dart --selftest         # 키·연결·삼성전자 1건 확인
+    python -m tools.fetch_dart --report           # 받아 둔 데이터 진단 (네트워크 안 씀)
+    python -m tools.fetch_dart --rebuild          # 파생 지표만 다시 계산 (네트워크 안 씀)
 
 전자공시(DART) 의 **다중회사 주요계정**(``fnlttMultiAcnt.json``) 을 연도×분기로 훑어
 ``dart/fundamentals-YYYY.parquet`` 을 만든다. 기업 고유번호 매핑은 ``dart/corp_map.parquet``.
@@ -17,6 +20,8 @@
 * 다만 **가장 최근 2개 분기**(``--refresh-recent``) 는 정정공시·지각제출 때문에 매번 다시 확인한다
 * 분기 종료 후 45일(``--disclosure-lag-days``) 이 지나지 않은 분기는 **아예 요청하지 않는다**
   (아직 공시 기간이 아니므로 013 만 잔뜩 돌아온다)
+* **2015년 1~3분기도 요청하지 않는다** — DART 재무정보 API 가 분기·반기보고서를
+  2016년부터만 제공한다(``--quarterly-from``). 2015년은 사업보고서만 있다
 * ``corp_map`` 은 하루 한 번만 받는다
 * 하루 호출 20,000건 한도를 스스로 세어 넘기 전에 멈추고, 다음 실행에서 이어받는다
 * 전부 다시 받으려면 ``--force``
@@ -1639,17 +1644,6 @@ def _num(v, digits: int = 0) -> str:
     except (TypeError, ValueError):
         pass
     return f"{float(v):,.{digits}f}"
-
-
-def _fitnum(v, digits: int = 0, width: int = 9) -> str:
-    """폭 안에 안 들어가면 지수 표기로 떨어뜨린다 (표가 깨지지 않게)."""
-    s = _num(v, digits)
-    if _w(s) <= width - 1:
-        return s
-    try:
-        return f"{float(v):.2e}"
-    except (TypeError, ValueError):  # pragma: no cover
-        return s
 
 
 def _fitnum(v, digits: int = 0, width: int = 9) -> str:

@@ -16,6 +16,8 @@ const BASE = '/api';
 const TIMEOUT_MS = 20000;
 const BACKTEST_TIMEOUT_MS = 700000;   // 서버 자체 타임아웃(600초)보다 길게 잡는다
 const SYNC_TIMEOUT_MS = 660000;
+/** 차트는 서버가 과거 연도 파일을 읽어야 할 수 있어 넉넉히 잡는다 */
+const CHART_TIMEOUT_MS = 30000;
 
 /** 백엔드 연결 실패로 폴백 데이터를 쓰고 있는가 */
 let fallback = false;
@@ -175,10 +177,10 @@ async function request(path, init = {}, timeoutMs = TIMEOUT_MS) {
  * 폴백을 허용하는 GET. 연결 실패(status 0)일 때만 mock 으로 대체한다.
  * 4xx/5xx 는 서버가 살아 있다는 뜻이므로 그대로 던져서 배너에 띄운다.
  */
-async function getOrMock(path, mockFn, init) {
+async function getOrMock(path, mockFn, init, timeoutMs) {
   if (fallback) return mockFn();
   try {
-    return await request(path, init);
+    return await request(path, init, timeoutMs);
   } catch (e) {
     if (e instanceof ApiError && e.offline) {
       enterFallback(e.message + ' ' + e.advice);
@@ -391,6 +393,11 @@ export async function resetStrategy(id) {
    4-6 차트 / 종목 검색
    ============================================================ */
 
+/**
+ * @param {object} q {code, start, end, indicators, run_id, n, signal, timeout}
+ *   start/end 를 주면 그 구간만 받는다. 전체 히스토리를 한 번에 받으면
+ *   서버가 32개 연도 파일을 전부 읽어야 해서 10초를 넘긴다 (점진 로딩 참고).
+ */
 export function getChart(q = {}) {
   const p = new URLSearchParams();
   if (q.code) p.set('code', q.code);
@@ -399,9 +406,12 @@ export function getChart(q = {}) {
   if (q.indicators && q.indicators.length) p.set('indicators', q.indicators.join(','));
   if (q.run_id) p.set('run_id', q.run_id);
   const qs = p.toString();
-  return getOrMock(`/chart${qs ? '?' + qs : ''}`, () => mock.mockChart({
-    code: q.code, n: q.n, indicators: q.indicators, start: q.start, end: q.end,
-  }));
+  return getOrMock(
+    `/chart${qs ? '?' + qs : ''}`,
+    () => mock.mockChart({ code: q.code, n: q.n, indicators: q.indicators, start: q.start, end: q.end }),
+    q.signal ? { signal: q.signal } : undefined,
+    q.timeout || CHART_TIMEOUT_MS,
+  );
 }
 
 /**
