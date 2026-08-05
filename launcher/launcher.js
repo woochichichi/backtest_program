@@ -610,13 +610,19 @@ function s1Bat() {
     "set \"PY=" + P.venvPy + "\"",
     "set \"REQ=" + P.req + "\"",
     "set \"FORCE=" + (S.force ? "1" : "0") + "\"",
+    "rem  자격 증명 창이 뜨면 런처가 멈춘다. 물어보지 말고 그냥 실패하게 만든다.",
+    "set \"GIT_TERMINAL_PROMPT=0\"",
+    "set \"GCM_INTERACTIVE=never\"",
     "set \"ST=skip\"",
     "set \"OLD=\"",
     "set \"NEW=\"",
     "set \"DIRTY=\"",
+    "set \"BLIND=\"",
     "> \"!OUT!\\s1_old.txt\" echo.",
     "> \"!OUT!\\s1_new.txt\" echo.",
     "> \"!OUT!\\s1_commits.txt\" echo.",
+    "> \"!OUT!\\s1_dirty.txt\" echo.",
+    "> \"!OUT!\\s1_blind.txt\" echo.",
     ">> \"!LOG!\" echo [launcher] program update check",
     "where git >nul 2>&1",
     "if !errorlevel! neq 0 (",
@@ -628,14 +634,8 @@ function s1Bat() {
     "    goto :fin",
     ")",
     "for /f %%a in ('git -C \"!ROOT!\" rev-parse HEAD 2^>nul') do set \"OLD=%%a\"",
-    "> \"!OUT!\\s1_old.txt\" echo !OLD!",
-    "for /f \"delims=\" %%a in ('git -C \"!ROOT!\" status --porcelain 2^>nul') do set \"DIRTY=1\"",
-    "if defined DIRTY (",
-    "    set \"ST=dirty\"",
-    "    goto :fin",
-    ")",
-    "if \"!FORCE!\"==\"1\" goto :dopull",
-    "rem ---- 원격 참조만 읽어 비교한다. 전체 fetch 를 하지 않는다 ----",
+    "> \"!OUT!\\s1_old.txt\" echo.!OLD!",
+    "rem ---- 지금 브랜치 (pull 재시도에도 쓴다) ----",
     "set \"BR=\"",
     "for /f \"tokens=1\" %%a in ('git -C \"!ROOT!\" rev-parse --abbrev-ref HEAD 2^>nul') do set \"BR=%%a\"",
     "if not defined BR (",
@@ -646,12 +646,28 @@ function s1Bat() {
     "    set \"ST=detached\"",
     "    goto :fin",
     ")",
+    "rem ---- 로컬 수정 확인 ----",
+    "rem  추적 안 되는 파일(??)은 ff-only pull 을 막지 않으므로 dirty 로 세지 않는다.",
+    "rem  그렇지 않으면 폴더에 파일 하나만 떨어져도 영영 업데이트가 안 된다.",
+    "for /f \"tokens=1,*\" %%a in ('git -C \"!ROOT!\" status --porcelain 2^>nul') do (",
+    "    if not \"%%a\"==\"??\" call :chkdirty \"%%b\"",
+    ")",
+    "if defined DIRTY (",
+    "    set \"ST=dirty\"",
+    "    goto :fin",
+    ")",
+    "if \"!FORCE!\"==\"1\" goto :dopull",
+    "rem ---- 원격 참조만 읽어 비교한다. 전체 fetch 를 하지 않는다 ----",
     "set \"REMOTE=\"",
     ">> \"!LOG!\" echo [git] ls-remote origin !BR!",
     "for /f \"tokens=1\" %%a in ('git -C \"!ROOT!\" ls-remote origin \"refs/heads/!BR!\" 2^>nul') do set \"REMOTE=%%a\"",
     "if not defined REMOTE (",
-    "    set \"ST=noremote\"",
-    "    goto :fin",
+    "    rem  비교에 실패했다고 갱신을 포기하면 안 된다. 비교는 최적화일 뿐이다.",
+    "    rem  사설 저장소 인증 실패 등으로 여기 걸리면 그냥 받아 본다.",
+    "    >> \"!LOG!\" echo [git] ls-remote 실패 - 비교를 건너뛰고 그냥 받는다",
+    "    set \"BLIND=1\"",
+    "    > \"!OUT!\\s1_blind.txt\" echo 1",
+    "    goto :dopull",
     ")",
     "if /i \"!REMOTE!\"==\"!OLD!\" (",
     "    set \"ST=fresh\"",
@@ -661,11 +677,16 @@ function s1Bat() {
     ">> \"!LOG!\" echo [git] pull --ff-only",
     "git -C \"!ROOT!\" pull --ff-only >> \"!LOG!\" 2>&1",
     "if !errorlevel! neq 0 (",
-    "    set \"ST=pullfail\"",
-    "    goto :fin",
+    "    rem  upstream 이 안 잡혀 있으면 origin/브랜치 를 직접 준다",
+    "    >> \"!LOG!\" echo [git] 재시도 - pull --ff-only origin !BR!",
+    "    git -C \"!ROOT!\" pull --ff-only origin \"!BR!\" >> \"!LOG!\" 2>&1",
+    "    if !errorlevel! neq 0 (",
+    "        set \"ST=pullfail\"",
+    "        goto :fin",
+    "    )",
     ")",
     "for /f %%a in ('git -C \"!ROOT!\" rev-parse HEAD 2^>nul') do set \"NEW=%%a\"",
-    "> \"!OUT!\\s1_new.txt\" echo !NEW!",
+    "> \"!OUT!\\s1_new.txt\" echo.!NEW!",
     "if /i \"!OLD!\"==\"!NEW!\" (",
     "    set \"ST=same\"",
     "    goto :fin",
@@ -683,9 +704,29 @@ function s1Bat() {
     "\"!PY!\" -m pip install -q -r \"!REQ!\" >> \"!LOG!\" 2>&1",
     "set \"ST=updated_pip\"",
     ":fin",
-    "> \"!OUT!\\s1_st.txt\" echo !ST!",
+    "> \"!OUT!\\s1_st.txt\" echo.!ST!",
     "> \"!OUT!\\s1.done\" echo done",
-    "endlocal"
+    "endlocal",
+    "goto :eof",
+    "",
+    "rem ---- 런타임에 생기는 파일은 수정으로 치지 않는다 ----",
+    "rem  (.gitignore 가 이미 걸러 주지만, 빠져 있어도 업데이트가 막히면 안 된다)",
+    ":chkdirty",
+    "set \"F=%~1\"",
+    "if not defined F goto :eof",
+    "set \"F=!F:\\=/!\"",
+    "if /i \"!F!\"==\"launcher_config.json\" goto :eof",
+    "if /i \"!F!\"==\"dart_key.txt\" goto :eof",
+    "if /i \"!F!\"==\".server.pid\" goto :eof",
+    "if /i \"!F!\"==\".env\" goto :eof",
+    "if \"!F:~0,5!\"==\"logs/\" goto :eof",
+    "if \"!F:~0,6!\"==\"cache/\" goto :eof",
+    "if \"!F:~0,5!\"==\"dart/\" goto :eof",
+    "if \"!F:~0,7!\"==\"marcap/\" goto :eof",
+    "if \"!F:~0,6!\"==\".venv/\" goto :eof",
+    "set \"DIRTY=1\"",
+    ">> \"!OUT!\\s1_dirty.txt\" echo.!F!",
+    "goto :eof"
   ];
 }
 
@@ -727,6 +768,7 @@ function step1() {
           if (L) { lines[lines.length] = L; }
         }
       }
+      var blind = trim(readOne("s1_blind.txt")) === "1";
       var shortOld = oldRev ? oldRev.substring(0, 7) : "";
       var shortNew = newRev ? newRev.substring(0, 7) : "";
 
@@ -735,17 +777,21 @@ function step1() {
       } else if (st === "norepo") {
         finishStep(0, "skip", "git 으로 받은 폴더가 아니어서 건너뜁니다", step2);
       } else if (st === "dirty") {
-        finishStep(0, "skip", "이 컴퓨터에서 고친 파일이 있어 업데이트를 건너뛰었습니다", step2);
+        var dl = trim(String(SYS.read(P.work + "\\s1_dirty.txt") || "").replace(/\r/g, " ").replace(/\n/g, " "));
+        finishStep(0, "skip", dl
+          ? ("이 컴퓨터에서 고친 파일이 있어 건너뜁니다 (" + esc(clipLine(dl, 34)) + ")")
+          : "이 컴퓨터에서 고친 파일이 있어 건너뜁니다", step2);
       } else if (st === "detached") {
         finishStep(0, "skip", "특정 버전에 고정돼 있어 건너뜁니다", step2);
-      } else if (st === "noremote") {
-        finishStep(0, "skip", "받아올 곳을 찾지 못해 건너뜁니다", step2);
       } else if (st === "fresh") {
         finishStep(0, "skip", "이미 최신입니다 (" + mono(shortOld) + ") — 받지 않았습니다", step2);
       } else if (st === "same") {
-        finishStep(0, "skip", "이미 최신입니다 (" + mono(shortOld) + ")", step2);
+        finishStep(0, "skip", blind
+          ? ("받아 봤지만 새 것이 없습니다 (" + mono(shortOld) + ")")
+          : ("이미 최신입니다 (" + mono(shortOld) + ")"), step2);
       } else if (st === "pullfail") {
-        finishStep(0, "fail", "받기에 실패했습니다. 인터넷 연결을 확인하세요", step2);
+        finishStep(0, "fail",
+          "받기에 실패했습니다 — 인터넷 연결이나 저장소 접근 권한을 확인하세요", step2);
       } else if (st === "updated" || st === "updated_pip") {
         S.tally.prog = 1;
         S.tally.progCommits = lines.length;

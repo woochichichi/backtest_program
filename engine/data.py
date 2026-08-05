@@ -25,7 +25,9 @@ import pandas as pd
 from .errors import DataUnavailable
 
 __all__ = ["MarcapStore", "MARCAP_COLUMNS", "NUMERIC_COLUMNS",
-           "halted_mask", "HALTED_COLUMN", "PRICE_LIMIT_PCT", "code_variants"]
+           "halted_mask", "HALTED_COLUMN", "PRICE_LIMIT_PCT", "code_variants",
+           "adjustment_factors", "apply_price_adjustment", "ADJUST_STOCKS_RATIO",
+           "ADJUST_LIMITATIONS"]
 
 
 #: marcap parquet 의 컬럼 (``ChagesRatio`` 오타는 원본 그대로 유지한다)
@@ -56,6 +58,17 @@ HALTED_COLUMN = "halted"
 
 #: KRX 일간 가격제한폭(%). 이걸 넘는 변동은 정지해제 갭이거나 권리락/액면분할이다.
 PRICE_LIMIT_PCT = 30.0
+
+#: 수정주가 이벤트 판정 임계값. ``Stocks`` 가 이 배수 이상 늘거나 그 역수 이하로 줄면 이벤트로 본다.
+ADJUST_STOCKS_RATIO = 1.5
+
+#: 수정주가로 잡히지 않는 것들 — 결과 페이로드에 그대로 실어 사용자에게 알린다
+ADJUST_LIMITATIONS = [
+    "액면분할·무상증자·액면병합은 상장주식수 변화로 정확히 반영됩니다.",
+    "유상증자는 반영되지 않습니다. 주식수 증가율과 가격 조정 비율이 다르기 때문입니다.",
+    "배당락은 반영되지 않습니다. 상장주식수가 변하지 않습니다.",
+    "합병·분할 등 주식수와 가격이 함께 바뀌는 사건은 근사치입니다.",
+]
 
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
@@ -97,6 +110,75 @@ def halted_mask(df: pd.DataFrame):
     c = pd.to_numeric(df["Close"], errors="coerce").to_numpy("float64")
     bad = ~(np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c))
     return bad | (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
+
+
+def adjustment_factors(df: pd.DataFrame, threshold: float = ADJUST_STOCKS_RATIO):
+    """상장주식수(``Stocks``) 변화로 수정주가 계수를 계산한다.
+
+    marcap 은 **KRX 원본 시세**라 액면분할·무상증자가 반영돼 있지 않다.
+    삼성전자 2018-05-04 50:1 분할이면 2,650,000원이 51,900원이 되는데,
+    조정하지 않으면 백테스트가 이걸 **하루 -98% 폭락**으로 계산한다.
+
+    ``배율 = Stocks(당일) / Stocks(전일)`` 이 임계값을 넘으면 이벤트로 보고,
+    그 이전 모든 봉에 ``1/배율`` 을 **소급** 적용한다.
+
+    Returns
+    -------
+    (factor, stats) : (np.ndarray | None, dict)
+        ``factor`` 는 각 행의 과거 가격에 곱할 계수 (마지막 시점 기준 = 1.0).
+    """
+    if "Stocks" not in df.columns or "Code" not in df.columns or len(df) == 0:
+        return None, {"events": 0, "symbols": 0}
+    stocks = pd.to_numeric(df["Stocks"], errors="coerce").astype("float64")
+    code = df["Code"]
+    prev = stocks.groupby(code, sort=False, observed=True).shift(1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = stocks / prev
+    lo = 1.0 / float(threshold)
+    ev = (
+        prev.notna() & (prev > 0) & stocks.notna() & (stocks > 0)
+        & np.isfinite(ratio)
+        & ((ratio >= float(threshold)) | (ratio <= lo))
+    )
+    n_ev = int(ev.sum())
+    if n_ev == 0:
+        return None, {"events": 0, "symbols": 0}
+
+    r = ratio.where(ev, 1.0)
+    grp = r.groupby(code, sort=False, observed=True)
+    cum = grp.cumprod()
+    last = cum.groupby(code, sort=False, observed=True).transform("last")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        factor = np.array((cum / last).to_numpy("float64"), dtype="float64", copy=True)
+    factor[~np.isfinite(factor)] = 1.0
+    return factor, {"events": n_ev, "symbols": int(code[ev].nunique())}
+
+
+def apply_price_adjustment(df: pd.DataFrame,
+                           threshold: float = ADJUST_STOCKS_RATIO) -> dict:
+    """``df`` 의 OHLC 를 제자리에서 수정주가로 바꾼다.
+
+    * OHLC × 계수 (과거를 현재 기준으로 끌어내린다)
+    * Volume ÷ 계수 (거래대금이 보존된다)
+    * Amount·Marcap·Stocks 는 **건드리지 않는다** (이미 금액/원본 수치다)
+    * 거래정지 봉의 0 은 0 × 계수 = 0 이라 그대로 남는다
+    """
+    factor, stats = adjustment_factors(df, threshold)
+    stats = {"events": 0, "symbols": 0, **stats}
+    if factor is None:
+        stats["applied"] = False
+        return stats
+    for c in ("Open", "High", "Low", "Close"):
+        if c in df.columns:
+            dt_ = df[c].dtype
+            df[c] = (df[c].to_numpy("float64") * factor).astype(dt_, copy=False)
+    if "Volume" in df.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = df["Volume"].to_numpy("float64") / factor
+        v[~np.isfinite(v)] = 0.0
+        df["Volume"] = v
+    stats["applied"] = True
+    return stats
 
 
 def _is_zero_padded(pf) -> bool:
@@ -188,7 +270,15 @@ class MarcapStore:
         root: str | os.PathLike = "marcap",
         cache_dir: str | os.PathLike = "cache",
         status_file: str | os.PathLike | None = None,
+        adjusted: bool = True,
+        adjust_threshold: float = ADJUST_STOCKS_RATIO,
     ):
+        #: 수정주가 적용 여부. marcap 은 KRX 원본이라 액면분할이 반영돼 있지 않다.
+        #: 조정하지 않으면 삼성전자 2018-05-04 분할이 하루 -98% 폭락으로 계산된다.
+        self.adjusted = bool(adjusted)
+        self.adjust_threshold = float(adjust_threshold)
+        #: 마지막 조회에서 적용된 수정주가 통계 (백테스트가 assumptions 에 실어 보낸다)
+        self.last_adjustment: Dict[str, object] = {"applied": False, "events": 0, "symbols": 0}
         self.root = Path(root)
         self.data_dir = self.root / "data"
         self.cache_dir = Path(cache_dir)
@@ -489,6 +579,7 @@ class MarcapStore:
         columns: Sequence[str] | None = None,
         use_cache: bool = True,
         on_year: Optional[Callable[[float, int, int], None]] = None,
+        adjusted: Optional[bool] = None,
     ) -> pd.DataFrame:
         """전 종목 구간 데이터. MultiIndex 없이 ``Date`` / ``Code`` 컬럼을 갖는다.
 
@@ -503,7 +594,9 @@ class MarcapStore:
         if e < s:
             raise DataUnavailable(f"구간이 뒤집혔습니다: {s} ~ {e}")
 
-        cache_path = self.cache_dir / f"panel-{s.isoformat()}-{e.isoformat()}.feather"
+        adj = self.adjusted if adjusted is None else bool(adjusted)
+        tag = "adj" if adj else "raw"
+        cache_path = self.cache_dir / f"panel-{s.isoformat()}-{e.isoformat()}-{tag}.feather"
         if use_cache and columns is None and cache_path.is_file():
             try:
                 df = pd.read_feather(cache_path)
@@ -514,7 +607,10 @@ class MarcapStore:
 
         cols = None
         if columns is not None:
-            cols = list(dict.fromkeys(["Date", "Code", *columns]))
+            wanted = list(columns)
+            if adj:
+                wanted.append("Stocks")      # 수정주가 계수 계산에 필요하다
+            cols = list(dict.fromkeys(["Date", "Code", *wanted]))
 
         frames = []
         years = self._range_years(s, e)
@@ -556,6 +652,11 @@ class MarcapStore:
             frames.clear()
         beat(0.3)
 
+        self.last_adjustment = {"applied": False, "events": 0, "symbols": 0}
+        if adj:
+            self.last_adjustment = apply_price_adjustment(out, self.adjust_threshold)
+            beat(0.35)
+
         if use_cache and columns is None and len(out) <= self.CACHE_MAX_ROWS:
             try:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -567,7 +668,8 @@ class MarcapStore:
 
     def bars(self, code: str, start=None, end=None,
              columns: Sequence[str] | str | None = None,
-             use_cache: bool = True) -> pd.DataFrame:
+             use_cache: bool = True,
+             adjusted: Optional[bool] = None) -> pd.DataFrame:
         """한 종목의 일봉. index=Date, 컬럼은 marcap 원본 표기(Open/High/.../Amount/Name).
 
         연도 파일을 통째로 읽지 않고 **parquet 푸시다운으로 그 종목만** 읽는다.
@@ -585,17 +687,25 @@ class MarcapStore:
         if e < s:
             raise DataUnavailable(f"구간이 뒤집혔습니다: {s} ~ {e}")
 
+        adj = self.adjusted if adjusted is None else bool(adjusted)
         cols = None if columns == "all" else list(columns or BARS_DEFAULT_COLUMNS)
+        if cols is not None and adj and "Stocks" not in cols:
+            cols = cols + ["Stocks"]
         years = self._range_years(s, e)
-        whole = start is None and end is None
+        if adj:
+            # 수정주가는 **최신 시점 기준**이라 요청 구간 뒤의 분할도 알아야 한다.
+            # 그래야 같은 종목을 어떤 구간으로 물어도 같은 가격이 나온다.
+            years = [y for y in sorted(files) if y >= min(years or [s.year])]
 
         frame = None
         if use_cache:
-            frame = self._symbol_cache_get(code, cols, years)
+            frame = self._symbol_cache_get(code, cols, years, adj)
         if frame is None:
             frame = self._read_symbol(code, cols, years)
+            if frame is not None and len(frame) and adj:
+                self.last_adjustment = apply_price_adjustment(frame, self.adjust_threshold)
             if use_cache and frame is not None and len(frame):
-                self._symbol_cache_put(code, frame, cols, years)
+                self._symbol_cache_put(code, frame, cols, years, adj)
 
         if frame is None or not len(frame):
             raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
@@ -672,9 +782,11 @@ class MarcapStore:
     def symbol_cache_dir(self) -> Path:
         return self.cache_dir / SYMBOL_CACHE_DIRNAME
 
-    def _symbol_cache_paths(self, code: str) -> tuple:
+    def _symbol_cache_paths(self, code: str, adjusted: bool = True) -> tuple:
+        """조정/미조정 캐시는 **절대 섞이면 안 된다.** 파일명으로 분리한다."""
         d = self.symbol_cache_dir
-        return d / f"{code}.parquet", d / f"{code}.meta.json"
+        tag = "" if adjusted else ".raw"
+        return d / f"{code}{tag}.parquet", d / f"{code}{tag}.meta.json"
 
     def _source_fingerprint(self) -> Dict[str, int]:
         """연도 파일들의 mtime. 데이터가 갱신되면 값이 바뀐다."""
@@ -687,13 +799,14 @@ class MarcapStore:
         return out
 
     def _symbol_cache_get(self, code: str, cols: Sequence[str] | None,
-                          want_years: Sequence[int]) -> Optional[pd.DataFrame]:
+                          want_years: Sequence[int],
+                          adjusted: bool = True) -> Optional[pd.DataFrame]:
         """유효한 종목 캐시를 돌려준다.
 
         * 요청 연도가 캐시가 담고 있는 연도에 **없으면 그 연도만** 읽어 이어붙인다(점진 로딩)
         * 원본 파일이 갱신된 연도는 그 연도만 다시 읽는다(증분 갱신)
         """
-        pq_path, meta_path = self._symbol_cache_paths(code)
+        pq_path, meta_path = self._symbol_cache_paths(code, adjusted)
         if not (pq_path.is_file() and meta_path.is_file()):
             return None
         try:
@@ -731,18 +844,22 @@ class MarcapStore:
         # 바뀐 연도의 행은 버리고, 부족한/바뀐 연도만 읽어 이어붙인다
         keep = df[~df["Date"].dt.year.isin(refresh)]
         known = {int(k) for k in cur}
+        # 조정된 캐시에 **원본**을 이어붙이면 가격 기준이 어긋난다 → 통째로 다시 만든다
+        if adjusted:
+            return None
         fresh = self._read_symbol(code, cols, [y for y in refresh if y in known])
         parts = [x for x in (keep, fresh) if x is not None and len(x)]
         if not parts:
             return None
         merged = self._normalize(pd.concat(parts, ignore_index=True))
-        self._symbol_cache_put(code, merged, cols, sorted(covered | set(refresh)))
+        self._symbol_cache_put(code, merged, cols, sorted(covered | set(refresh)), adjusted)
         return merged
 
     def _symbol_cache_put(self, code: str, df: pd.DataFrame,
                           cols: Sequence[str] | None,
-                          years: Sequence[int] = ()) -> None:
-        pq_path, meta_path = self._symbol_cache_paths(code)
+                          years: Sequence[int] = (),
+                          adjusted: bool = True) -> None:
+        pq_path, meta_path = self._symbol_cache_paths(code, adjusted)
         try:
             self.symbol_cache_dir.mkdir(parents=True, exist_ok=True)
             df.reset_index(drop=True).to_parquet(pq_path, index=False)
@@ -752,6 +869,7 @@ class MarcapStore:
                         "code": code,
                         "columns": list(cols) if cols is not None else None,
                         "years": sorted(int(y) for y in years),
+                        "adjusted": bool(adjusted),
                         "rows": int(len(df)),
                         "first": str(df["Date"].min().date()) if len(df) else None,
                         "last": str(df["Date"].max().date()) if len(df) else None,
