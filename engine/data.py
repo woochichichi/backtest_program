@@ -40,6 +40,22 @@ NUMERIC_COLUMNS = [
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
 
+def _concat_columnwise(frames: List[pd.DataFrame], beat) -> pd.DataFrame:
+    """여러 해치 프레임을 **컬럼 단위로** 이어붙인다.
+
+    ``pd.concat(frames)`` 은 700만 행에서 수 초가 걸리는 단일 연산이라 그 사이 취소를 받을 수 없다.
+    컬럼마다 나눠 붙이면 각 단계가 수백 ms 라 진행률·취소가 계속 살아 있다.
+    """
+    cols = list(frames[0].columns)
+    n = len(cols)
+    data = {}
+    for i, c in enumerate(cols):
+        parts = [f[c] for f in frames if c in f.columns]
+        data[c] = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0].reset_index(drop=True)
+        beat(0.05 + 0.2 * (i + 1) / max(n, 1))
+    return pd.DataFrame(data, columns=cols)
+
+
 def _to_date(v) -> dt.date:
     if isinstance(v, dt.datetime):
         return v.date()
@@ -388,14 +404,8 @@ class MarcapStore:
         if len(frames) == 1:
             out = frames[0].reset_index(drop=True)
         else:
-            # 한 번에 concat 하면 수 초가 걸리고 그 사이 취소를 못 받는다. 묶어서 이어붙인다.
-            step = max(1, len(frames) // 4)
-            partial = []
-            for i in range(0, len(frames), step):
-                partial.append(pd.concat(frames[i:i + step], ignore_index=True))
-                beat(0.1)
-            out = pd.concat(partial, ignore_index=True) if len(partial) > 1 else partial[0]
-        beat(0.2)
+            out = _concat_columnwise(frames, beat)
+        beat(0.3)
 
         if use_cache and columns is None and len(out) <= self.CACHE_MAX_ROWS:
             try:
