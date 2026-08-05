@@ -519,7 +519,9 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
         take = g.iloc[idx]
         rows.append(take.loc[take["Date"] >= pd.Timestamp(start)])
     if not rows:
-        return sub.iloc[0:0]
+        keep = [c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close")
+                if c in panel.columns]
+        return panel.iloc[0:0][keep]
     out = pd.concat(rows, ignore_index=True)
     keep = [c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in out.columns]
     return out[keep]

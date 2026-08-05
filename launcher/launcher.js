@@ -13,9 +13,12 @@
 /* eslint-disable no-var */
 (function () {
 
-var PORT = 8000;
-var BASE_URL = "http://127.0.0.1:" + PORT + "/";
-var STATUS_URL = BASE_URL + "api/status";
+var DEF_PORT = 8000;
+var PORT_TRIES = 10;       /* 포트가 막혔을 때 위로 몇 개까지 찾아볼지 */
+
+/* 포트는 launcher_config.json 으로 바뀔 수 있어 상수로 두지 않는다 */
+function baseUrl() { return "http://127.0.0.1:" + S.port + "/"; }
+function statusUrl() { return baseUrl() + "api/status"; }
 
 var STEP_MIN = 320;        /* 단계 하나가 화면에 머무는 최소 시간 */
 var DONE_HOLD = 1400;      /* 완료 화면을 보여 주는 최소 시간 */
@@ -23,6 +26,10 @@ var CLOSE_MIN = 18 * 60 + 30;  /* 국내 시세가 올라오는 시각 (18:30) *
 
 var S = {
   root: "",
+  port: 8000,
+  cfg: null,
+  portInfo: null,
+  logMark: 0,
   force: false,
   cancelled: false,
   finished: false,
@@ -190,6 +197,13 @@ function makeRealSys() {
 
     open: function (url) { try { sh.Run(url, 1, false); } catch (e) {} },
 
+    /* localhost 프로브. 두 가지 함정이 있어 둘 다 막는다.
+       (1) ServerXMLHTTP 는 WinHTTP 프록시 설정을 따른다. 회사 PC 처럼 프록시가
+           잡혀 있으면 127.0.0.1 요청까지 프록시로 나가려다 실패해서, 서버가
+           멀쩡히 떠 있어도 "없다"로 오판한다.
+           -> setProxy(1) = SXH_PROXY_SET_DIRECT 로 프록시를 우회한다.
+       (2) 서버가 긴 백테스트를 도는 중이면 응답이 늦다. 짧은 타임아웃으로
+           끊으면 역시 "없다"로 오판한다. -> 6초까지 기다린다. */
     ping: function (cb) {
       var http = null, fired = false, wd = null;
       function fin(ok, body) {
@@ -201,9 +215,12 @@ function makeRealSys() {
       }
       try { http = new ActiveXObject("MSXML2.ServerXMLHTTP.6.0"); }
       catch (e2) { fin(false, ""); return; }
+      /* 구버전엔 setProxy 가 없을 수 있어 감싼다. open 전후로 한 번씩 건다. */
+      try { http.setProxy(1); } catch (ep1) {}
       try {
-        http.setTimeouts(1000, 1000, 1500, 1500);
-        http.open("GET", STATUS_URL, true);
+        http.setTimeouts(2000, 2000, 5000, 5000);
+        http.open("GET", statusUrl(), true);
+        try { http.setProxy(1); } catch (ep2) {}
         http.onreadystatechange = function () {
           var st = 0, tx = "";
           try { if (http.readyState != 4) { return; } } catch (e3) { fin(false, ""); return; }
@@ -214,7 +231,7 @@ function makeRealSys() {
         wd = setTimeout(function () {
           try { http.abort(); } catch (e5) {}
           fin(false, "");
-        }, 2500);
+        }, 6000);
       } catch (e6) { fin(false, ""); }
     },
 
@@ -358,8 +375,9 @@ function clipLine(s, n) {
 }
 
 /* 로그 파일의 마지막 세 줄을 흘려 보낸다 */
-function tailLog(path) {
-  var t = SYS.read(path);
+function tailLog(path) { tailLogText(SYS.read(path)); }
+
+function tailLogText(t) {
   if (!t) { return; }
   var lines = String(t).replace(/\r/g, "").split("\n");
   var keep = [], i, L;
@@ -421,6 +439,36 @@ function buildPaths(root) {
   P.s2bat = P.work + "\\s2.bat";
   P.s2log = P.work + "\\s2.log";
   P.s3bat = P.work + "\\s3.bat";
+  P.pbBat = P.work + "\\probe.bat";
+  P.pbLog = P.work + "\\probe.log";
+  P.cfgFile = root + "\\launcher_config.json";
+}
+
+/* ---------- 설정 파일 (없으면 기본값) ---------- */
+function defaultCfg() { return { port: DEF_PORT, prog: true, quote: true }; }
+
+function loadConfig() {
+  var c = defaultCfg();
+  var t = SYS.read(P.cfgFile);
+  if (t) {
+    var m = /"port"\s*:\s*(\d+)/.exec(String(t));
+    if (m) {
+      var v = parseInt(m[1], 10);
+      if (v >= 1024 && v <= 65535) { c.port = v; }
+    }
+    if (/"auto_update_program"\s*:\s*false/.test(String(t))) { c.prog = false; }
+    if (/"auto_update_quote"\s*:\s*false/.test(String(t))) { c.quote = false; }
+  }
+  return c;
+}
+
+function saveConfig() {
+  var t = "{\r\n" +
+    "  \"port\": " + S.cfg.port + ",\r\n" +
+    "  \"auto_update_program\": " + (S.cfg.prog ? "true" : "false") + ",\r\n" +
+    "  \"auto_update_quote\": " + (S.cfg.quote ? "true" : "false") + "\r\n" +
+    "}\r\n";
+  SYS.write(P.cfgFile, t, true);
 }
 
 /* ============================================================
@@ -832,14 +880,118 @@ function runQuoteSync(firstTime) {
 }
 
 /* ============================================================
-   8. 3단계 - 서버 시작
+   8. 포트 조사
+   "HTTP 응답이 없다 = 서버가 없다" 가 아니다. 프록시 때문에 프로브가 막힐 수도,
+   서버가 백테스트로 바쁠 수도 있다. 포트를 누가 잡고 있는지 반드시 따로 본다.
+   ============================================================ */
+
+function probeBat() {
+  var W = P.work;
+  return [
+    "@echo off",
+    "setlocal enabledelayedexpansion",
+    "set \"OUT=" + W + "\"",
+    "set \"PORT=" + S.port + "\"",
+    "set \"PID=\"",
+    "set \"PNAME=\"",
+    "set \"PPATH=\"",
+    "set \"FREE=\"",
+    "set \"CAND=" + S.port + "\"",
+    "rem ---- 설정된 포트를 누가 잡고 있는지 ----",
+    "for /f \"tokens=2,5\" %%a in ('netstat -ano -p TCP 2^>nul ^| findstr \":!PORT!\"') do (",
+    "    if \"%%a\"==\"127.0.0.1:!PORT!\" set \"PID=%%b\"",
+    "    if \"%%a\"==\"0.0.0.0:!PORT!\" set \"PID=%%b\"",
+    "    if \"%%a\"==\"[::1]:!PORT!\" set \"PID=%%b\"",
+    "    if \"%%a\"==\"[::]:!PORT!\" set \"PID=%%b\"",
+    ")",
+    "if not defined PID goto :fin",
+    "for /f \"tokens=1 delims=,\" %%c in ('tasklist /FI \"PID eq !PID!\" /FO CSV /NH 2^>nul') do set \"PNAME=%%~c\"",
+    "rem ---- 실행 파일 경로까지 봐야 우리 .venv 파이썬인지 알 수 있다 ----",
+    "for /f \"delims=\" %%d in ('powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { (Get-Process -Id !PID! -ErrorAction Stop).Path } catch { '' }\" 2^>nul') do set \"PPATH=%%d\"",
+    "rem ---- 비어 있는 포트도 하나 찾아 둔다 ----",
+    "for /l %%i in (1,1," + PORT_TRIES + ") do (",
+    "    if not defined FREE (",
+    "        set /a \"CAND=CAND+1\"",
+    "        call :chk",
+    "    )",
+    ")",
+    ":fin",
+    "> \"!OUT!\\pb_pid.txt\" echo.!PID!",
+    "> \"!OUT!\\pb_name.txt\" echo.!PNAME!",
+    "> \"!OUT!\\pb_path.txt\" echo.!PPATH!",
+    "> \"!OUT!\\pb_free.txt\" echo.!FREE!",
+    "> \"!OUT!\\pb.done\" echo done",
+    "endlocal",
+    "goto :eof",
+    "",
+    ":chk",
+    "set \"BUSY=\"",
+    "for /f \"tokens=2\" %%a in ('netstat -ano -p TCP 2^>nul ^| findstr \":!CAND!\"') do (",
+    "    if \"%%a\"==\"127.0.0.1:!CAND!\" set \"BUSY=1\"",
+    "    if \"%%a\"==\"0.0.0.0:!CAND!\" set \"BUSY=1\"",
+    "    if \"%%a\"==\"[::1]:!CAND!\" set \"BUSY=1\"",
+    "    if \"%%a\"==\"[::]:!CAND!\" set \"BUSY=1\"",
+    ")",
+    "if not defined BUSY set \"FREE=!CAND!\"",
+    "goto :eof"
+  ];
+}
+
+function probePort(cb) {
+  runBat(P.pbBat, probeBat(), P.work + "\\pb.done", P.pbLog, 40000, null, function (how) {
+    var info = { busy: false, pid: 0, name: "", path: "", free: 0, mine: false };
+    if (how === "ok") {
+      var pid = parseInt(readOne("pb_pid.txt"), 10);
+      if (!isNaN(pid) && pid > 0) { info.busy = true; info.pid = pid; }
+      var nm = readOne("pb_name.txt");
+      if (/\.exe$/i.test(nm)) { info.name = nm; }
+      info.path = readOne("pb_path.txt");
+      var fp = parseInt(readOne("pb_free.txt"), 10);
+      if (!isNaN(fp) && fp > 0) { info.free = fp; }
+      if (info.busy) {
+        /* 우리 서버인지는 실행 파일 경로로 판단한다.
+           .server.pid 에 적힌 것은 감싼 cmd.exe 라 포트를 잡은 python 과 PID 가 다르다. */
+        if (info.path && String(info.path).toLowerCase() === String(P.venvPy).toLowerCase()) {
+          info.mine = true;
+        }
+        var saved = parseInt(trim(SYS.read(P.pidFile)), 10);
+        if (!isNaN(saved) && saved === info.pid) { info.mine = true; }
+      }
+    }
+    S.portInfo = info;
+    cb(info);
+  });
+}
+
+/* 한 번 실패했다고 단정하지 않는다. 1초 뒤 한 번 더 두드린다. */
+function pingRobust(cb) {
+  SYS.ping(function (ok, body) {
+    if (ok) { cb(true, body); return; }
+    later(function () {
+      SYS.ping(function (ok2, body2) { cb(ok2, body2); });
+    }, 1000);
+  });
+}
+
+/* 우리가 띄웠던 서버가 죽은 채 PID 만 남아 있으면 치운다.
+   반드시 이 폴더의 .venv 파이썬인지 확인한 뒤에만 죽인다. */
+function cleanupZombie() {
+  var t = SYS.read(P.pidFile);
+  var pid = parseInt(trim(t), 10);
+  if (!isNaN(pid) && pid > 0) { SYS.kill(pid); }
+  SYS.del(P.pidFile);
+  SYS.killVenvPython(P.venvPy);
+}
+
+/* ============================================================
+   9. 3단계 - 서버 시작
    ============================================================ */
 
 function s3Bat() {
   return [
     "@echo off",
     "cd /d \"" + P.root + "\"",
-    "\"" + P.venvPy + "\" -m uvicorn server.app:app --host 127.0.0.1 --port " + PORT +
+    "\"" + P.venvPy + "\" -m uvicorn server.app:app --host 127.0.0.1 --port " + S.port +
       " >> \"" + P.serverLog + "\" 2>&1"
   ];
 }
@@ -849,26 +1001,46 @@ function step3() {
   setHead("백테스트 엔진을 켜고 있습니다");
   setProg(56);
 
-  SYS.ping(function (ok, body) {
+  pingRobust(function (ok, body) {
     if (S.cancelled) { return; }
     if (ok) {
       S.apiLatestTradeDate = pickTradeDate(body) || S.apiLatestTradeDate;
-      finishStep(2, "skip", "이미 켜져 있습니다", step4);
+      finishStep(2, "skip", "이미 켜져 있습니다 (" + S.port + "번 포트)", step4);
       return;
     }
-    if (!SYS.exists(P.venvPy)) {
-      setStep(2, "fail", "설치가 아직 안 됐습니다");
-      halt("install.bat 을 먼저 실행해 주세요");
-      return;
-    }
-    startServer();
+    /* 응답이 없다고 서버가 없다고 단정하지 않는다 */
+    setSub(2, S.port + "번 포트를 누가 쓰고 있는지 확인합니다");
+    probePort(function (info) {
+      if (S.cancelled) { return; }
+      if (!info.busy) { launchOurServer(true); return; }
+      if (info.mine) {
+        finishStep(2, "skip",
+          "이미 실행 중인 서버를 그대로 씁니다 (PID " + info.pid + ")", step4);
+        return;
+      }
+      showPortConflict(info, "");
+    });
   });
 }
 
+function launchOurServer(cleanFirst) {
+  if (!SYS.exists(P.venvPy)) {
+    setStep(2, "fail", "설치가 아직 안 됐습니다");
+    halt("install.bat 을 먼저 실행해 주세요");
+    return;
+  }
+  if (cleanFirst) { cleanupZombie(); }
+  startServer();
+}
+
 function startServer() {
-  setSub(2, "서버를 켜는 중입니다");
+  setSub(2, S.port + "번 포트로 서버를 켜는 중입니다");
   SYS.mkdir(P.logs);
   SYS.mkdir(P.work);
+
+  /* 로그는 이어붙기라 지난 실행의 오류가 남아 있다. 지금부터 늘어난 부분만 본다. */
+  var pre = SYS.read(P.serverLog);
+  S.logMark = pre ? String(pre).length : 0;
 
   if (!SYS.write(P.s3bat, s3Bat().join("\r\n") + "\r\n", true)) {
     setStep(2, "fail", "임시 파일을 만들 수 없습니다");
@@ -886,7 +1058,18 @@ function startServer() {
   function wait() {
     if (S.cancelled) { return; }
     var el2 = (new Date()).getTime() - t0;
-    tailLog(P.serverLog);
+    var full = SYS.read(P.serverLog);
+    var fresh = full ? String(full).substring(S.logMark) : "";
+    tailLogText(fresh);
+
+    /* 10048 = 포트 중복 바인딩. 60초를 다 기다릴 필요 없이 바로 원인을 짚어 준다. */
+    if (fresh.indexOf("10048") >= 0) {
+      setStep(2, "fail", S.port + "번 포트가 이미 쓰이고 있습니다");
+      setSub(2, "누가 쓰고 있는지 확인합니다");
+      probePort(function (info) { showPortConflict(info, "10048"); });
+      return;
+    }
+
     setProg(56 + Math.round(18 * (el2 / LIMIT)));
     setSub(2, "서버가 켜지기를 기다립니다 (" + Math.round(el2 / 1000) + "초)");
 
@@ -895,12 +1078,21 @@ function startServer() {
       if (ok) {
         S.tally.server = true;
         S.apiLatestTradeDate = pickTradeDate(body) || S.apiLatestTradeDate;
-        finishStep(2, "done", "서버를 켰습니다", step4);
+        finishStep(2, "done", "서버를 켰습니다 (" + S.port + "번 포트)", step4);
         return;
       }
       if ((new Date()).getTime() - t0 > LIMIT) {
-        setStep(2, "fail", "서버가 켜지지 않았습니다");
-        halt("logs\\server.log 에 이유가 적혀 있습니다");
+        /* 시간이 다 됐어도 포트부터 다시 본다 */
+        probePort(function (info) {
+          if (info.busy && info.mine) {
+            finishStep(2, "skip", "서버가 떠 있는 것으로 보입니다 (PID " + info.pid + ")", step4);
+          } else if (info.busy) {
+            showPortConflict(info, "10048");
+          } else {
+            setStep(2, "fail", "서버가 켜지지 않았습니다");
+            halt("logs\\server.log 에 이유가 적혀 있습니다");
+          }
+        });
         return;
       }
       later(wait, 700);
@@ -909,8 +1101,40 @@ function startServer() {
   later(wait, 600);
 }
 
+/* 포트가 겹쳤을 때 무엇을 할지 사용자가 고르게 한다 */
+function showPortConflict(info, why) {
+  clearTimers();
+  S.portInfo = info;
+  setState(2, "fail");
+  setSub(2, why === "10048"
+    ? (S.port + "번 포트가 이미 쓰여 서버를 켜지 못했습니다")
+    : (S.port + "번 포트를 다른 프로그램이 쓰고 있습니다"));
+  setHead("포트가 겹칩니다");
+  setNote("어떻게 할지 골라 주세요");
+
+  var who = info.name ? ("<b>" + esc(info.name) + "</b>") : "<b>알 수 없는 프로그램</b>";
+  var body = S.port + "번 포트를 이미 " + who;
+  if (info.pid) { body += " <b>(PID " + info.pid + ")</b>"; }
+  body += " 가 쓰고 있습니다.";
+  if (info.path) { body += "<br><span class=\"pth\">" + esc(clipLine(info.path, 56)) + "</span>"; }
+  if (why === "10048") { body += "<br>그래서 서버가 켜지지 못했습니다 (오류 10048)."; }
+  body += "<br>KRX 백테스터의 이전 서버일 수도 있습니다.";
+  body += info.free
+    ? ("<br>비어 있는 포트: <b>" + info.free + "</b>")
+    : "<br>주변에 비어 있는 포트를 찾지 못했습니다.";
+
+  var m = el("portMsg");
+  if (m) { m.innerHTML = body; }
+  var ob = el("portOther");
+  if (ob) {
+    ob.disabled = info.free ? false : true;
+    ob.innerHTML = info.free ? (info.free + "번 포트로 켜기") : "다른 포트로 켜기";
+  }
+  showOv("ovPort");
+}
+
 /* ============================================================
-   9. 4단계 - 브라우저
+   10. 4단계 - 브라우저
    ============================================================ */
 
 function step4() {
@@ -925,7 +1149,7 @@ function step4() {
 }
 
 /* ============================================================
-   10. 마무리 / 중단
+   11. 마무리 / 중단
    ============================================================ */
 
 function finishStep(i, state, sub, next) {
@@ -1002,7 +1226,7 @@ function stopServer() {
 }
 
 /* ============================================================
-   11. 이미 켜져 있을 때의 선택 화면
+   12. 이미 켜져 있을 때의 선택 화면
    ============================================================ */
 
 function showToggle(body) {
@@ -1025,7 +1249,7 @@ function showToggle(body) {
 }
 
 /* ============================================================
-   12. 시작
+   13. 시작
    ============================================================ */
 
 function resetSteps() {
