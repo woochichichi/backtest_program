@@ -474,7 +474,7 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
     total = len(codes)
     rows = []
     for j, (code, g) in enumerate(sub.groupby("Code", sort=False)):
-        if (j & 15) == 0:
+        if (j & 7) == 0:
             rep.tick(18 + 7.0 * j / max(total, 1),
                      f"기준일 조건 확인 중 ({j:,}/{total:,} 종목)", PHASE_SCAN)
         df = g.set_index("Date")[cols]
@@ -498,10 +498,18 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
     return out[keep]
 
 
-def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date) -> pd.DataFrame:
+def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
+                      rep=None) -> pd.DataFrame:
     """기준일 후보 (Code, Date) 를 벡터 연산으로 뽑는다."""
     rd = dict(universe.get("reference_day") or {})
     rule = str(rd.get("rule") or "amount_spike")
+
+    def beat(msg: str) -> None:
+        if rep is not None:
+            rep.check(force=True)
+            rep.emit(19, msg, PHASE_SCAN, force=True)
+
+    beat("기준일 조건 계산 중 (종목별 그룹핑)")
     g = panel.groupby("Code", sort=False)
 
     if rule == "none":
@@ -511,6 +519,7 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date) ->
         mask = panel["Amount"] >= spike
         prev_max = rd.get("prev_day_amount_max_eok")
         if prev_max is not None:
+            beat("기준일 조건 계산 중 (직전일 거래대금)")
             prev = g["Amount"].shift(1)
             mask &= prev.notna() & (prev <= float(prev_max) * EOK)
     elif rule == "volume_spike":
@@ -525,9 +534,12 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date) ->
     else:  # pragma: no cover - validate 에서 차단됨
         mask = pd.Series(False, index=panel.index)
 
+    beat("기준일 조건 계산 중 (구간 필터)")
     mask &= panel["Date"] >= pd.Timestamp(start)
     cols = [c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in panel.columns]
-    return panel.loc[mask, cols]
+    out = panel.loc[mask, cols]
+    beat(f"기준일 {len(out):,}건 확인")
+    return out
 
 
 # ======================================================================================
@@ -778,18 +790,27 @@ def run_backtest(
     rep.set_phase(PHASE_LOAD, 3)
     report(3, f"{hist_start.year}~{end.year}년 데이터 읽는 중", PHASE_LOAD)
 
-    def _on_year(idx: int, total: int, year: int) -> None:
+    def _on_year(idx: float, total: int, year: int) -> None:
+        # 연도 파일 하나가 몇 초씩 걸리므로 **파일 내부에서도** 호출된다.
         rep.check(force=True)
-        rep.emit(3 + 14.0 * idx / max(total, 1),
-                 f"{year}년 데이터 읽는 중 ({idx + 1}/{total}년)", PHASE_LOAD, force=True)
+        rep.emit(3 + 14.0 * float(idx) / max(total, 1),
+                 f"{year}년 데이터 읽는 중 ({min(int(idx) + 1, total)}/{total}년)",
+                 PHASE_LOAD)
 
     try:
         panel = store.panel(hist_start, end, on_year=_on_year)
     except TypeError:                       # 구버전 store (on_year 미지원)
         panel = store.panel(hist_start, end)
     rep.check(force=True)
-    report(18, "종목 목록 정리 중", PHASE_LOAD)
-    panel = panel.sort_values(["Code", "Date"], kind="stable").reset_index(drop=True)
+    report(17, "종목 목록 정리 중", PHASE_LOAD)
+    # 연도 파일은 (Date, Code) 순으로 저장돼 있고 연도 순으로 이어붙였으므로 이미 Date 오름차순이다.
+    # 700만 행 정렬은 몇 초가 걸리는데 중간에 취소 확인을 넣을 수 없어, 필요할 때만 한다.
+    # 종목 안에서 날짜 오름차순이기만 하면 groupby.shift / rolling 이 모두 정확하다.
+    if not panel["Date"].is_monotonic_increasing:
+        panel = panel.sort_values(["Date", "Code"], kind="stable")
+    panel = panel.reset_index(drop=True)
+    rep.check(force=True)
+    rep.emit(18, "종목 선정 조건 확인 중", PHASE_LOAD, force=True)
 
     calendar = [d.date() for d in pd.DatetimeIndex(sorted(panel["Date"].unique()))]
     calendar = [d for d in calendar if start <= d <= end]
@@ -819,8 +840,9 @@ def run_backtest(
     if str((universe.get("reference_day") or {}).get("rule") or "") == "custom":
         events = _custom_events(panel, universe, start, aliases, rep)
     else:
-        events = _reference_events(panel, universe, start)
+        events = _reference_events(panel, universe, start, rep)
     rep.check(force=True)
+    rep.emit(20, "기준일 정리 중", PHASE_SCAN, force=True)
     if events.empty:
         return _empty_result(
             run_id, t0, warnings, sig, calendar, initial_capital, start, end,
@@ -835,7 +857,7 @@ def run_backtest(
     recs: Dict[str, dict] = {}
     _n_cand = len(cand_codes)
     for _j, (code, gdf) in enumerate(sub.groupby("Code", sort=False)):
-        if (_j & 31) == 0:
+        if (_j & 7) == 0:
             rep.tick(20 + 5.0 * _j / max(_n_cand, 1),
                      f"후보 종목 준비 중 ({_j:,}/{_n_cand:,})", PHASE_SCAN)
         gdf = gdf.sort_values("Date", kind="stable")
@@ -855,7 +877,9 @@ def run_backtest(
         }
 
     events_by_day: Dict[dt.date, List[Tuple[str, dict]]] = {}
-    for row in events.itertuples(index=False):
+    for _k, row in enumerate(events.itertuples(index=False)):
+        if (_k & 1023) == 0:
+            rep.tick(25, f"기준일 정리 중 ({_k:,}/{len(events):,})", PHASE_SCAN)
         d = _d(row.Date)
         if d < start or d > end:
             continue
@@ -1085,7 +1109,9 @@ def run_backtest(
     # ---------------------------------------------------------------- 미청산 강제 청산
     report(92, "미청산 포지션 정리", PHASE_SIM)
     last_day = calendar[-1]
-    for code in sorted(active):
+    for _k, code in enumerate(sorted(active)):
+        if (_k & 15) == 0:
+            rep.tick(92, f"미청산 포지션 정리 중 ({_k:,}/{len(active):,})", PHASE_SIM)
         w = active[code]
         if w["qty"] <= 0:
             continue
@@ -1115,8 +1141,12 @@ def run_backtest(
     rep.check(force=True)
     report(96, "성과 계산 중", PHASE_METRICS)
     metrics = compute_metrics(calendar, eq_values, trades, initial_capital, start, end)
+    rep.check(force=True)
+    rep.emit(97, "자산 곡선 만드는 중", PHASE_METRICS, force=True)
     equity = build_equity(calendar, eq_values, initial_capital)
     monthly = monthly_returns(calendar, eq_values)
+    rep.check(force=True)
+    rep.emit(98, "종목별 집계 중", PHASE_METRICS, force=True)
 
     sig.add(
         last_day, "DONE", None,
