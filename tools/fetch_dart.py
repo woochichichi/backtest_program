@@ -1445,7 +1445,611 @@ def selftest(
 
 
 # ======================================================================================
-# 10. CLI
+# 10. 진단 리포트 (--report) — 네트워크를 쓰지 않는다
+# ======================================================================================
+
+REPORT_OK = 0
+REPORT_ISSUES = 1
+REPORT_NO_DATA = 2
+
+RULE = "=" * 74
+THIN = "-" * 74
+
+#: 대표 종목
+SAMPLE_CODES = [("005930", "삼성전자"), ("000660", "SK하이닉스")]
+
+#: 삼성전자의 상식 범위 (이 밖이면 파싱 오류를 의심한다)
+SAMSUNG_DEBT_RATIO_RANGE = (10.0, 60.0)
+SAMSUNG_CURRENT_RATIO_RANGE = (100.0, 500.0)
+
+#: 결측률이 이보다 높으면 계정명 매칭 실패를 의심한다
+MISSING_WARN_PCT = 30.0
+#: 유동자산/유동부채는 금융업에 원래 없어서 기준을 느슨하게 잡는다
+MISSING_WARN_PCT_CURRENT = 55.0
+#: 부채비율이 이 값을 넘으면 이상치로 센다
+DEBT_RATIO_ABSURD = 10_000.0
+
+
+def _w(s) -> int:
+    """콘솔 표시 폭. 한글은 2칸."""
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
+
+
+def _lj(s, n: int) -> str:
+    return f"{s}{' ' * max(0, n - _w(s))}"
+
+
+def _rj(s, n: int) -> str:
+    return f"{' ' * max(0, n - _w(s))}{s}"
+
+
+def _num(v, digits: int = 0) -> str:
+    """숫자를 사람이 읽는 문자열로. 없으면 ``-``."""
+    if v is None:
+        return "-"
+    try:
+        if pd.isna(v):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    return f"{float(v):,.{digits}f}"
+
+
+def _eok(v) -> str:
+    """원 단위 정수를 억원으로."""
+    n = _as_opt_int(v)
+    return "-" if n is None else f"{n / 100_000_000.0:,.0f}"
+
+
+def _stats(series: pd.Series) -> Optional[dict]:
+    """최소/25%/중앙/75%/최대."""
+    s = pd.to_numeric(series, errors="coerce").astype("float64").dropna()
+    if s.empty:
+        return None
+    return {
+        "n": int(len(s)),
+        "min": float(s.min()),
+        "p25": float(s.quantile(0.25)),
+        "median": float(s.median()),
+        "p75": float(s.quantile(0.75)),
+        "max": float(s.max()),
+    }
+
+
+class _Report:
+    """출력과 함께 이상 징후를 모은다."""
+
+    def __init__(self, out=None):
+        self._out = out or (lambda s: print(s, flush=True))
+        self.issues: List[str] = []
+        self.notes: List[str] = []
+
+    def p(self, s: str = "") -> None:
+        self._out(s)
+
+    def issue(self, msg: str) -> None:
+        """사람이 확인해야 하는 문제."""
+        self.issues.append(msg)
+        self.p(f"      [확인 필요] {msg}")
+
+    def note(self, msg: str) -> None:
+        """알아 두면 좋은 참고 사항."""
+        self.notes.append(msg)
+        self.p(f"      [참고] {msg}")
+
+
+# --- marcap 쪽 읽기 (engine 을 수정하지 않고 컬럼 하나만 읽는다) -----------------------
+
+
+def _marcap_files(marcap_root: str | os.PathLike) -> Dict[int, Path]:
+    root = Path(marcap_root)
+    out: Dict[int, Path] = {}
+    for d in (root / "data", root):
+        if not d.is_dir():
+            continue
+        for p in d.glob("marcap-*.parquet"):
+            m = re.search(r"marcap-(\d{4})\.parquet$", p.name, re.IGNORECASE)
+            if m:
+                out.setdefault(int(m.group(1)), p)
+        if out:
+            break
+    return out
+
+
+def _marcap_codes(marcap_root, years: Optional[Iterable[int]] = None) -> Dict[int, set]:
+    """연도별 등장 종목코드. ``Code`` 컬럼만 읽어 빠르게 센다."""
+    files = _marcap_files(marcap_root)
+    if years is not None:
+        want = set(int(y) for y in years)
+        files = {y: p for y, p in files.items() if y in want}
+    out: Dict[int, set] = {}
+    for y, p in sorted(files.items()):
+        try:
+            col = pd.read_parquet(p, columns=["Code"])["Code"]
+        except Exception:  # pragma: no cover - 손상 파일
+            continue
+        out[y] = set(col.astype(str).str.zfill(6).unique())
+    return out
+
+
+def _marcap_live_codes(marcap_root) -> set:
+    """가장 최근 연도 파일의 마지막 거래일에 존재하는 종목 = 현재 상장."""
+    files = _marcap_files(marcap_root)
+    if not files:
+        return set()
+    p = files[max(files)]
+    try:
+        df = pd.read_parquet(p, columns=["Date", "Code"])
+    except Exception:  # pragma: no cover
+        return set()
+    if df.empty:
+        return set()
+    last = pd.to_datetime(df["Date"]).max()
+    live = df.loc[pd.to_datetime(df["Date"]) == last, "Code"]
+    return set(live.astype(str).str.zfill(6).unique())
+
+
+# --- 각 절 ---------------------------------------------------------------------------
+
+
+def _section_collection(r: _Report, df: pd.DataFrame, files: Dict[int, Path],
+                        root: Path, marcap_root) -> None:
+    r.p("[가] 수집 현황")
+    r.p(THIN)
+
+    state_path = root / STATE_FILENAME
+    last_fetch = "모름"
+    try:
+        if state_path.is_file():
+            raw = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            last_fetch = str(raw.get("updated_at") or raw.get("corp_map_fetched_at") or "모름")
+    except (OSError, ValueError):  # pragma: no cover
+        pass
+
+    years = sorted(int(y) for y in df["year"].dropna().unique())
+    periods = sorted(
+        (int(y), int(q))
+        for y, q in zip(df["year"].dropna(), df["quarter"].dropna())
+    )
+    codes = df["code"].dropna().unique()
+
+    r.p(f"  연도 파일 수      : {len(files):,}개")
+    r.p(f"  총 행 수          : {len(df):,}행")
+    r.p(f"  연도 범위         : {min(years)} ~ {max(years)}" if years else "  연도 범위         : -")
+    if periods:
+        a, b = periods[0], periods[-1]
+        r.p(f"  분기 범위         : {a[0]}-{a[1]} ~ {b[0]}-{b[1]}")
+    r.p(f"  마지막 수집 시각  : {last_fetch}")
+    r.p(f"  커버 종목 수      : {len(codes):,}개")
+
+    live = _marcap_live_codes(marcap_root)
+    if live:
+        covered = len(set(str(c) for c in codes) & live)
+        r.p(f"  marcap 현재 상장  : {len(live):,}개 중 {covered:,}개 커버 "
+            f"({covered / len(live) * 100:.1f}%)")
+        if covered / len(live) < 0.80:
+            r.issue(f"현재 상장 종목의 {covered / len(live) * 100:.0f}% 만 재무가 있습니다. "
+                    "corp_map 매칭이나 수집 범위를 의심하세요.")
+    else:
+        r.note("marcap 데이터가 없어 종목 커버리지를 비교하지 못했습니다.")
+
+    # --- 분기별 행 수 표 ---
+    r.p("")
+    r.p("  분기별 행 수 (X=비었음, *=다른 분기의 절반 미만)")
+    counts: Dict[int, Dict[int, int]] = {}
+    for (y, q), n in df.groupby(
+        [df["year"].astype("Int64"), df["quarter"].astype("Int64")]
+    ).size().items():
+        counts.setdefault(int(y), {})[int(q)] = int(n)
+
+    nonzero = [n for row in counts.values() for n in row.values() if n > 0]
+    median = float(pd.Series(nonzero).median()) if nonzero else 0.0
+
+    header = ("  " + _lj("연도", 6) + _rj("1분기", 9) + _rj("반기", 9)
+              + _rj("3분기", 9) + _rj("사업보고서", 12) + _rj("합계", 10))
+    r.p(header)
+    thin_rows = []
+    empty_rows = []
+    for y in years:
+        row = counts.get(y, {})
+        cells = []
+        for q in (1, 2, 3, 4):
+            n = row.get(q, 0)
+            if n == 0:
+                cells.append("X")
+                empty_rows.append(f"{y}-{q}")
+            elif median and n < median * 0.5:
+                cells.append(f"{n:,}*")
+                thin_rows.append(f"{y}-{q}({n:,}행)")
+            else:
+                cells.append(f"{n:,}")
+        total = sum(row.values())
+        r.p("  " + _lj(str(y), 6) + _rj(cells[0], 9) + _rj(cells[1], 9)
+            + _rj(cells[2], 9) + _rj(cells[3], 12) + _rj(f"{total:,}", 10))
+
+    r.p("")
+    if empty_rows:
+        recent = [s for s in empty_rows if int(s.split("-")[0]) >= max(years) - 1]
+        old = [s for s in empty_rows if s not in recent]
+        if recent:
+            r.note(f"아직 공시 기간이 아닌 분기가 비어 있습니다: {', '.join(recent)}")
+        if old:
+            r.issue(f"과거 분기가 비어 있습니다: {', '.join(old[:8])}"
+                    f"{' …' if len(old) > 8 else ''} — 그 분기를 못 받았을 수 있습니다.")
+    if thin_rows:
+        r.issue(f"행 수가 유난히 적은 분기가 있습니다: {', '.join(thin_rows[:8])}"
+                f"{' …' if len(thin_rows) > 8 else ''}")
+    if not empty_rows and not thin_rows:
+        r.p("      분기별 행 수가 고릅니다. 빠진 분기 없음.")
+    r.p("")
+
+
+def _section_parsing(r: _Report, df: pd.DataFrame) -> None:
+    r.p("[나] 파싱 점검 — 계정명·금액 표기가 제대로 잡혔는지")
+    r.p(THIN)
+    n = len(df)
+
+    r.p("  재무 항목별 결측률")
+    r.p("  " + _lj("항목", 14) + _rj("값 있음", 10) + _rj("결측", 10) + _rj("결측률", 10))
+    for c in AMOUNT_COLUMNS:
+        have = int(df[c].notna().sum())
+        miss = n - have
+        pct = miss / n * 100.0 if n else 0.0
+        r.p("  " + _lj(c, 14) + _rj(f"{have:,}", 10) + _rj(f"{miss:,}", 10)
+            + _rj(f"{pct:.1f}%", 10))
+        limit = MISSING_WARN_PCT_CURRENT if c in ("유동자산", "유동부채") else MISSING_WARN_PCT
+        if pct > limit:
+            r.issue(f"'{c}' 가 {pct:.0f}% 결측입니다. "
+                    "DART 응답의 account_nm 표기와 매칭이 어긋났을 수 있습니다.")
+    r.p("")
+
+    # --- 파생 지표 분포 ---
+    r.p("  파생 지표 분포")
+    r.p("  " + _lj("지표", 18) + _rj("건수", 9) + _rj("최소", 12) + _rj("25%", 11)
+        + _rj("중앙", 11) + _rj("75%", 11) + _rj("최대", 13))
+    for col, unit, digits in (
+        ("debt_ratio_pct", "%", 1),
+        ("current_ratio_pct", "%", 1),
+        ("op_income_quarter", "억원", 0),
+    ):
+        s = df[col]
+        if col == "op_income_quarter":
+            s = pd.to_numeric(s, errors="coerce").astype("float64") / 100_000_000.0
+        st = _stats(s)
+        if st is None:
+            r.p("  " + _lj(f"{col}({unit})", 18) + _rj("0", 9) + "  (값 없음)")
+            r.issue(f"'{col}' 에 값이 하나도 없습니다.")
+            continue
+        r.p("  " + _lj(f"{col}({unit})", 18) + _rj(f"{st['n']:,}", 9)
+            + _rj(_num(st["min"], digits), 12) + _rj(_num(st["p25"], digits), 11)
+            + _rj(_num(st["median"], digits), 11) + _rj(_num(st["p75"], digits), 11)
+            + _rj(_num(st["max"], digits), 13))
+        miss_pct = (1 - st["n"] / n) * 100.0 if n else 0.0
+        if miss_pct > MISSING_WARN_PCT_CURRENT:
+            r.issue(f"'{col}' 이 {miss_pct:.0f}% 결측입니다.")
+
+    st = _stats(df["debt_ratio_pct"])
+    if st is not None:
+        if not (5.0 <= st["median"] <= 400.0):
+            r.issue(f"부채비율 중앙값이 {st['median']:,.1f}% 입니다. "
+                    "보통 40~150% 범위입니다 — 단위나 부호 파싱을 의심하세요.")
+        absurd = int((pd.to_numeric(df["debt_ratio_pct"], errors="coerce")
+                      > DEBT_RATIO_ABSURD).sum())
+        if absurd:
+            pct = absurd / max(1, st["n"]) * 100.0
+            msg = (f"부채비율이 {DEBT_RATIO_ABSURD:,.0f}% 를 넘는 행이 {absurd:,}건"
+                   f"({pct:.2f}%) 있습니다.")
+            if pct > 1.0:
+                r.issue(msg + " 단위/부호 파싱 오류를 의심하세요.")
+            else:
+                r.note(msg + " 자본잠식 직전 회사면 정상일 수 있습니다.")
+
+    st = _stats(df["current_ratio_pct"])
+    if st is not None and not (30.0 <= st["median"] <= 1000.0):
+        r.issue(f"유동비율 중앙값이 {st['median']:,.1f}% 입니다. 보통 100~250% 범위입니다.")
+    r.p("")
+
+    # --- 음수가 실제로 잡혔는가 ---
+    r.p("  음수 표기 파싱 확인")
+    op_cum = pd.to_numeric(df["영업이익"], errors="coerce")
+    op_q = pd.to_numeric(df["op_income_quarter"], errors="coerce")
+    neg_cum = int((op_cum < 0).sum())
+    neg_q = int((op_q < 0).sum())
+    have_cum = int(op_cum.notna().sum())
+    have_q = int(op_q.notna().sum())
+    r.p(f"    영업이익(누적) 음수      : {neg_cum:,}건 / {have_cum:,}건 "
+        f"({neg_cum / have_cum * 100 if have_cum else 0:.1f}%)")
+    r.p(f"    영업이익(분기 차분) 음수 : {neg_q:,}건 / {have_q:,}건 "
+        f"({neg_q / have_q * 100 if have_q else 0:.1f}%)")
+    r.p(f"    당기순이익 음수          : "
+        f"{int((pd.to_numeric(df['당기순이익'], errors='coerce') < 0).sum()):,}건")
+    if have_cum and neg_cum == 0:
+        r.issue("영업이익 음수가 한 건도 없습니다. "
+                "'△' 나 '(1,000)' 같은 음수 표기 파싱이 실패했을 가능성이 큽니다.")
+    elif have_cum and neg_cum / have_cum < 0.03:
+        r.issue(f"영업이익 음수 비율이 {neg_cum / have_cum * 100:.1f}% 로 지나치게 낮습니다. "
+                "상장사 적자 비율은 보통 20~35% 입니다.")
+    r.p("")
+
+    # --- fs_div 분포 ---
+    r.p("  연결/별도 분포")
+    vc = df["fs_div"].value_counts(dropna=False)
+    for k, v in vc.items():
+        label = {"CFS": "CFS (연결)", "OFS": "OFS (별도)"}.get(str(k), f"{k}")
+        r.p(f"    {_lj(label, 14)}{_rj(f'{int(v):,}', 9)}  ({v / n * 100:.1f}%)")
+    if "CFS" not in set(str(x) for x in vc.index):
+        r.issue("연결(CFS) 재무가 하나도 없습니다. fs_div 우선순위 처리를 확인하세요.")
+    r.p("")
+
+    # --- 유동자산/유동부채가 아예 없는 종목 ---
+    by_code = df.groupby("code")[["유동자산", "유동부채"]].count()
+    no_current = by_code[(by_code["유동자산"] == 0) & (by_code["유동부채"] == 0)]
+    total_codes = int(df["code"].nunique())
+    r.p(f"  유동자산/유동부채가 한 번도 없는 종목 : {len(no_current):,}개 "
+        f"/ {total_codes:,}개 ({len(no_current) / total_codes * 100 if total_codes else 0:.1f}%)")
+    r.p("    금융업(은행·보험·증권)은 유동/비유동 구분을 하지 않아 원래 비어 있습니다.")
+    if total_codes and len(no_current) / total_codes > 0.30:
+        r.issue(f"유동비율을 계산할 수 없는 종목이 {len(no_current) / total_codes * 100:.0f}% 입니다. "
+                "금융업 비중치고 지나치게 높습니다.")
+    r.p("")
+
+
+def _pick_loss_code(df: pd.DataFrame) -> Optional[str]:
+    """적자 이력이 있는 대표 종목 하나 (행이 가장 많은 것)."""
+    op = pd.to_numeric(df["op_income_quarter"], errors="coerce")
+    loss_codes = set(df.loc[op < 0, "code"].dropna().astype(str))
+    loss_codes -= {c for c, _n in SAMPLE_CODES}
+    if not loss_codes:
+        return None
+    sub = df[df["code"].astype(str).isin(loss_codes)]
+    counts = sub.groupby(sub["code"].astype(str)).size().sort_values(
+        ascending=False, kind="stable"
+    )
+    return str(counts.index[0])
+
+
+def _section_samples(r: _Report, store, df: pd.DataFrame, limit: int = 12) -> None:
+    r.p("[다] 대표 종목 샘플 — 숫자가 상식적인지 눈으로 확인")
+    r.p(THIN)
+
+    targets = list(SAMPLE_CODES)
+    loss = _pick_loss_code(df)
+    if loss:
+        name = "적자 이력 종목"
+        targets.append((loss, name))
+    else:
+        r.note("적자 이력이 있는 종목을 찾지 못했습니다. 음수 파싱을 의심하세요.")
+
+    for code, label in targets:
+        sub = df[df["code"].astype(str) == code].sort_values(
+            ["year", "quarter"], kind="stable"
+        )
+        r.p("")
+        r.p(f"  {code} {label}")
+        if sub.empty:
+            r.p("      데이터 없음")
+            if code in ("005930", "000660"):
+                r.issue(f"{code} {label} 재무가 하나도 없습니다. 수집이 제대로 안 됐습니다.")
+            continue
+
+        r.p("  " + _lj("분기", 10) + _lj("공시일", 13) + _rj("부채비율", 11)
+            + _rj("유동비율", 11) + _rj("분기영업이익(억)", 20))
+        for _, row in sub.tail(limit).iterrows():
+            d = row["disclosed_at"]
+            r.p("  "
+                + _lj(f"{_as_opt_int(row['year'])}-{_as_opt_int(row['quarter'])}", 10)
+                + _lj("-" if pd.isna(d) else str(pd.Timestamp(d).date()), 13)
+                + _rj(_num(row["debt_ratio_pct"], 1), 11)
+                + _rj(_num(row["current_ratio_pct"], 1), 11)
+                + _rj(_eok(row["op_income_quarter"]), 20))
+        if len(sub) > limit:
+            r.p(f"      (최근 {limit}개만 표시. 전체 {len(sub)}행)")
+
+        if code == "005930":
+            st = _stats(sub["debt_ratio_pct"])
+            lo, hi = SAMSUNG_DEBT_RATIO_RANGE
+            if st is None:
+                r.issue("삼성전자 부채비율이 전부 비어 있습니다.")
+            elif not (lo <= st["median"] <= hi):
+                r.issue(f"삼성전자 부채비율 중앙값이 {st['median']:,.1f}% 입니다. "
+                        f"정상 범위는 {lo:.0f}~{hi:.0f}% 입니다 — 파싱 오류를 의심하세요.")
+            else:
+                r.p(f"      삼성전자 부채비율 중앙값 {st['median']:.1f}% — 정상 범위입니다.")
+            st = _stats(sub["current_ratio_pct"])
+            lo, hi = SAMSUNG_CURRENT_RATIO_RANGE
+            if st is not None and not (lo <= st["median"] <= hi):
+                r.issue(f"삼성전자 유동비율 중앙값이 {st['median']:,.1f}% 입니다. "
+                        f"정상 범위는 {lo:.0f}~{hi:.0f}% 입니다.")
+            elif st is not None:
+                r.p(f"      삼성전자 유동비율 중앙값 {st['median']:.1f}% — 정상 범위입니다.")
+    r.p("")
+
+
+def _section_asof(r: _Report, store, df: pd.DataFrame) -> None:
+    r.p("[라] as-of 동작 확인 — 공시 전 재무를 미리 보고 있지 않은지")
+    r.p(THIN)
+
+    code = "005930"
+    sub = df[df["code"].astype(str) == code]
+    if sub.empty:
+        code = str(df["code"].dropna().iloc[0])
+        sub = df[df["code"].astype(str) == code]
+    r.p(f"  기준 종목: {code}")
+    r.p("")
+
+    dates = sorted(pd.Timestamp(d) for d in sub["disclosed_at"].dropna().unique())
+    probes: List[pd.Timestamp] = []
+    for d in dates[-4:]:
+        probes += [d - pd.Timedelta(days=1), d]
+    if not probes:
+        r.issue("공시일(disclosed_at)이 하나도 없습니다. rcept_no 파싱을 확인하세요.")
+        r.p("")
+        return
+
+    r.p("  " + _lj("조회일", 13) + _lj("반환 분기", 12) + _lj("그 분기 공시일", 16)
+        + _lj("판정", 10))
+    violations = 0
+    for probe in probes:
+        got = store.as_of(code, probe.date())
+        if got is None:
+            r.p("  " + _lj(str(probe.date()), 13) + _lj("(없음)", 12)
+                + _lj("-", 16) + _lj("정상", 10))
+            continue
+        disc = got["disclosed_at"]
+        bad = disc is not None and pd.Timestamp(disc) > probe
+        if bad:
+            violations += 1
+        r.p("  " + _lj(str(probe.date()), 13)
+            + _lj(f"{got['year']}-{got['quarter']}", 12)
+            + _lj(str(disc), 16)
+            + _lj("룩어헤드!!" if bad else "정상", 10))
+
+    # 전 종목 전수 확인
+    r.p("")
+    span = sorted(pd.Timestamp(d) for d in df["disclosed_at"].dropna().unique())
+    scan_dates = []
+    if span:
+        lo, hi = span[0], span[-1]
+        step = max(1, (hi - lo).days // 7)
+        scan_dates = [lo + pd.Timedelta(days=step * i) for i in range(8)]
+    total_bad = 0
+    for d in scan_dates:
+        panel = store.as_of_panel(None, d.date())
+        if panel.empty:
+            continue
+        bad = int((panel["disclosed_at"] > d).sum())
+        total_bad += bad
+    r.p(f"  전 종목 전수 확인: {len(scan_dates)}개 시점에서 공시일이 조회일보다 뒤인 행 "
+        f"{total_bad:,}건")
+
+    if violations or total_bad:
+        r.p("")
+        r.p("  " + "!" * 60)
+        r.issue(f"룩어헤드 편향 발견: 공시 전 재무가 {violations + total_bad:,}건 조회됩니다. "
+                "이대로 백테스트하면 수익률이 실제보다 좋게 나옵니다. 즉시 알려주세요.")
+        r.p("  " + "!" * 60)
+    else:
+        r.p("      공시 전 재무가 조회되는 경우 없음. as-of 규칙이 지켜지고 있습니다.")
+    r.p("")
+
+
+def _section_survivorship(r: _Report, df: pd.DataFrame, marcap_root) -> None:
+    r.p("[마] 생존 편향 규모 — marcap 에는 있는데 재무가 없는 종목")
+    r.p(THIN)
+
+    years = sorted(int(y) for y in df["year"].dropna().unique())
+    by_year = _marcap_codes(marcap_root, years=years)
+    if not by_year:
+        r.note("marcap 데이터가 없어 생존 편향 규모를 재지 못했습니다. "
+               "update_marcap.bat 을 먼저 실행하면 이 항목도 나옵니다.")
+        r.p("")
+        return
+
+    marcap_all = set().union(*by_year.values())
+    dart_codes = set(str(c) for c in df["code"].dropna().unique())
+    missing = marcap_all - dart_codes
+    live = _marcap_live_codes(marcap_root)
+
+    missing_live = missing & live
+    missing_gone = missing - live
+
+    r.p(f"  marcap 등장 종목 ({min(years)}~{max(years)}) : {len(marcap_all):,}개")
+    r.p(f"  DART 재무가 한 건도 없는 종목        : {len(missing):,}개 "
+        f"({len(missing) / len(marcap_all) * 100:.1f}%)")
+    r.p(f"    - 지금도 상장 중                   : {len(missing_live):,}개")
+    r.p(f"    - 지금은 없음 (상장폐지 추정)      : {len(missing_gone):,}개")
+    r.p("")
+    r.p("  상장폐지 종목의 과거 재무는 corpCode.xml 에 종목코드가 남지 않아 받을 수 없습니다.")
+    r.p("  재무 필터를 켜면 그 종목들이 통째로 빠지므로, 실제보다 결과가 좋게 나올 수 있습니다.")
+
+    if len(missing_gone):
+        r.note(f"재무 필터를 켠 백테스트에서는 상장폐지 종목 {len(missing_gone):,}개가 "
+               "자동 제외됩니다. 필터를 끈 결과와 비교해 보세요.")
+    if len(missing_live) and len(missing_live) / max(1, len(live)) > 0.15:
+        r.issue(f"현재 상장 중인데 재무가 없는 종목이 {len(missing_live):,}개 "
+                f"({len(missing_live) / len(live) * 100:.0f}%) 입니다. "
+                "스팩·리츠·외국계를 빼도 많다면 수집이 덜 됐을 수 있습니다.")
+    r.p("")
+
+
+def run_report(
+    dart_root: str | os.PathLike = "dart",
+    marcap_root: str | os.PathLike = "marcap",
+    out=None,
+) -> int:
+    """받아 둔 ``dart/`` 를 읽어 한국어 진단 리포트를 낸다. **네트워크를 쓰지 않는다.**
+
+    0 = 정상 / 1 = 확인 필요 / 2 = 데이터 없음
+    """
+    from engine.dart import DartStore  # 순환 의존을 피하려고 여기서 import
+
+    r = _Report(out)
+    root = Path(dart_root)
+
+    r.p(RULE)
+    r.p(" DART 재무 데이터 진단 리포트")
+    r.p(f" 생성 시각 : {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    r.p(f" 데이터 폴더: {root.resolve() if root.exists() else root}")
+    r.p(RULE)
+    r.p("")
+
+    store = DartStore(root=root)
+    if not store.available:
+        r.p("  받아 둔 재무 데이터가 없습니다.")
+        r.p("")
+        r.p(f"  찾은 위치 : {root.resolve() if root.exists() else root}")
+        r.p("")
+        r.p("  1) test_dart.bat 을 실행해 인증키와 연결을 먼저 확인하세요.")
+        r.p("  2) 그 다음 update_dart.bat 을 실행해 데이터를 받으세요.")
+        r.p("")
+        r.p(RULE)
+        r.p(" 판정: 확인 필요 (데이터 없음)")
+        r.p(RULE)
+        return REPORT_NO_DATA
+
+    df = store.load()
+    files = {y: root / f"fundamentals-{y}.parquet" for y in store.years}
+
+    if df.empty:
+        r.p("  파일은 있는데 행이 하나도 없습니다. update_dart.bat 을 다시 실행하세요.")
+        r.p(RULE)
+        r.p(" 판정: 확인 필요 (행 없음)")
+        r.p(RULE)
+        return REPORT_NO_DATA
+
+    _section_collection(r, df, files, root, marcap_root)
+    _section_parsing(r, df)
+    _section_samples(r, store, df)
+    _section_asof(r, store, df)
+    _section_survivorship(r, df, marcap_root)
+
+    # ---- 판정 -----------------------------------------------------------------------
+    r.p(RULE)
+    if r.issues:
+        r.p(f" 판정: 확인 필요 — {len(r.issues)}건")
+        r.p(RULE)
+        for i, msg in enumerate(r.issues, start=1):
+            r.p(f"  {i}. {msg}")
+        r.p("")
+        r.p(" 위 내용을 그대로 담당자에게 보내주세요.")
+    else:
+        r.p(" 판정: 정상")
+        r.p(RULE)
+        r.p("  계정명 매칭, 음수 표기, 부호·단위, as-of 규칙 모두 이상 없습니다.")
+        r.p("  재무 필터를 켠 백테스트를 돌려도 됩니다.")
+    if r.notes:
+        r.p("")
+        r.p(" 참고 사항")
+        for i, msg in enumerate(r.notes, start=1):
+            r.p(f"  {i}. {msg}")
+    r.p(RULE)
+    return REPORT_ISSUES if r.issues else REPORT_OK
+
+
+# ======================================================================================
+# 11. CLI
 # ======================================================================================
 
 
@@ -1477,11 +2081,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--call-limit", dest="call_limit", type=int, default=DAILY_CALL_LIMIT,
                    help=f"하루 호출 한도 (기본 {DAILY_CALL_LIMIT})")
     p.add_argument("--selftest", action="store_true", help="키·연결·삼성전자 1건만 확인하고 끝낸다")
+    p.add_argument("--report", action="store_true",
+                   help="받아 둔 데이터를 읽어 진단 리포트를 낸다 (네트워크 안 씀)")
+    p.add_argument("--marcap", dest="marcap_root", default="marcap",
+                   help="--report 에서 비교할 marcap 폴더 (기본 marcap)")
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+
+    # --report 는 인증키도 네트워크도 필요 없다. 키 검사보다 먼저 처리한다.
+    if args.report:
+        return run_report(args.out_dir, args.marcap_root)
 
     key = read_api_key(args.key_file)
     if args.selftest:

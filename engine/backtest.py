@@ -230,7 +230,7 @@ def _market_mask(series: pd.Series, markets: Sequence[str]) -> pd.Series:
     return s.isin(allowed)
 
 
-#: ``universe.filters`` 중 엔진이 실제로 적용할 수 있는 키
+#: ``universe.filters`` 중 시세(marcap)만으로 판정 가능한 키
 SUPPORTED_FILTERS = {
     "market_cap_min_eok": ("시가총액 하한", "억"),
     "market_cap_max_eok": ("시가총액 상한", "억"),
@@ -240,7 +240,25 @@ SUPPORTED_FILTERS = {
     "volume_min": ("거래량 하한", "주"),
 }
 
+#: DART 재무 데이터가 연결됐을 때만 판정 가능한 키
+FINANCIAL_FILTERS = {
+    "debt_ratio_max_pct": ("부채비율 상한", "%"),
+    "current_ratio_min_pct": ("유동비율 하한", "%"),
+    "profitable_quarters_min": ("영업이익 연속 흑자 분기", "분기"),
+}
+
+#: 필터가 아니라 필터의 동작을 정하는 키
+FILTER_OPTION_KEYS = {"on_missing", "comment"}
+
+#: 재무를 알 수 없는 종목 처리 정책
+ON_MISSING_MODES = ("include", "exclude")
+DEFAULT_ON_MISSING = "include"
+
 _DEFAULT_IGNORED_REASON = "이 조건에 필요한 데이터가 marcap 에 없어 적용하지 않았습니다."
+_NO_DART_REASON = (
+    "DART 재무 데이터가 연결되지 않아 이 조건은 적용되지 않습니다. "
+    "update_dart.bat 으로 재무 데이터를 받으면 자동으로 적용됩니다."
+)
 
 
 #: 항상 필요한 컬럼
@@ -284,14 +302,15 @@ def _indicator_aliases(strategy: Mapping) -> Dict[str, dict]:
     return out
 
 
-def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
-    """``universe.filters`` 를 (적용 가능, 무시됨) 으로 나눈다.
+def _split_filters(strategy: Mapping, dart_ok: bool = False) -> Tuple[dict, dict, List[dict]]:
+    """``universe.filters`` 를 (시세 필터, 재무 필터, 무시됨) 으로 나눈다.
 
     무시된 항목의 사유는 같은 경로를 가리키는 ``params[].unavailable_reason`` 을 우선 쓴다.
+    ``dart_ok`` 가 False 면 재무 필터는 전부 무시 목록으로 간다.
     """
     filters = (strategy.get("universe") or {}).get("filters") or {}
     if not isinstance(filters, Mapping):
-        return {}, []
+        return {}, {}, []
 
     by_path = {}
     for prm in strategy.get("params") or []:
@@ -299,9 +318,10 @@ def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
             by_path[prm["path"]] = prm
 
     applied: dict = {}
+    financial: dict = {}
     ignored: List[dict] = []
     for key, value in filters.items():
-        if str(key).startswith("_") or key == "comment":
+        if str(key).startswith("_") or key in FILTER_OPTION_KEYS:
             continue
         if value is None:
             continue
@@ -311,10 +331,20 @@ def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
             except (TypeError, ValueError):
                 pass
             continue
+        if key in FINANCIAL_FILTERS and dart_ok:
+            try:
+                financial[key] = float(value)
+            except (TypeError, ValueError):
+                pass
+            continue
+
         prm = by_path.get(f"universe.filters.{key}") or {}
-        label = prm.get("label") or key
-        unit = prm.get("unit") or ""
-        reason = prm.get("unavailable_reason") or _DEFAULT_IGNORED_REASON
+        label = prm.get("label") or FINANCIAL_FILTERS.get(key, (key, ""))[0]
+        unit = prm.get("unit") or FINANCIAL_FILTERS.get(key, ("", ""))[1]
+        if key in FINANCIAL_FILTERS:
+            reason = _NO_DART_REASON if not prm.get("unavailable_reason") else prm["unavailable_reason"]
+        else:
+            reason = prm.get("unavailable_reason") or _DEFAULT_IGNORED_REASON
         ignored.append(
             {
                 "key": key,
@@ -327,7 +357,7 @@ def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
                 ),
             }
         )
-    return applied, ignored
+    return applied, financial, ignored
 
 
 def _eligible_codes(panel: pd.DataFrame, universe: Mapping,
@@ -708,6 +738,7 @@ def _fill_price(
 def run_backtest(
     strategy: Mapping,
     store,
+    dart=None,
     progress: Optional[Callable[..., None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -715,6 +746,10 @@ def run_backtest(
 
     Parameters
     ----------
+    dart : DartStore | None
+        DART 재무 저장소. ``None`` 이거나 ``available == False`` 면 재무 필터는
+        적용되지 않고 ``assumptions.ignored_filters`` 에 사유가 남는다(기존 동작 그대로).
+        연결되면 **반드시 그 시점에 이미 공시된 재무만** 본다 (``as_of``).
     progress : callable | None
         ``progress(done, total, message)`` (v1) 또는
         ``progress(done, total, message, phase, eta_sec)`` (v2). ``total`` 은 항상 100.
@@ -786,15 +821,36 @@ def run_backtest(
         "same_day_entry_exit_pct": 0.0,
         "ambiguous_bars": 0,
         "same_day_profit_exits_blocked": 0,
+        "missing_financials": 0,
+        "missing_financials_pct": 0.0,
     }
 
     # 지표 별칭 — strategy["indicators"][].key 를 조건식/수식에서 이름으로 쓴다
     aliases = _indicator_aliases(strategy)
 
+    # DART 재무 데이터 연결 여부
+    dart_ok = False
+    if dart is not None:
+        try:
+            dart_ok = bool(dart.available)
+        except Exception:  # pragma: no cover - 저장소가 이상해도 백테스트는 돌아야 한다
+            dart_ok = False
+
+    on_missing = str((universe.get("filters") or {}).get("on_missing") or DEFAULT_ON_MISSING)
+    if on_missing not in ON_MISSING_MODES:
+        on_missing = DEFAULT_ON_MISSING
+
     # universe.filters — 지원하는 키만 적용하고 나머지는 사유와 함께 남긴다
-    applied_filters, ignored_filters = _split_filters(strategy)
+    applied_filters, financial_filters, ignored_filters = _split_filters(strategy, dart_ok)
     for ig in ignored_filters:
         warnings.append(ig["message"])
+
+    dart_last_fetch = None
+    if dart_ok and financial_filters:
+        try:
+            dart_last_fetch = dart.status().get("last_fetch")
+        except Exception:  # pragma: no cover
+            dart_last_fetch = None
 
     def make_assumptions() -> dict:
         return {
@@ -813,6 +869,16 @@ def run_backtest(
             "ignored_filters": [
                 {"key": ig["key"], "reason": ig["reason"]} for ig in ignored_filters
             ],
+            "dart": {
+                "available": bool(dart_ok),
+                "as_of": bool(dart_ok and financial_filters),
+                "coverage_pct": (
+                    _r(100.0 - float(stats["missing_financials_pct"]))
+                    if (dart_ok and financial_filters) else None
+                ),
+                "on_missing": on_missing,
+                "last_fetch": dart_last_fetch,
+            },
         }
 
     # ---------------------------------------------------------------- 기간

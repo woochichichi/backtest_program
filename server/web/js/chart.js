@@ -96,6 +96,17 @@ export class CandleChart {
     this.bctx = this.base.getContext('2d', { alpha: false });
     this.octx = this.overlay.getContext('2d');
 
+    // 데이터 끝에 닿았을 때 알려 주는 가장자리 표시 (아무 반응이 없으면 "고장났다"고 느낀다)
+    this.edgeL = document.createElement('div');
+    this.edgeL.className = 'edge-glow l';
+    this.edgeL.innerHTML = '<span>가장 오래된 데이터입니다</span>';
+    this.edgeR = document.createElement('div');
+    this.edgeR.className = 'edge-glow r';
+    this.edgeR.innerHTML = '<span>가장 최근 데이터입니다</span>';
+    host.appendChild(this.edgeL);
+    host.appendChild(this.edgeR);
+    this._edgeTimer = 0;
+
     this.d = null;                 // 데이터
     this.i0 = 0; this.i1 = 0;      // 가시 구간 [i0, i1)
     this.hover = -1;               // 호버 중인 봉 인덱스
@@ -192,6 +203,61 @@ export class CandleChart {
 
   hasData() { return !!(this.d && this.d.n); }
 
+  /** 로드된 전체 봉 수 (뷰포트가 아니라 데이터 전체) */
+  get n() { return this.d ? this.d.n : 0; }
+
+  /** 화면에 보이는 봉 수 */
+  get visibleCount() { return this.i1 - this.i0; }
+
+  /** 가장 최근 `count` 개만 보이도록 뷰포트를 맞춘다 (데이터 재요청 없음) */
+  showLast(count, notify = true) {
+    if (!this.d) return;
+    const n = this.d.n;
+    const c = Math.max(MIN_BARS, Math.min(n, Math.round(count) || n));
+    this.setViewport(n - c, n, notify);
+  }
+
+  /**
+   * 차트에 처음 들어왔을 때 딱 한 번만 조작 방법을 알려 준다.
+   * localStorage 에 기록해 두 번째부터는 띄우지 않는다.
+   */
+  _maybeShowHint() {
+    if (this._hintShown || !this.hasData()) return;
+    try { if (localStorage.getItem('chartHintSeen') === '1') { this._hintShown = true; return; } } catch { /* 접근 불가 */ }
+    this._hintShown = true;
+    if (!this._hintEl) {
+      this._hintEl = document.createElement('div');
+      this._hintEl.className = 'chart-firsthint';
+      this._hintEl.innerHTML =
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<path d="M5 12h14M9 8l-4 4 4 4M15 8l4 4-4 4"/></svg>' +
+        '<span><b>드래그</b>로 좌우 이동 · <b>휠</b>로 확대 · <b>더블클릭</b>으로 전체 보기</span>';
+      this.host.appendChild(this._hintEl);
+    }
+    this._hintEl.classList.add('on');
+    clearTimeout(this._hintTimer);
+    this._hintTimer = setTimeout(() => this._hideHint(), 5000);
+    try { localStorage.setItem('chartHintSeen', '1'); } catch { /* 접근 불가 */ }
+  }
+
+  _hideHint() {
+    if (this._hintEl) this._hintEl.classList.remove('on');
+    clearTimeout(this._hintTimer);
+  }
+
+  /** 데이터 가장자리에 닿았음을 잠깐 표시한다 */
+  _flashEdge(side) {
+    const el = side === 'left' ? this.edgeL : this.edgeR;
+    const other = side === 'left' ? this.edgeR : this.edgeL;
+    other.classList.remove('on');
+    // 이미 켜져 있으면 애니메이션을 다시 시작시킨다
+    el.classList.remove('on');
+    void el.offsetWidth;
+    el.classList.add('on');
+    clearTimeout(this._edgeTimer);
+    this._edgeTimer = setTimeout(() => el.classList.remove('on'), 900);
+  }
+
   /* ---------------- 뷰포트 ---------------- */
 
   /** 전체 보기 */
@@ -213,11 +279,16 @@ export class CandleChart {
     if (a < 0) { b -= a; a = 0; }
     if (b > n) { a -= (b - n); b = n; }
     if (a < 0) a = 0;
-    if (a === this.i0 && b === this.i1) return;
+    if (a === this.i0 && b === this.i1) return false;   // 클램프되어 움직이지 못했다
     this.i0 = a; this.i1 = b;
     this.requestBase();
     if (notify && this.onViewport) this.onViewport(a, b);
+    return true;
   }
+
+  /** 왼쪽/오른쪽 데이터 끝에 붙어 있는가 */
+  atStart() { return this.i0 <= 0; }
+  atEnd() { return this.d ? this.i1 >= this.d.n : false; }
 
   /** 특정 구간이 화면에 여유 있게 들어오도록 이동 */
   focusRange(from, to, pad = 0.35) {
@@ -773,30 +844,65 @@ export class CandleChart {
     this._onTheme = () => this.invalidateTheme();
     window.addEventListener('themechange', this._onTheme);
 
-    let dragging = false, lastX = 0, movedPx = 0, anchorI0 = 0, anchorI1 = 0;
+    let dragging = false, lastX = 0, anchorI0 = 0, anchorI1 = 0;
+    /** 동시에 눌린 포인터들 — 두 개면 핀치 줌 */
+    const pts = new Map();
+    let pinch = null;   // {dist, i0, i1, frac}
 
     host.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || !this.hasData()) return;
-      dragging = true; movedPx = 0; lastX = e.clientX;
+      if (!this.hasData()) return;
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pts.size === 2) {
+        // 두 손가락 → 핀치 줌 시작. 팬은 중단한다.
+        dragging = false;
+        host.classList.remove('panning');
+        const [a, b] = [...pts.values()];
+        const r = host.getBoundingClientRect();
+        const midX = (a.x + b.x) / 2 - r.left;
+        pinch = {
+          dist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+          i0: this.i0, i1: this.i1,
+          frac: this._geo ? Math.max(0, Math.min(1, (midX - PL) / this._geo.plotW)) : 0.5,
+        };
+        return;
+      }
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      dragging = true; lastX = e.clientX;
       anchorI0 = this.i0; anchorI1 = this.i1;
-      host.setPointerCapture(e.pointerId);
+      try { host.setPointerCapture(e.pointerId); } catch { /* 캡처 실패해도 팬은 동작한다 */ }
       host.classList.add('panning');
+      this._hideHint();
     });
 
     host.addEventListener('pointermove', (e) => {
+      if (pts.has(e.pointerId)) pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
       const r = host.getBoundingClientRect();
       const px = e.clientX - r.left;
       this.hoverY = e.clientY - r.top;
 
+      // ---- 핀치 줌 ----
+      if (pinch && pts.size === 2) {
+        const [a, b] = [...pts.values()];
+        const d = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+        const span = pinch.i1 - pinch.i0;
+        const next = Math.max(MIN_BARS, Math.min(this.d.n, Math.round(span * (pinch.dist / d))));
+        const anchor = pinch.i0 + pinch.frac * span;
+        this.setViewport(anchor - pinch.frac * next, anchor - pinch.frac * next + next);
+        return;
+      }
+
+      // ---- 드래그 팬 ----
       if (dragging && this._geo) {
         const dx = e.clientX - lastX;
-        movedPx += Math.abs(dx);
         // 드래그 시작 시점의 봉 폭을 기준으로 삼아야 팬 도중 가속되지 않는다
-        const cw = this._geo.plotW / (anchorI1 - anchorI0);
+        const cw = this._geo.plotW / Math.max(1, anchorI1 - anchorI0);
         const barsMoved = Math.round(-dx / cw);
         if (barsMoved !== 0) {
           lastX = e.clientX;
-          this.setViewport(this.i0 + barsMoved, this.i1 + barsMoved);
+          const moved = this.setViewport(this.i0 + barsMoved, this.i1 + barsMoved);
+          // 클램프되어 못 움직였으면 왜 안 되는지 보여 준다
+          if (!moved) this._flashEdge(barsMoved < 0 ? 'left' : 'right');
         }
       }
 
@@ -809,6 +915,8 @@ export class CandleChart {
     });
 
     const endDrag = (e) => {
+      pts.delete(e.pointerId);
+      if (pts.size < 2) pinch = null;
       if (!dragging) return;
       dragging = false;
       host.classList.remove('panning');
@@ -822,6 +930,9 @@ export class CandleChart {
       this.requestOverlay();
       if (this.onHover) this.onHover(null);
     });
+
+    // 처음 차트에 들어왔을 때 한 번만 조작 방법을 알려 준다
+    host.addEventListener('pointerenter', () => this._maybeShowHint(), { once: false });
 
     host.addEventListener('wheel', (e) => {
       if (!this.hasData()) return;
@@ -845,11 +956,17 @@ export class CandleChart {
       if (!this.hasData()) return;
       const nVis = this.i1 - this.i0;
       const step = Math.max(1, Math.round(nVis * 0.1));
-      if (e.key === 'ArrowLeft') { this.setViewport(this.i0 - step, this.i1 - step); e.preventDefault(); }
-      else if (e.key === 'ArrowRight') { this.setViewport(this.i0 + step, this.i1 + step); e.preventDefault(); }
-      else if (e.key === '+' || e.key === '=') { this.zoomBy(0.8); e.preventDefault(); }
+      if (e.key === 'ArrowLeft') {
+        if (!this.setViewport(this.i0 - step, this.i1 - step)) this._flashEdge('left');
+        e.preventDefault();
+      } else if (e.key === 'ArrowRight') {
+        if (!this.setViewport(this.i0 + step, this.i1 + step)) this._flashEdge('right');
+        e.preventDefault();
+      } else if (e.key === '+' || e.key === '=') { this.zoomBy(0.8); e.preventDefault(); }
       else if (e.key === '-' || e.key === '_') { this.zoomBy(1.25); e.preventDefault(); }
-      else if (e.key === 'Home' || e.key === '0') { this.fitAll(); e.preventDefault(); }
+      else if (e.key === 'Home') { this.setViewport(0, nVis); this._flashEdge('left'); e.preventDefault(); }
+      else if (e.key === 'End') { this.setViewport(this.d.n - nVis, this.d.n); this._flashEdge('right'); e.preventDefault(); }
+      else if (e.key === '0') { this.fitAll(); e.preventDefault(); }
     });
   }
 

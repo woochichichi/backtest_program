@@ -968,3 +968,91 @@ tbody tr.grp-row:not(.grp-last) td { border-bottom-color: transparent; }
 /* ---------- 되돌리기 버튼이 길어질 때 ---------- */
 #btnRevert { grid-column: span 3; }
 @media (max-width: 1180px) { #btnRevert { grid-column: span 2; } }
+
+/* ============================================================
+   차트 조작 피드백 — 가장자리 도달 표시 / 최초 1회 힌트
+   ============================================================ */
+
+/* 데이터 끝에 닿았을 때: 짧은 글로우 + 이유 설명.
+   아무 반응이 없으면 사용자는 "고장났다"고 느낀다. */
+.edge-glow {
+  position: absolute; top: 0; bottom: 0; width: 64px; z-index: 4;
+  pointer-events: none; opacity: 0;
+  display: flex; align-items: center;
+  transition: opacity .18s var(--ease);
+}
+.edge-glow.l { left: 0; justify-content: flex-start;
+  background: linear-gradient(90deg, var(--accent-soft) 0%, transparent 100%); }
+.edge-glow.r { right: 0; justify-content: flex-end;
+  background: linear-gradient(270deg, var(--accent-soft) 0%, transparent 100%); }
+.edge-glow.on { opacity: 1; animation: edgeBounce .32s var(--ease); }
+.edge-glow span {
+  position: absolute; top: 10px; white-space: nowrap;
+  padding: 3px 9px; border-radius: 11px;
+  background: var(--bg-1); border: 1px solid var(--bd-str); box-shadow: var(--shadow-1);
+  font-size: 10.5px; color: var(--tx-sub); font-family: var(--sans);
+}
+.edge-glow.l span { left: 8px; }
+.edge-glow.r span { right: 8px; }
+@keyframes edgeBounce {
+  0% { transform: translateX(0); }
+  45% { transform: translateX(var(--bounce, 5px)); }
+  100% { transform: translateX(0); }
+}
+.edge-glow.l { --bounce: 5px; }
+.edge-glow.r { --bounce: -5px; }
+@media (prefers-reduced-motion: reduce) { .edge-glow.on { animation: none; } }
+
+/* 최초 1회 조작 안내 */
+.chart-firsthint {
+  position: absolute; left: 50%; bottom: 34px; transform: translate(-50%, 8px);
+  z-index: 4; pointer-events: none; opacity: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 13px; border-radius: 18px;
+  background: var(--bg-1); border: 1px solid var(--bd-str); box-shadow: var(--shadow-2);
+  font-size: 12px; color: var(--tx); white-space: nowrap;
+  transition: opacity .25s var(--ease), transform .25s var(--ease);
+}
+.chart-firsthint.on { opacity: 1; transform: translate(-50%, 0); }
+.chart-firsthint svg { color: var(--accent); flex: 0 0 auto; }
+.chart-firsthint b { font-weight: 700; }
+
+/* 끌 수 있다는 신호 — 기본은 crosshair, 누르는 동안 grabbing */
+.chart-wrap { cursor: crosshair; }
+.chart-wrap.panning { cursor: grabbing; }
+.chart-wrap.panning .chart-hint { opacity: 0; }
+
+/* ============================================================
+   거래 내역 표 정렬
+   ============================================================ */
+thead th.sortable { padding: 0; }
+thead th.sortable .th-btn {
+  display: flex; align-items: center; gap: 3px; width: 100%;
+  padding: 7px 10px; font: inherit; color: inherit; text-align: inherit;
+  justify-content: flex-end; white-space: nowrap;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+thead th.sortable.l .th-btn { justify-content: flex-start; }
+thead th.sortable .th-btn:hover { color: var(--tx); background: var(--bg-2); }
+thead th.sortable .th-arrow { opacity: 0; flex: 0 0 9px; transition: opacity var(--dur) var(--ease); }
+thead th.sortable .th-btn:hover .th-arrow { opacity: .45; }
+thead th.sortable[aria-sort="ascending"] .th-arrow,
+thead th.sortable[aria-sort="descending"] .th-arrow { opacity: 1; color: var(--accent); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color: var(--tx); }
+
+/* 같은 진입 그룹(부분 청산)을 세로선으로 묶는다 */
+td.grp { position: relative; }
+.grp-badge {
+  display: inline-block; margin-left: 5px; padding: 0 4px; border-radius: 3px;
+  background: var(--bg-3); color: var(--tx-sub);
+  font-family: var(--mono); font-size: 9px; font-weight: 700; vertical-align: 1px;
+}
+tr.grp-mid td.grp::before, tr.grp-last td.grp::before {
+  content: ""; position: absolute; left: 3px; top: -1px; height: 50%;
+  border-left: 2px solid var(--accent-bd);
+}
+tr.grp-first td.grp::after, tr.grp-mid td.grp::after {
+  content: ""; position: absolute; left: 3px; bottom: -1px; height: 50%;
+  border-left: 2px solid var(--accent-bd);
+}

@@ -63,6 +63,10 @@ function setAutoSyncEnabled(on) {
 }
 
 /** 조회 기간 계산. months=0 이면 전체. */
+/** 한 달에 들어가는 대략적인 영업일 수 (기간 버튼 → 봉 수 환산) */
+const BARS_PER_MONTH = 21;
+
+/** (폴백 mockdata 전용) 조회 기간 계산. 실서버에는 start/end 를 보내지 않는다. */
 function rangeParams() {
   const endStr = (S.status && S.status.latest_trade_date) || isoOf(new Date());
   if (!S.rangeMonths) {
@@ -697,11 +701,27 @@ function newStrategy() {
    5. 차트 · 종목 검색
    ============================================================ */
 
+/** 기간 버튼(3M/6M/1Y/전체) → 보여 줄 봉 수. 0 이면 전체. */
+function rangeBars() {
+  return S.rangeMonths ? Math.round(S.rangeMonths * BARS_PER_MONTH) : 0;
+}
+
+/** 데이터를 다시 받지 않고 뷰포트만 기간 버튼에 맞춘다 */
+function applyRangeViewport() {
+  if (!S.chart || !S.chart.hasData()) return;
+  const bars = rangeBars();
+  if (!bars) S.chart.fitAll(false);
+  else S.chart.showLast(bars, false);
+}
+
+/**
+ * 차트 로드.
+ * 종목의 **가용 전체 구간**을 받고, 기간 버튼은 뷰포트만 바꾼다.
+ * (선택 기간만 받으면 로드된 봉 수 == 보이는 봉 수가 되어 좌우로 이동할 데이터가 없다)
+ */
 async function loadChart(o = {}) {
   if (!S.chart) return;
-  const r = rangeParams();
   const code = o.code || S.symbol.code || firstTradeCode() || '';
-  const start = o.start || r.start, end = o.end || r.end, n = o.n || r.n;
   $('chartNote').hidden = true;
   $('chartWrap').classList.remove('has-note');
 
@@ -742,8 +762,11 @@ async function loadChart(o = {}) {
     desc: code ? `${code} 의 시세를 받고 있습니다.` : '표시할 종목을 고르는 중입니다.',
   });
   try {
+    // start/end 를 보내지 않는다 = 상장 이후 전체 히스토리.
+    // 기간 버튼은 데이터 재요청이 아니라 뷰포트 변경으로 처리한다.
     const payload = await api.getChart({
-      code, start, end, n,
+      code,
+      n: 4000,                    // 폴백 mockdata 전용 (실서버는 이 값을 쓰지 않는다)
       indicators: S.active.map((a) => a.key),
       run_id: S.result ? S.result.run_id : undefined,
     });
@@ -751,6 +774,7 @@ async function loadChart(o = {}) {
     $('symCode').textContent = S.symbol.code || '—';
     $('symName').textContent = S.symbol.name || '이름 없음';
     S.chart.setData(payload, S.active);
+    applyRangeViewport();         // 전체를 들고 있되 보이는 구간만 기간 버튼에 맞춘다
 
     if (payload && payload.n) {
       $('chartEmpty').hidden = true;
@@ -900,11 +924,9 @@ async function gotoTrade(no) {
     && indexOfDate(d0.t, span.to) >= 0;
 
   if (!covered) {
-    // await 필수 — 기다리지 않으면 새 데이터가 도착하며 setHighlight 가 지워진다
-    const start = shiftMonths(span.from, -2);
-    const end = shiftMonths(span.to, 2);
-    const days = Math.max(40, Math.round((ymdDate(end) - ymdDate(start)) / 86400000 * 0.69));
-    await loadChart({ code: t.code, name: t.name, start, end, n: days });
+    // 종목이 다르면 그 종목의 전체 히스토리를 새로 받는다.
+    // await 필수 — 기다리지 않으면 새 데이터가 도착하며 setHighlight 가 지워진다.
+    await loadChart({ code: t.code, name: t.name });
   }
   focusTrade(t);
 }
@@ -934,11 +956,16 @@ function stepTrade(dir) {
   gotoTrade(trades[idx].no);
 }
 
+/**
+ * 기간 버튼. 데이터를 다시 받지 않고 뷰포트만 바꾼다.
+ * (전체 히스토리를 이미 들고 있으므로 재요청이 필요 없다)
+ */
 function setRange(months) {
   S.rangeMonths = months;
   for (const b of $('rangeSeg').querySelectorAll('button')) {
     b.setAttribute('aria-pressed', String(Number(b.dataset.months) === months));
   }
+  if (S.chart && S.chart.hasData()) { applyRangeViewport(); return Promise.resolve(); }
   return loadChart();
 }
 
