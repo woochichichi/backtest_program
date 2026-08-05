@@ -772,9 +772,13 @@ export class CandleChart {
     ctx.save();
     ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
     ctx.font = 'bold 10px ' + MONO;
+    // 화면 왼쪽 밖으로 한 화면 이상 지난 기준선은 그리지 않는다.
+    // (과거를 이어붙일수록 옛날 기준선이 쌓여 화면이 어지러워진다)
+    const staleBefore = this.i0 - (this.i1 - this.i0);
     for (const lv of this.d.levels) {
       const p = +lv.price;
       if (!Number.isFinite(p)) continue;
+      if ((lv.from | 0) < staleBefore || (lv.from | 0) >= this.i1) continue;
       const y = g.Y(p);
       if (y < g.priceY - 2 || y > g.priceY + g.priceH + 2) continue;
       const from = Math.max(this.i0, lv.from | 0);
