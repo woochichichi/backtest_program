@@ -310,9 +310,18 @@ def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
 
 
 def _eligible_codes(panel: pd.DataFrame, universe: Mapping,
-                    filters: Mapping | None = None) -> Tuple[pd.Index, dict]:
+                    filters: Mapping | None = None,
+                    beat: Optional[Callable[[str], None]] = None) -> Tuple[pd.Index, dict]:
     """시장 / 제외 조건 / universe.filters 를 종목 단위로 적용한다 (각 종목의 최신 행 기준)."""
-    last = panel.drop_duplicates("Code", keep="last")
+    def _b(msg: str) -> None:
+        if beat is not None:
+            beat(msg)
+
+    _b("종목별 최신 시세 추리는 중")
+    dup = panel["Code"].duplicated(keep="last")
+    _b("종목 목록 만드는 중")
+    last = panel.loc[~dup]
+    _b("종목 선정 조건 확인 중")
     stats = {"total": int(len(last))}
     keep = pd.Series(True, index=last.index)
 
@@ -797,9 +806,11 @@ def run_backtest(
                  f"{year}년 데이터 읽는 중 ({min(int(idx) + 1, total)}/{total}년)",
                  PHASE_LOAD)
 
+    want_cols = ["Date", "Code", "Name", "Market", "MarketId", "Dept",
+                 "Open", "High", "Low", "Close", "Volume", "Amount", "Marcap"]
     try:
-        panel = store.panel(hist_start, end, on_year=_on_year)
-    except TypeError:                       # 구버전 store (on_year 미지원)
+        panel = store.panel(hist_start, end, columns=want_cols, on_year=_on_year)
+    except TypeError:                       # 구버전 store (columns/on_year 미지원)
         panel = store.panel(hist_start, end)
     rep.check(force=True)
     report(17, "종목 목록 정리 중", PHASE_LOAD)
@@ -817,14 +828,19 @@ def run_backtest(
     if not calendar:
         raise DataUnavailable(f"{start} ~ {end} 구간에 거래일이 없습니다")
 
-    codes, ustats = _eligible_codes(panel, universe, applied_filters)
+    def _load_beat(msg: str) -> None:
+        rep.check(force=True)
+        rep.emit(18, msg, PHASE_LOAD, force=True)
+
+    codes, ustats = _eligible_codes(panel, universe, applied_filters, beat=_load_beat)
     if len(codes) == 0:
         return _empty_result(
             run_id, t0, warnings, sig, calendar, initial_capital, start, end,
             "종목 선정 조건(시장·제외·filters)을 만족하는 종목이 없습니다.", make_assumptions(),
         )
-    if len(codes) < ustats["total"]:
-        panel = panel[panel["Code"].isin(codes)]
+    # 700만 행 패널을 복사하지 않는다 (수 초가 걸리고 중단할 수 없다).
+    # 제외 종목은 기준일 이벤트 단계에서 걸러낸다.
+    eligible = set(codes) if len(codes) < ustats["total"] else None
     rep.check(force=True)
 
     sig.add(
@@ -849,17 +865,21 @@ def run_backtest(
             "기준일 조건을 만족하는 종목이 없습니다.", make_assumptions(),
         )
 
+    if eligible is not None and not events.empty:
+        events = events[events["Code"].isin(eligible)]
+        rep.check(force=True)
+        if events.empty:
+            return _empty_result(
+                run_id, t0, warnings, sig, calendar, initial_capital, start, end,
+                "기준일 조건을 만족하는 종목이 없습니다.", make_assumptions(),
+            )
     cand_codes = pd.Index(events["Code"].unique())
     report(20, f"후보 {len(cand_codes):,}종목")
 
     # ---------------------------------------------------------------- 후보 종목 봉 준비
-    sub = panel[panel["Code"].isin(cand_codes)]
     recs: Dict[str, dict] = {}
     _n_cand = len(cand_codes)
-    for _j, (code, gdf) in enumerate(sub.groupby("Code", sort=False)):
-        if (_j & 7) == 0:
-            rep.tick(20 + 5.0 * _j / max(_n_cand, 1),
-                     f"후보 종목 준비 중 ({_j:,}/{_n_cand:,})", PHASE_SCAN)
+    for _j, (code, gdf) in enumerate(_iter_candidate_bars(panel, cand_codes, rep, _n_cand)):
         gdf = gdf.sort_values("Date", kind="stable")
         df = gdf.set_index("Date")[[c for c in _PRICE_COLS if c in gdf.columns]]
         recs[code] = {
@@ -1285,6 +1305,39 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
         notes.append(ig["message"])
     notes.append("미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).")
     return [n for n in notes if n]
+
+
+#: 후보 종목을 한 번에 몇 개씩 잘라 처리할지. groupby 한 번이 1초를 넘지 않도록 잡는다.
+CANDIDATE_BATCH = 150
+
+
+def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
+    """후보 종목의 일봉을 ``(code, DataFrame)`` 으로 흘려보낸다.
+
+    700만 행짜리 패널에 groupby 를 한 번에 걸면 첫 그룹이 나오기까지 10초 가까이 걸리고
+    그 사이 취소를 못 받는다. 후보를 배치로 잘라 각 단계가 1초를 넘지 않게 한다.
+    """
+    cols = [c for c in (["Date", "Code", "Name"] + _PRICE_COLS) if c in panel.columns]
+    rep.tick(20, "후보 종목 데이터 준비 중", PHASE_SCAN)
+    narrow = panel[cols]
+    rep.tick(20, f"후보 종목 데이터 준비 중 (0/{total:,})", PHASE_SCAN)
+
+    codes = list(cand_codes)
+    done = 0
+    for i in range(0, len(codes), CANDIDATE_BATCH):
+        batch = set(codes[i:i + CANDIDATE_BATCH])
+        rep.tick(20 + 5.0 * done / max(total, 1),
+                 f"후보 종목 데이터 준비 중 ({done:,}/{total:,})", PHASE_SCAN)
+        mask = narrow["Code"].isin(batch)
+        rep.check(force=True)
+        part = narrow[mask]
+        rep.check(force=True)
+        for code, gdf in part.groupby("Code", sort=False):
+            done += 1
+            if (done & 15) == 0:
+                rep.tick(20 + 5.0 * done / max(total, 1),
+                         f"후보 종목 데이터 준비 중 ({done:,}/{total:,})", PHASE_SCAN)
+            yield code, gdf
 
 
 def _order_exits(exits: Sequence[Mapping], priority: Sequence[str]) -> List[Mapping]:

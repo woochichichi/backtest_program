@@ -108,6 +108,10 @@ class MarcapStore:
     #: parquet 를 나눠 읽는 단위 (행). 취소 확인 간격을 짧게 유지하기 위한 값.
     CHUNK_ROWS = 250_000
 
+    #: 이 행 수를 넘는 패널은 feather 캐시를 만들지 않는다.
+    #: 연도 단위 메모리 캐시로 이미 재사용되고, 쓰기가 수 초씩 걸려 취소를 막는다.
+    CACHE_MAX_ROWS = 1_500_000
+
     def load_year(self, year: int, columns: Sequence[str] | None = None,
                   on_chunk: Optional[Callable[[float], None]] = None) -> pd.DataFrame:
         """한 해치 parquet 를 읽어 정규화된 DataFrame 으로 돌려준다 (Date 는 컬럼).
@@ -120,13 +124,19 @@ class MarcapStore:
         path = files.get(int(year))
         if path is None:
             raise DataUnavailable(f"{year}년 marcap 파일이 없습니다: {self.data_dir}")
-        cached = self._years.get(int(year))
+        ckey = (int(year), tuple(sorted(columns)) if columns else None)
+        cached = self._years.get(ckey)
+        if cached is None and columns:
+            full = self._years.get((int(year), None))
+            if full is not None:
+                keep = [c for c in full.columns if c in set(columns) | {"Date", "Code"}]
+                cached = full[keep]
         if cached is not None:
             if on_chunk is not None:
                 on_chunk(1.0)
             return cached
         try:
-            df = self._read_parquet(path, on_chunk)
+            df = self._read_parquet(path, on_chunk, columns)
         except DataUnavailable:
             raise
         except Exception as e:
@@ -134,34 +144,42 @@ class MarcapStore:
                 raise           # 콜백이 던진 취소 예외는 그대로 올린다
             raise DataUnavailable(f"{path} 를 읽을 수 없습니다: {e}") from e
         df = self._normalize(df, on_chunk)
-        self._years[int(year)] = df
+        self._years[ckey] = df
         return df
 
     def _read_parquet(self, path: Path,
-                      on_chunk: Optional[Callable[[float], None]]) -> pd.DataFrame:
-        """행 묶음 단위로 나눠 읽는다 (취소 확인 지점을 파일 내부에도 만들기 위해)."""
+                      on_chunk: Optional[Callable[[float], None]],
+                      columns: Sequence[str] | None = None) -> pd.DataFrame:
+        """행 묶음 단위로 나눠 읽는다 (취소 확인 지점을 파일 내부에도 만들기 위해).
+
+        ``columns`` 를 주면 그 컬럼만 읽는다 — 읽기·concat 비용이 크게 줄어든다.
+        """
+        cols = list(columns) if columns else None
         if on_chunk is None:
-            return pd.read_parquet(path)
+            return pd.read_parquet(path, columns=cols)
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError:  # pragma: no cover
             on_chunk(0.0)
-            out = pd.read_parquet(path)
+            out = pd.read_parquet(path, columns=cols)
             on_chunk(0.9)
             return out
 
         pf = pq.ParquetFile(path)
+        if cols:
+            have = set(pf.schema_arrow.names)
+            cols = [c for c in cols if c in have] or None
         total = max(int(pf.metadata.num_rows), 1)
         batches = []
         done = 0
         on_chunk(0.0)
-        for batch in pf.iter_batches(batch_size=self.CHUNK_ROWS):
+        for batch in pf.iter_batches(batch_size=self.CHUNK_ROWS, columns=cols):
             batches.append(batch)
             done += batch.num_rows
             on_chunk(min(0.9 * done / total, 0.9))
         if not batches:
-            return pd.read_parquet(path)
+            return pd.read_parquet(path, columns=cols)
         return pa.Table.from_batches(batches).to_pandas()
 
     @staticmethod
@@ -349,10 +367,10 @@ class MarcapStore:
             if on_year is not None:
                 def sub_cb(frac, _i=i, _n=len(years), _y=y):   # noqa: F811
                     on_year(_i + frac, _n, _y)
-            df = self.load_year(y, on_chunk=sub_cb)
+            df = self.load_year(y, columns=cols, on_chunk=sub_cb)
             if on_year is not None:
                 on_year(i + 1.0, len(years), y)
-            if cols is not None:
+            if cols is not None and len(df.columns) != len(cols):
                 keep = [c for c in cols if c in df.columns]
                 df = df[keep]
             m = (df["Date"] >= pd.Timestamp(s)) & (df["Date"] <= pd.Timestamp(e))
@@ -360,16 +378,32 @@ class MarcapStore:
                 frames.append(df.loc[m])
         if not frames:
             raise DataUnavailable(f"{s} ~ {e} 구간에 데이터가 없습니다")
-        if on_year is not None:
-            on_year(len(years), len(years), years[-1] if years else 0)
-        out = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0].reset_index(drop=True)
+        last_year = years[-1] if years else 0
 
-        if use_cache and columns is None:
+        def beat(msg_idx: float) -> None:
+            if on_year is not None:
+                on_year(len(years) + msg_idx, len(years), last_year)
+
+        beat(0.0)
+        if len(frames) == 1:
+            out = frames[0].reset_index(drop=True)
+        else:
+            # 한 번에 concat 하면 수 초가 걸리고 그 사이 취소를 못 받는다. 묶어서 이어붙인다.
+            step = max(1, len(frames) // 4)
+            partial = []
+            for i in range(0, len(frames), step):
+                partial.append(pd.concat(frames[i:i + step], ignore_index=True))
+                beat(0.1)
+            out = pd.concat(partial, ignore_index=True) if len(partial) > 1 else partial[0]
+        beat(0.2)
+
+        if use_cache and columns is None and len(out) <= self.CACHE_MAX_ROWS:
             try:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 out.to_feather(cache_path)
             except Exception:  # pragma: no cover - 캐시 실패는 치명적이지 않다
                 pass
+        beat(0.3)
         return out
 
     def bars(self, code: str, start=None, end=None) -> pd.DataFrame:

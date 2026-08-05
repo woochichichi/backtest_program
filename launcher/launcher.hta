@@ -1,0 +1,149 @@
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>KRX 백테스터</title>
+<hta:application
+  id="oHTA"
+  applicationname="KRXBacktesterLauncher"
+  border="thin"
+  borderstyle="normal"
+  caption="yes"
+  contextmenu="no"
+  icon="../assets/krx.ico"
+  innerborder="no"
+  maximizebutton="no"
+  minimizebutton="yes"
+  navigable="no"
+  scroll="no"
+  selection="no"
+  showintaskbar="yes"
+  singleinstance="yes"
+  sysmenu="yes"
+  windowstate="normal" />
+<link rel="stylesheet" type="text/css" href="launcher.css">
+</head>
+<body>
+
+<div id="sky">
+  <div id="glow"></div>
+  <div id="glow2"></div>
+  <div id="candles"></div>
+  <div id="trend"></div>
+</div>
+
+<div id="app">
+
+  <div id="head">
+    <img id="logo" src="../assets/krx.png" alt="">
+    <div id="htitle">KRX 백테스터</div>
+    <div id="hsub">시작할 준비를 하고 있습니다</div>
+  </div>
+
+  <div id="steps">
+    <div class="step is-wait" id="s0">
+      <div class="mk">
+        <div class="mk-idle"></div>
+        <div class="mk-spin"></div>
+        <div class="mk-done"><i></i></div>
+        <div class="mk-fail">!</div>
+        <div class="mk-skip"><i></i></div>
+      </div>
+      <div class="stt">프로그램 업데이트</div>
+      <div class="sts">대기 중</div>
+    </div>
+    <div class="step is-wait" id="s1">
+      <div class="mk">
+        <div class="mk-idle"></div>
+        <div class="mk-spin"></div>
+        <div class="mk-done"><i></i></div>
+        <div class="mk-fail">!</div>
+        <div class="mk-skip"><i></i></div>
+      </div>
+      <div class="stt">시세 데이터</div>
+      <div class="sts">대기 중</div>
+    </div>
+    <div class="step is-wait" id="s2">
+      <div class="mk">
+        <div class="mk-idle"></div>
+        <div class="mk-spin"></div>
+        <div class="mk-done"><i></i></div>
+        <div class="mk-fail">!</div>
+        <div class="mk-skip"><i></i></div>
+      </div>
+      <div class="stt">서버 시작</div>
+      <div class="sts">대기 중</div>
+    </div>
+    <div class="step is-wait" id="s3">
+      <div class="mk">
+        <div class="mk-idle"></div>
+        <div class="mk-spin"></div>
+        <div class="mk-done"><i></i></div>
+        <div class="mk-fail">!</div>
+        <div class="mk-skip"><i></i></div>
+      </div>
+      <div class="stt">화면 열기</div>
+      <div class="sts">대기 중</div>
+    </div>
+  </div>
+
+  <div id="logbox">
+    <div class="lg" id="lg0">&nbsp;</div>
+    <div class="lg l2" id="lg1">&nbsp;</div>
+    <div class="lg l3" id="lg2">&nbsp;</div>
+  </div>
+
+  <div id="barwrap"><div id="bar"></div></div>
+
+  <div id="foot">
+    <div id="fnote">잠시만 기다려 주세요</div>
+    <div id="fbtns">
+      <button type="button" id="btnCancel">취소</button>
+    </div>
+    <a class="lnk" id="frecheck" title="신선도 판정을 무시하고 전부 다시 받습니다">전부 다시 확인</a>
+  </div>
+
+</div>
+
+<div class="ov" id="ovAsk">
+  <div class="ovin">
+    <div class="ovt">시세 데이터가 아직 없습니다</div>
+    <div class="ovb">
+      백테스트에 쓸 주가 데이터를 한 번은 받아야 합니다.<br>
+      크기가 <b>약 1.8GB</b> 라 <b>10~30분</b> 걸립니다. 한 번만 받으면 됩니다.<br>
+      나중에 받으려면 <b>update_marcap.bat</b> 을 더블클릭하세요.
+    </div>
+    <div class="ovf">
+      <button type="button" id="askNo">나중에 하기</button>
+      <button type="button" class="pri" id="askYes">지금 받기</button>
+    </div>
+  </div>
+</div>
+
+<div class="ov" id="ovRun">
+  <div class="ovin">
+    <div class="ovt">이미 실행 중입니다</div>
+    <div class="ovb" id="runMsg">
+      KRX 백테스터가 켜져 있습니다.<br>
+      무엇을 할까요?
+    </div>
+    <div class="ovf">
+      <button type="button" id="runClose">닫기</button>
+      <button type="button" class="dgr" id="runStop">프로그램 종료</button>
+      <button type="button" class="pri" id="runOpen">브라우저 다시 열기</button>
+    </div>
+  </div>
+</div>
+
+<div class="ov" id="ovDone">
+  <div class="ovin">
+    <div id="bigck"><i></i></div>
+    <div id="dtitle">준비 완료</div>
+    <div id="dsum">브라우저를 엽니다</div>
+  </div>
+</div>
+
+<script type="text/javascript" charset="utf-8" src="launcher.js"></script>
+
+</body>
+</html>

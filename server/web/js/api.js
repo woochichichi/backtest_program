@@ -369,14 +369,20 @@ export async function cancelBacktest(jobId) {
  * 호출부가 클라이언트에서 직접 default 를 적용한다.
  * @returns {Promise<object|null>} 되돌린 전략, 미지원이면 null
  */
+let resetUnsupported = false;   // 서버에 reset 이 없다는 걸 한 번 확인하면 다시 찌르지 않는다
+
 export async function resetStrategy(id) {
-  if (fallback) return null;
-  // 서버가 이 기능을 알리지 않으면 호출하지 않는다. 호출부가 클라이언트에서 default 를 적용한다.
-  if (!hasFeature('strategy_reset', false)) return null;
+  if (fallback || resetUnsupported) return null;
+  // features 에 명시적으로 false 라고 적혀 있으면 아예 호출하지 않는다.
+  if (!hasFeature('strategy_reset', true)) { resetUnsupported = true; return null; }
   try {
     return await request(`/strategies/${encodeURIComponent(id)}/reset`, { method: 'POST' }, 20000);
   } catch (e) {
-    if (e instanceof ApiError && (e.status === 404 || e.status === 501 || e.status === 405)) return null;
+    // 아직 구현하지 않은 서버 → 이번 세션 동안은 클라이언트 폴백만 쓴다
+    if (e instanceof ApiError && (e.status === 404 || e.status === 501 || e.status === 405)) {
+      resetUnsupported = true;
+      return null;
+    }
     throw e;
   }
 }

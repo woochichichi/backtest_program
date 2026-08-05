@@ -758,8 +758,8 @@ pre.code .sk-line { margin: 6px 0; }
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 12px;
   background: var(--warn-soft); border: 1px solid var(--warn);
-  color: var(--tx); font-size: 11px; white-space: nowrap;
-  max-width: 62%; overflow: hidden; text-overflow: ellipsis;
+  color: var(--tx); font-size: 11px; line-height: 1.45;
+  max-width: min(92%, 460px); text-align: left;
 }
 .chart-note svg { flex: 0 0 auto; }
 /* 알림이 떠 있으면 좌상단 범례를 아래로 내려 겹치지 않게 한다 */
