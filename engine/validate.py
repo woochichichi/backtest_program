@@ -12,7 +12,9 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, List, Mapping, Sequence, Tuple
 
+from .errors import PathError
 from .indicators import REGISTRY, SOURCE_OPTIONS
+from .params import PARAM_TYPES, collect_params, get_by_path
 
 __all__ = ["validate_strategy", "SCHEMA_ID"]
 
@@ -20,7 +22,7 @@ SCHEMA_ID = "krx-backtest-strategy/v1"
 
 _MARKETS = {"KOSPI", "KOSDAQ", "KONEX"}
 _EXCLUDES = {"ETF", "ETN", "SPAC", "PREFERRED", "ADMIN_ISSUE", "TRADE_HALT", "REIT", "WARRANT"}
-_REF_RULES = {"amount_spike", "volume_spike", "range_breakout", "none"}
+_REF_RULES = {"amount_spike", "volume_spike", "range_breakout", "custom", "none"}
 _CONDITIONS = {
     "close_below_reference_open",
     "close_below_reference_low",
@@ -38,8 +40,16 @@ _BARS = {"1d"}
 _CMP_OPS = {">", ">=", "<", "<=", "==", "!=", "cross_above", "cross_below"}
 _LOGIC_OPS = {"and", "or", "not"}
 
-_BAR_FIELDS = {"open", "high", "low", "close", "volume", "amount"}
-_REF_FIELDS = {"open", "high", "low", "close", "volume", "amount"}
+_BAR_FIELDS = {"open", "high", "low", "close", "volume", "amount", "marcap"}
+_REF_FIELDS = {"open", "high", "low", "close", "volume", "amount", "marcap"}
+_ENTRY_FIELDS = _REF_FIELDS | {"price", "qty"}
+
+#: universe.filters 중 엔진이 실제로 적용할 수 있는 키
+SUPPORTED_FILTERS = {
+    "market_cap_min_eok", "market_cap_max_eok",
+    "price_min", "price_max",
+    "amount_min_eok", "volume_min",
+}
 _POS_FIELDS = {
     "avg_price", "qty", "pnl_pct", "pnl", "hold_days", "cost", "peak_price", "entry_price",
 }
@@ -125,7 +135,8 @@ def _isdate(v) -> bool:
 # --------------------------------------------------------------------------------------
 
 
-def _check_operand(op: Any, path: str, err: _Errors, known_ids: set, *, allow_position=True):
+def _check_operand(op: Any, path: str, err: _Errors, known_ids: set, *,
+                   allow_position=True, allow_entry=False):
     if op is None:
         err.add(path, "피연산자가 없습니다")
         return
@@ -135,7 +146,8 @@ def _check_operand(op: Any, path: str, err: _Errors, known_ids: set, *, allow_po
     if isinstance(op, (int, float)):
         return
     if isinstance(op, str):
-        _check_reference(op, path, err, known_ids, allow_position=allow_position)
+        _check_reference(op, path, err, known_ids,
+                        allow_position=allow_position, allow_entry=allow_entry)
         return
     if isinstance(op, Mapping):
         if "indicator" in op:
@@ -152,7 +164,8 @@ def _check_operand(op: Any, path: str, err: _Errors, known_ids: set, *, allow_po
     err.add(path, f"알 수 없는 피연산자 타입: {type(op).__name__}")
 
 
-def _check_reference(s: str, path: str, err: _Errors, known_ids: set, *, allow_position=True):
+def _check_reference(s: str, path: str, err: _Errors, known_ids: set, *,
+                     allow_position=True, allow_entry=False):
     name = s.strip()
     try:
         float(name)
@@ -167,6 +180,17 @@ def _check_reference(s: str, path: str, err: _Errors, known_ids: set, *, allow_p
         return
     head, rest = name.split(".", 1)
     head = head.lower()
+    if head == "prev":
+        _check_reference(rest, path, err, known_ids,
+                        allow_position=False, allow_entry=False)
+        return
+    if head == "entry":
+        if not allow_entry:
+            err.add(path, "entry.* 는 청산 규칙에서만 쓸 수 있습니다 (진입 전에는 값이 없습니다)")
+            return
+        if rest.lower() not in _ENTRY_FIELDS:
+            err.add(path, f"알 수 없는 진입봉 필드: {name}")
+        return
     if head == "ref":
         if rest.lower() not in _REF_FIELDS:
             err.add(path, f"알 수 없는 기준일 필드: {name}")
@@ -215,7 +239,7 @@ def _check_indicator(spec: Mapping, path: str, err: _Errors):
 
 
 def _check_condition(node: Any, path: str, err: _Errors, known_ids: set,
-                     *, allow_position=True, depth=0):
+                     *, allow_position=True, allow_entry=False, depth=0):
     if node is None:
         return
     if depth > 12:
@@ -236,7 +260,8 @@ def _check_condition(node: Any, path: str, err: _Errors, known_ids: set,
             return
         for i, c in enumerate(conds):
             _check_condition(c, f"{path}.conditions[{i}]", err, known_ids,
-                             allow_position=allow_position, depth=depth + 1)
+                             allow_position=allow_position, allow_entry=allow_entry,
+                             depth=depth + 1)
         return
     if o == "not":
         inner = node.get("condition")
@@ -244,7 +269,8 @@ def _check_condition(node: Any, path: str, err: _Errors, known_ids: set,
             err.add(f"{path}.condition", "not 은 condition 이 필요합니다")
             return
         _check_condition(inner, f"{path}.condition", err, known_ids,
-                         allow_position=allow_position, depth=depth + 1)
+                         allow_position=allow_position, allow_entry=allow_entry,
+                         depth=depth + 1)
         return
     if o not in _CMP_OPS:
         err.add(f"{path}.op", f"알 수 없는 op: {op} (가능: {sorted(_CMP_OPS | _LOGIC_OPS)})")
@@ -252,11 +278,13 @@ def _check_condition(node: Any, path: str, err: _Errors, known_ids: set,
     if "left" not in node:
         err.add(f"{path}.left", "필수 항목이 없습니다")
     else:
-        _check_operand(node["left"], f"{path}.left", err, known_ids, allow_position=allow_position)
+        _check_operand(node["left"], f"{path}.left", err, known_ids,
+                      allow_position=allow_position, allow_entry=allow_entry)
     if "right" not in node:
         err.add(f"{path}.right", "필수 항목이 없습니다")
     else:
-        _check_operand(node["right"], f"{path}.right", err, known_ids, allow_position=allow_position)
+        _check_operand(node["right"], f"{path}.right", err, known_ids,
+                      allow_position=allow_position, allow_entry=allow_entry)
 
 
 # --------------------------------------------------------------------------------------
@@ -318,6 +346,17 @@ def _check_universe(obj: Mapping, err: _Errors):
             _num(rd, "volume_ma_period", "universe.reference_day", err, minimum=1)
         elif rule == "range_breakout":
             _num(rd, "breakout_period", "universe.reference_day", err, minimum=1)
+        elif rule == "custom":
+            if rd.get("when") is None:
+                err.add("universe.reference_day.when",
+                        'rule="custom" 은 when 조건식이 필요합니다')
+            else:
+                _check_condition(rd["when"], "universe.reference_day.when", err, set(),
+                                 allow_position=False, allow_entry=False)
+
+    filters = u.get("filters")
+    if filters is not None and not isinstance(filters, Mapping):
+        err.add("universe.filters", "객체여야 합니다")
 
     cond = u.get("condition", "none")
     _enum(cond, _CONDITIONS, "universe.condition", err, "condition")
@@ -392,8 +431,10 @@ def _check_rule(r: Any, path: str, err: _Errors, ids: set, *, is_exit: bool):
             _enum(t, _EXIT_TYPES, f"{path}.type", err, "청산 타입")
         if t == "trailing_stop" and "trail_pct" not in r and r.get("when") is None:
             err.add(f"{path}.trail_pct", "trailing_stop 은 trail_pct 또는 when 이 필요합니다")
-        if t == "time_exit" and "max_hold_days" not in r and r.get("when") is None:
-            err.add(f"{path}.max_hold_days", "time_exit 은 max_hold_days 또는 when 이 필요합니다")
+        if (t == "time_exit" and r.get("when") is None
+                and "max_hold_days" not in r and "hold_days" not in r):
+            err.add(f"{path}.max_hold_days",
+                    "time_exit 은 max_hold_days(또는 hold_days) 또는 when 이 필요합니다")
 
     when = r.get("when")
     if when is None:
@@ -402,10 +443,12 @@ def _check_rule(r: Any, path: str, err: _Errors, ids: set, *, is_exit: bool):
         elif r.get("type") not in ("trailing_stop", "time_exit"):
             err.add(f"{path}.when", "청산 규칙에는 when 또는 type(trailing_stop/time_exit)이 필요합니다")
     else:
-        _check_condition(when, f"{path}.when", err, ids, allow_position=is_exit)
+        _check_condition(when, f"{path}.when", err, ids,
+                         allow_position=is_exit, allow_entry=is_exit)
 
     if "price" in r and r["price"] is not None:
-        _check_operand(r["price"], f"{path}.price", err, ids, allow_position=is_exit)
+        _check_operand(r["price"], f"{path}.price", err, ids,
+                      allow_position=is_exit, allow_entry=is_exit)
 
     _num(r, "size_pct", path, err, minimum=0, maximum=100)
     so = r.get("size_of")
@@ -500,6 +543,53 @@ def _check_indicators(obj: Mapping, err: _Errors):
 # --------------------------------------------------------------------------------------
 
 
+def _check_params(obj: Mapping, err: _Errors):
+    """``params`` 는 UI 메타데이터다. 여기서는 형식과 **path 존재 여부**만 본다."""
+    raw = obj.get("params")
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        err.add("params", "배열이어야 합니다")
+        return
+    seen: set = set()
+    for i, p in enumerate(raw):
+        path = f"params[{i}]"
+        if not isinstance(p, Mapping):
+            err.add(path, f"객체여야 합니다 (현재 {type(p).__name__})")
+            continue
+        for key in ("key", "label", "group", "path", "type"):
+            v = p.get(key)
+            if not isinstance(v, str) or not v.strip():
+                err.add(f"{path}.{key}", "비어 있지 않은 문자열이어야 합니다")
+        if isinstance(p.get("key"), str):
+            if p["key"] in seen:
+                err.add(f"{path}.key", f"중복된 key: {p['key']}")
+            seen.add(p["key"])
+        if isinstance(p.get("type"), str):
+            _enum(p["type"], set(PARAM_TYPES), f"{path}.type", err, "type")
+        if "default" not in p:
+            err.add(f"{path}.default", "필수 항목이 없습니다 (초기화 버튼이 되돌릴 값)")
+        if "available" in p and not isinstance(p["available"], bool):
+            err.add(f"{path}.available", "불리언이어야 합니다")
+        if p.get("available") is False and not p.get("unavailable_reason"):
+            err.add(f"{path}.unavailable_reason",
+                    "available:false 항목은 사용자에게 보여줄 이유가 필요합니다")
+        if p.get("type") == "select" and not isinstance(p.get("options"), list):
+            err.add(f"{path}.options", "type=select 는 options 배열이 필요합니다")
+        for k in ("min", "max", "step"):
+            if k in p and p[k] is not None and (
+                isinstance(p[k], bool) or not isinstance(p[k], (int, float))
+            ):
+                err.add(f"{path}.{k}", "숫자여야 합니다")
+
+        raw_path = p.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            try:
+                get_by_path(obj, raw_path)
+            except PathError as e:
+                err.add(f"{path}.path", str(e))
+
+
 def validate_strategy(obj: Any) -> Tuple[bool, List[dict]]:
     """전략 DSL 을 검증한다.
 
@@ -536,6 +626,7 @@ def validate_strategy(obj: Any) -> Tuple[bool, List[dict]]:
 
     _check_market(obj, err)
     _check_universe(obj, err)
+    _check_params(obj, err)
     _check_rules(obj, err)
     _check_indicators(obj, err)
     _check_portfolio(obj, err)

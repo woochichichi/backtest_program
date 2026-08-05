@@ -30,10 +30,28 @@ class DSLError(EngineError):
     """조건식·수식 평가 실패."""
 
 
+class BacktestCancelled(EngineError):
+    """``should_cancel()`` 이 True 를 돌려줘 백테스트가 중단됐을 때.
+
+    서버는 이걸 오류가 아니라 "사용자 취소"로 처리한다 (ARCHITECTURE-v2 2-2).
+    """
+
+    def __init__(self, message: str = "사용자가 취소했습니다.", done: int = 0, phase: str | None = None):
+        super().__init__(message)
+        self.done = done
+        self.phase = phase
+
+
+class PathError(EngineError):
+    """``params[].path`` 가 가리키는 위치가 문서에 없을 때."""
+
+
 __all__ = [
     "EngineError",
     "DataUnavailable",
     "StrategyError",
     "IndicatorError",
     "DSLError",
+    "BacktestCancelled",
+    "PathError",
 ]

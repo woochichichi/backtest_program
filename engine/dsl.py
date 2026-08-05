@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .errors import DSLError
-from .indicators import compute, indicator_key, source_series
+from .indicators import compute, indicator_key, raw_column as _raw_column, source_series
 
 __all__ = [
     "EvalContext",
@@ -34,11 +34,15 @@ __all__ = [
     "LOGICAL_OPS",
 ]
 
-BAR_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+BAR_FIELDS = ("open", "high", "low", "close", "volume", "amount", "marcap")
 COMPARISON_OPS = (">", ">=", "<", "<=", "==", "!=", "cross_above", "cross_below")
 LOGICAL_OPS = ("and", "or", "not")
 
-_REF_FIELDS = ("open", "high", "low", "close", "volume", "amount", "date")
+#: ``ref.*`` / ``entry.*`` 로 참조 가능한 봉 필드 (ARCHITECTURE-v2 §3-2)
+BAR_REF_FIELDS = ("open", "high", "low", "close", "volume", "amount", "marcap", "date")
+
+_REF_FIELDS = BAR_REF_FIELDS
+_ENTRY_FIELDS = BAR_REF_FIELDS + ("price", "qty")
 _POSITION_FIELDS = (
     "avg_price",
     "qty",
@@ -75,7 +79,10 @@ class EvalContext:
         같은 종목 안에서 지표 계산 결과를 재사용하기 위한 캐시. 종목별로 하나 만들어 넘긴다.
     """
 
-    __slots__ = ("df", "ref", "fills", "position", "params", "_ind", "_bars", "n", "extra")
+    __slots__ = (
+        "df", "ref", "fills", "position", "params", "_ind", "_bars", "n",
+        "extra", "aliases", "entry",
+    )
 
     def __init__(
         self,
@@ -86,6 +93,8 @@ class EvalContext:
         params: Mapping[str, Any] | None = None,
         indicator_cache: Dict[str, Any] | None = None,
         extra: Mapping[str, Any] | None = None,
+        aliases: Mapping[str, Any] | None = None,
+        entry: Mapping[str, Any] | None = None,
     ):
         self.df = df
         self.ref = dict(ref or {})
@@ -95,6 +104,10 @@ class EvalContext:
         self._ind = indicator_cache if indicator_cache is not None else {}
         self._bars: Dict[str, np.ndarray] = {}
         self.extra = dict(extra or {})
+        #: strategy["indicators"] 의 ``key`` → 지표 스펙. 조건식/수식에서 이름으로 쓴다.
+        self.aliases = dict(aliases or {})
+        #: 진입이 체결된 봉의 값 (``entry.*``). 청산 규칙에서만 채워진다.
+        self.entry = dict(entry or {})
         self.n = int(len(df)) if df is not None else 0
 
     # -- 봉 필드 -----------------------------------------------------------------
@@ -102,7 +115,11 @@ class EvalContext:
         f = field.lower()
         arr = self._bars.get(f)
         if arr is None:
-            arr = source_series(self.df, f)
+            if f == "marcap":
+                # marcap parquet 의 Marcap 은 이미 '원' 단위다 (= Close × Stocks).
+                arr = _raw_column(self.df, "Marcap")
+            else:
+                arr = source_series(self.df, f)
             self._bars[f] = arr
         return arr
 
@@ -133,21 +150,42 @@ class EvalContext:
 
     # -- 이름 조회 ---------------------------------------------------------------
     def lookup(self, dotted: str):
-        """``"close"``, ``"ref.open"``, ``"fill.B1.price"``, ``"position.avg_price"``,
-        ``"trigger_pct"`` 를 값으로 바꾼다. 봉 필드/지표는 배열, 나머지는 스칼라."""
+        """``"close"``, ``"marcap"``, ``"prev.close"``, ``"ref.open"``, ``"entry.low"``,
+        ``"fill.B1.price"``, ``"position.avg_price"``, 지표 별칭(``"MA20"``),
+        규칙 파라미터(``"trigger_pct"``) 를 값으로 바꾼다.
+
+        봉 필드·지표·``prev.*`` 는 배열, 나머지는 스칼라다."""
         name = dotted.strip()
         low = name.lower()
 
         if low in BAR_FIELDS:
             return self.bar(low)
 
+        if name in self.aliases:
+            return self.indicator(self.aliases[name])
+
         if "." in name:
             head, rest = name.split(".", 1)
             head_l = head.lower()
+            if head_l == "prev":
+                return _shift1(_as_f64(self.lookup(rest)))
+            if head_l == "entry":
+                key = rest.lower()
+                if key not in _ENTRY_FIELDS:
+                    raise DSLError(f"알 수 없는 진입봉 필드: {name}")
+                if not self.entry:
+                    raise DSLError(
+                        f"진입 전에는 {name} 을(를) 참조할 수 없습니다 (entry.* 는 청산 규칙 전용)"
+                    )
+                if key not in self.entry:
+                    raise DSLError(f"진입봉에 {key} 값이 없습니다: {name}")
+                return _num(self.entry[key], name)
             if head_l == "ref":
                 key = rest.lower()
                 if key not in _REF_FIELDS:
                     raise DSLError(f"알 수 없는 기준일 필드: {name}")
+                if key == "date":
+                    raise DSLError("ref.date 는 수식에 쓸 수 없습니다")
                 if not self.ref:
                     raise DSLError(f"기준일이 없는데 {name} 을(를) 참조했습니다")
                 if key not in self.ref:
@@ -182,6 +220,13 @@ class EvalContext:
         if low in ("pi",):
             return math.pi
         raise DSLError(f"알 수 없는 이름: {name}")
+
+
+def _as_f64(v) -> np.ndarray:
+    """``prev.*`` 용 — 시계열만 허용한다."""
+    if isinstance(v, np.ndarray) and v.ndim == 1:
+        return v.astype("float64", copy=False)
+    raise DSLError("prev.* 는 시계열(봉 필드·지표)에만 쓸 수 있습니다")
 
 
 def _num(v, where: str) -> float:

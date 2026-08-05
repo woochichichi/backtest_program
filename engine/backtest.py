@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import math
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -20,12 +21,13 @@ import numpy as np
 import pandas as pd
 
 from .dsl import EvalContext, evaluate_condition, evaluate_operand
-from .errors import DataUnavailable, DSLError, StrategyError
+from .errors import BacktestCancelled, DataUnavailable, DSLError, StrategyError
 from .indicators import REGISTRY
 from .metrics import _i, build_equity, by_stock_summary, compute_metrics, monthly_returns
 from .validate import validate_strategy
 
-__all__ = ["run_backtest", "EOK", "SAME_DAY_EXIT_MODES", "DEFAULT_SAME_DAY_EXIT"]
+__all__ = ["run_backtest", "EOK", "SAME_DAY_EXIT_MODES", "DEFAULT_SAME_DAY_EXIT",
+           "SUPPORTED_FILTERS"]
 
 #: 1억
 EOK = 100_000_000.0
@@ -39,7 +41,16 @@ SAME_DAY_EXIT_MODES = ("loss_only", "never", "always")
 #: 기본값. 일봉만으로는 저가·고가 순서를 알 수 없으므로 보수적으로 잡는다.
 DEFAULT_SAME_DAY_EXIT = "loss_only"
 
-_PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount"]
+_PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount", "Marcap"]
+
+#: 진행률/취소 확인 주기 (초). 계약상 최소 1초에 한 번은 should_cancel 을 봐야 한다.
+CANCEL_INTERVAL_SEC = 0.25
+PROGRESS_INTERVAL_SEC = 0.5
+
+PHASE_LOAD = "데이터 읽는 중"
+PHASE_SCAN = "기준일 찾는 중"
+PHASE_SIM = "종목별 매매 계산 중"
+PHASE_METRICS = "성과 계산 중"
 
 _MARKET_ALIASES = {
     "KOSPI": {"KOSPI", "STK", "유가증권", "유가증권시장"},

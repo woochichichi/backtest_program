@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import functools
+import inspect
 import json
 import math
 import mimetypes
@@ -28,6 +29,7 @@ import subprocess
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,7 +62,7 @@ TASK_NAME = "KRXBacktesterDataSync"
 IS_WINDOWS = os.name == "nt" or platform.system().lower().startswith("win")
 
 SYNC_TIMEOUT_SEC = 600
-BACKTEST_TIMEOUT_SEC = 60
+BACKTEST_TIMEOUT_SEC = 600  # 10년 백테스트는 60초를 넘는다 (ARCHITECTURE-v2 §2-2)
 SSE_IDLE_TIMEOUT_SEC = 300
 
 STRATEGY_ID_RE = re.compile(r"^[a-z0-9_-]+$")
@@ -483,6 +485,8 @@ def build_features() -> Dict[str, bool]:
         "backtest_progress_sse": True,
         "ai_available": bool(ai_module.is_available()),
         "symbol_search": True,
+        "backtest_cancel": True,
+        "sync_status": True,
     }
 
 
@@ -885,6 +889,51 @@ def api_strategies_delete(sid: str) -> Dict[str, Any]:
     return {"ok": True, "id": _check_id(sid), "backup": backup}
 
 
+@app.post("/api/strategies/{sid}/reset")
+def api_strategies_reset(sid: str) -> Dict[str, Any]:
+    """모든 params[].default 를 각 path 에 되돌려 쓰고 저장한다 (ARCHITECTURE-v2 §1).
+
+    `params` 배열 자체는 건드리지 않는다. 되돌리기 전 .bak 백업은 PUT 과 동일.
+    """
+    path = _strategy_path(sid)
+    if not path.exists():
+        raise ApiError(404, f"'{sid}' 전략을 찾을 수 없습니다.", f"경로: {path.name}")
+
+    try:
+        from engine.params import reset_to_defaults  # type: ignore
+    except Exception as exc:
+        raise ApiError(
+            501,
+            "전략 초기화 기능이 아직 준비되지 않았습니다.",
+            "engine/params.py 의 reset_to_defaults 가 없습니다. 엔진 업데이트 후 다시 시도하세요.",
+            {"detail_exc": f"{type(exc).__name__}: {exc}"},
+        ) from exc
+
+    doc = _load_strategy_file(path)
+    try:
+        restored = reset_to_defaults(doc)
+    except Exception as exc:
+        raise ApiError(
+            500,
+            "전략을 기본값으로 되돌리는 중 오류가 발생했습니다.",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+    if not isinstance(restored, dict):
+        raise ApiError(
+            500,
+            "초기화 결과가 올바르지 않습니다.",
+            f"reset_to_defaults 가 dict 가 아닌 {type(restored).__name__} 를 돌려줬습니다.",
+        )
+
+    restored["id"] = _check_id(sid)
+    _validate_or_422(restored)
+
+    backup = _backup(path)
+    _write_strategy(path, restored)
+    return {"ok": True, "id": restored["id"], "backup": backup, "strategy": restored}
+
+
 async def _json_body(request: Request) -> Any:
     try:
         return await request.json()
@@ -1143,9 +1192,59 @@ def default_chart_code(run_id: Optional[str] = None) -> str:
 
 
 # =================================================== 4-5. POST /api/backtest
-_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="backtest")
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="backtest")
 _PROGRESS: Dict[str, "queue.Queue[Dict[str, Any]]"] = {}
 _PROGRESS_LOCK = threading.Lock()
+
+MAX_TRACKED_JOBS = 50
+CANCEL_MESSAGE = "사용자가 취소했습니다."
+
+
+class _CancelledSignal(Exception):
+    """서버 내부 신호. 엔진의 BacktestCancelled 를 서버 응답으로 옮기기 위한 것."""
+
+
+class _Job:
+    """백테스트 작업 하나. 취소 플래그를 들고 있다."""
+
+    __slots__ = ("job_id", "cancel", "state", "created_at", "finished_at", "run_id")
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        self.cancel = threading.Event()
+        self.state = "running"  # running | done | cancelled | error
+        self.created_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.run_id: Optional[str] = None
+
+
+_JOBS: "OrderedDict[str, _Job]" = OrderedDict()
+_JOBS_LOCK = threading.Lock()
+
+
+def _job_start(job_id: str) -> _Job:
+    job = _Job(job_id)
+    with _JOBS_LOCK:
+        _JOBS.pop(job_id, None)
+        _JOBS[job_id] = job
+        while len(_JOBS) > MAX_TRACKED_JOBS:
+            _JOBS.popitem(last=False)
+    return job
+
+
+def _job_get(job_id: str) -> Optional[_Job]:
+    with _JOBS_LOCK:
+        return _JOBS.get(job_id)
+
+
+def _job_finish(job_id: str, state: str, run_id: Optional[str] = None) -> None:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job.state = state
+            job.finished_at = time.time()
+            if run_id:
+                job.run_id = run_id
 
 
 def _progress_queue(job_id: str) -> "queue.Queue[Dict[str, Any]]":
@@ -1162,31 +1261,100 @@ def _progress_drop(job_id: str) -> None:
         _PROGRESS.pop(job_id, None)
 
 
-def _run_backtest_sync(strategy: Dict[str, Any], job_id: Optional[str]) -> Dict[str, Any]:
+def _emit_progress(job_id: Optional[str], payload: Dict[str, Any]) -> None:
+    if not job_id:
+        return
+    try:
+        _progress_queue(job_id).put_nowait(payload)
+    except queue.Full:
+        pass
+
+
+def _is_cancelled_exc(exc: BaseException) -> bool:
+    """engine 의 BacktestCancelled 인지 클래스 이름으로 판별.
+
+    engine 이 이 예외를 errors.py 에 둘지 backtest.py 에 둘지 모르므로 이름으로 본다.
+    """
+    for klass in type(exc).__mro__:
+        if klass.__name__ == "BacktestCancelled":
+            return True
+    return False
+
+
+def _engine_cancel_class() -> Any:
+    """engine.errors.BacktestCancelled (없으면 None). 방어적 조회."""
+    try:
+        from engine import errors as engine_errors  # type: ignore
+
+        return getattr(engine_errors, "BacktestCancelled", None)
+    except Exception:
+        return None
+
+
+def _accepts_should_cancel(func: Any) -> bool:
+    """engine 이 아직 should_cancel 을 안 받을 수 있으므로 시그니처를 확인한다."""
+    try:
+        params = inspect.signature(func).parameters
+    except Exception:
+        return False
+    if "should_cancel" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _run_backtest_sync(
+    strategy: Dict[str, Any], job_id: Optional[str], job: Optional[_Job]
+) -> Dict[str, Any]:
     (run_backtest,) = _engine("engine.backtest", "run_backtest")
     store = get_store()
 
     progress_cb = None
     if job_id:
-        q = _progress_queue(job_id)
 
-        def progress_cb(done: int, total: int, message: str = "") -> None:  # noqa: F811
+        def progress_cb(  # noqa: F811
+            done: int = 0,
+            total: int = 100,
+            message: str = "",
+            phase: Any = None,
+            eta_sec: Any = None,
+            **_extra: Any,
+        ) -> None:
+            """engine 이 3인자만 보내도, 5인자를 보내도 동작한다."""
             try:
-                q.put_nowait(
-                    {
-                        "job_id": job_id,
-                        "done": int(done),
-                        "total": int(total),
-                        "message": str(message or ""),
-                        "finished": False,
-                    }
-                )
-            except queue.Full:
-                pass
+                eta = None if eta_sec is None else float(eta_sec)
+            except Exception:
+                eta = None
+            _emit_progress(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "done": int(done),
+                    "total": int(total) if total else 100,
+                    "message": str(message or ""),
+                    "phase": None if phase is None else str(phase),
+                    "eta_sec": eta,
+                    "finished": False,
+                    "cancelled": False,
+                },
+            )
+
+    kwargs: Dict[str, Any] = {"progress": progress_cb}
+    if job is not None and _accepts_should_cancel(run_backtest):
+        kwargs["should_cancel"] = job.cancel.is_set
 
     started = time.time()
-    result = run_backtest(strategy, store, progress=progress_cb)
+    try:
+        result = run_backtest(strategy, store, **kwargs)
+    except Exception as exc:
+        if _is_cancelled_exc(exc):
+            raise _CancelledSignal() from exc
+        raise
     elapsed = round(time.time() - started, 3)
+
+    # engine 이 should_cancel 을 아직 지원하지 않으면 끝까지 돈다.
+    # 이때도 사용자가 취소를 눌렀다면 결과를 버리고 취소로 처리한다.
+    if job is not None and job.cancel.is_set():
+        raise _CancelledSignal()
 
     if not isinstance(result, dict):
         raise ApiError(500, "백테스트 결과 형식이 올바르지 않습니다.", f"type={type(result).__name__}")
@@ -1195,28 +1363,29 @@ def _run_backtest_sync(strategy: Dict[str, Any], job_id: Optional[str]) -> Dict[
     if not result.get("run_id"):
         result["run_id"] = RUNS.new_run_id()
     result.setdefault("warnings", [])
+    if job_id:
+        result.setdefault("job_id", job_id)
     RUNS.put(str(result["run_id"]), result)
 
-    if job_id:
-        q = _progress_queue(job_id)
-        try:
-            q.put_nowait(
-                {
-                    "job_id": job_id,
-                    "done": 1,
-                    "total": 1,
-                    "message": "완료",
-                    "finished": True,
-                    "run_id": result["run_id"],
-                }
-            )
-        except queue.Full:
-            pass
+    _emit_progress(
+        job_id,
+        {
+            "job_id": job_id,
+            "done": 100,
+            "total": 100,
+            "message": "완료",
+            "phase": "완료",
+            "eta_sec": 0,
+            "finished": True,
+            "cancelled": False,
+            "run_id": result["run_id"],
+        },
+    )
     return result
 
 
 @app.post("/api/backtest")
-async def api_backtest(request: Request) -> Dict[str, Any]:
+async def api_backtest(request: Request) -> Any:
     body = await _json_body(request)
     if not isinstance(body, dict):
         raise ApiError(400, "요청 본문이 JSON 객체가 아닙니다.")
@@ -1233,34 +1402,81 @@ async def api_backtest(request: Request) -> Dict[str, Any]:
         merged.update({k: v for k, v in period.items() if v is not None})
         strategy["period"] = merged
 
-    job_id = body.get("job_id")
-    job_id = str(job_id) if job_id else None
+    raw_job = body.get("job_id")
+    job_id = str(raw_job) if raw_job else RUNS.new_run_id().replace("r_", "j_")
+    job = _job_start(job_id)
 
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(_POOL, _run_backtest_sync, strategy, job_id)
+    future = loop.run_in_executor(_POOL, _run_backtest_sync, strategy, job_id, job)
     try:
         result = await asyncio.wait_for(asyncio.shield(future), timeout=BACKTEST_TIMEOUT_SEC)
+    except _CancelledSignal:
+        # 취소는 오류가 아니다. 프런트가 빨간 배너를 띄우면 안 되므로 200 으로 돌려준다.
+        _job_finish(job_id, "cancelled")
+        _emit_progress(
+            job_id,
+            {
+                "job_id": job_id,
+                "done": 0,
+                "total": 100,
+                "message": CANCEL_MESSAGE,
+                "phase": "취소됨",
+                "eta_sec": None,
+                "finished": True,
+                "cancelled": True,
+            },
+        )
+        return {"ok": False, "cancelled": True, "error": CANCEL_MESSAGE, "job_id": job_id}
     except asyncio.TimeoutError as exc:
-        if job_id:
-            try:
-                _progress_queue(job_id).put_nowait(
-                    {
-                        "job_id": job_id,
-                        "done": 0,
-                        "total": 0,
-                        "message": "시간 초과",
-                        "finished": True,
-                        "error": True,
-                    }
-                )
-            except queue.Full:
-                pass
+        _job_finish(job_id, "error")
+        _emit_progress(
+            job_id,
+            {
+                "job_id": job_id,
+                "done": 0,
+                "total": 100,
+                "message": "시간 초과",
+                "phase": "시간 초과",
+                "eta_sec": None,
+                "finished": True,
+                "cancelled": False,
+                "error": True,
+            },
+        )
         raise ApiError(
             504,
             f"백테스트가 {BACKTEST_TIMEOUT_SEC}초 안에 끝나지 않았습니다.",
             "기간을 줄이거나 종목 선정 조건을 좁혀서 다시 실행하세요.",
         ) from exc
+    except Exception:
+        _job_finish(job_id, "error")
+        raise
+
+    _job_finish(job_id, "done", run_id=str(result.get("run_id") or ""))
     return result
+
+
+@app.post("/api/backtest/cancel/{job_id}")
+def api_backtest_cancel(job_id: str) -> Dict[str, Any]:
+    """실행 중인 백테스트 취소 (ARCHITECTURE-v2 §2-2)."""
+    job = _job_get(job_id)
+    if job is None:
+        raise ApiError(
+            404,
+            f"'{job_id}' 작업을 찾을 수 없습니다.",
+            "이미 정리되었거나 시작되지 않은 job_id 입니다.",
+        )
+
+    if job.state != "running":
+        reason = "이미 완료됨"
+        if job.state == "cancelled":
+            reason = "이미 취소됨"
+        elif job.state == "error":
+            reason = "이미 종료됨"
+        return {"ok": True, "cancelled": False, "reason": reason}
+
+    job.cancel.set()
+    return {"ok": True, "cancelled": True}
 
 
 @app.get("/api/backtest/progress/{job_id}")

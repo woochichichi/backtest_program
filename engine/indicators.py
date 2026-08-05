@@ -15,7 +15,7 @@ import pandas as pd
 
 from .errors import IndicatorError
 
-__all__ = ["REGISTRY", "compute", "spec_list", "source_series", "indicator_key"]
+__all__ = ["REGISTRY", "compute", "spec_list", "source_series", "indicator_key", "raw_column"]
 
 
 # --------------------------------------------------------------------------------------
@@ -34,6 +34,11 @@ def _raw(df: pd.DataFrame, field: str) -> np.ndarray:
         if cand in df.columns:
             return np.asarray(df[cand], dtype="float64")
     raise IndicatorError(f"필요한 컬럼이 없습니다: {field} (있는 컬럼: {list(df.columns)})")
+
+
+def raw_column(df: pd.DataFrame, name: str) -> np.ndarray:
+    """대소문자 무관하게 원본 컬럼을 float64 배열로 뽑는다 (Marcap 등)."""
+    return _raw(df, name)
 
 
 def source_series(df: pd.DataFrame, source: str | None) -> np.ndarray:
@@ -279,6 +284,16 @@ def _f_envelope(p, df):
     return {"middle": mid, "upper": mid * (1 + pct / 100.0), "lower": mid * (1 - pct / 100.0)}
 
 
+def _f_highest(p, df):
+    n = _period(p, "period", 252)
+    return _s(source_series(df, p.get("source"))).rolling(n, min_periods=n).max().to_numpy()
+
+
+def _f_lowest(p, df):
+    n = _period(p, "period", 252)
+    return _s(source_series(df, p.get("source"))).rolling(n, min_periods=n).min().to_numpy()
+
+
 def _f_donchian(p, df):
     n = _period(p, "period", 20)
     up = _s(_raw(df, "high")).rolling(n, min_periods=n).max().to_numpy()
@@ -375,6 +390,24 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             True,
             "price",
             _f_envelope,
+        ),
+        _spec(
+            "HIGHEST",
+            "N봉 최고값",
+            [_P("period", "int", 252), _SRC],
+            None,
+            True,
+            "price",
+            _f_highest,
+        ),
+        _spec(
+            "LOWEST",
+            "N봉 최저값",
+            [_P("period", "int", 252), _SRC],
+            None,
+            True,
+            "price",
+            _f_lowest,
         ),
         _spec(
             "DONCHIAN",
