@@ -40,6 +40,9 @@ const S = {
   noAutoSymbol: false,   // 서버가 code 없는 /api/chart 를 거절했는가
   hiddenInd: new Set(),  // 차트에서만 숨긴 지표 키 (전략 파일은 건드리지 않는다)
   chartSeq: 0,           // 차트 요청 순번 — 늦게 도착한 예전 응답을 버린다
+  chartAbort: null,      // 진행 중인 차트 요청 (종목 전환 시 실제로 끊는다)
+  histExhausted: false,  // 더 받을 과거가 없다
+  lastChartArgs: null,   // 재시도용
   abort: null,             // 실행 중인 백테스트의 AbortController
   jobId: null,             // 진행률 SSE / 취소용
   cancelling: false,
@@ -998,6 +1001,10 @@ async function loadChart(o = {}) {
     P.highlightSymbol(S.symbol.code);
     P.clearBanner('err-차트 불러오기');
   } catch (e) {
+    clearTimeout(slowTimer);
+    // 새 요청이 들어와 취소된 것은 오류가 아니다 (종목 연타 등)
+    if ((e && e.aborted) || seq !== S.chartSeq) return;
+
     // 종목을 안 보내서 거절당한 경우는 오류가 아니라 "종목을 골라야 한다"는 뜻이다
     if (!code && e instanceof ApiError && (e.status === 400 || e.status === 422)) {
       S.noAutoSymbol = true;
@@ -1011,12 +1018,20 @@ async function loadChart(o = {}) {
       return;
     }
     handleError(e, '차트 불러오기');
+    // 새로고침 말고 이 자리에서 다시 시도할 수 있게 한다
     showChartEmpty({
       icon: 'alert', tone: 'err',
       title: '차트를 불러오지 못했습니다',
-      desc: (e && e.advice) || '화면 위쪽 안내를 확인하세요.',
+      desc: (e && e.advice) || '잠시 후 다시 시도해 보세요.',
+      action: { label: '다시 시도', act: 'retryChart', primary: true },
     });
   }
+}
+
+/** 실패한 차트 요청을 같은 조건으로 다시 시도 */
+function retryChart() {
+  P.clearBanner('err-차트 불러오기');
+  loadChart(S.lastChartArgs || {});
 }
 
 function showChartEmpty(opts) {
@@ -1609,6 +1624,7 @@ function wire() {
     pickSymbol: openSymbolPicker,
     sync: () => startSync({}),
     cancelRun: cancelBacktest,
+    retryChart,
   });
 
   P.bindTabs((name) => {
@@ -1732,6 +1748,8 @@ function setupCharts() {
         `${S.symbol.code} ${S.symbol.name}`);
       P.renderTooltip(info, wrap.getBoundingClientRect());
     },
+    // 아직 안 받은 과거로 팬하면 그때 이어받는다
+    onViewport: (i0) => onChartViewport(i0),
   });
   S.eq = new MiniChart($('eq'), 'equity');
   S.mo = new MiniChart($('mo'), 'monthly');

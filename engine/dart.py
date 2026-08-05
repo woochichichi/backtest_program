@@ -53,7 +53,12 @@ AMOUNT_COLUMNS = [
 ]
 
 #: 파생 컬럼
-DERIVED_COLUMNS = ["debt_ratio_pct", "current_ratio_pct", "op_income_quarter"]
+#:
+#: ``capital_impaired`` 는 **3값 논리**다. ``True``=자본잠식 / ``False``=정상 /
+#: ``pd.NA``=자본총계를 모름. "모름" 을 ``False`` 로 뭉개면 안 된다 (아래 주의 참고).
+DERIVED_COLUMNS = [
+    "debt_ratio_pct", "current_ratio_pct", "op_income_quarter", "capital_impaired",
+]
 
 META_COLUMNS = ["code", "corp_code", "year", "quarter", "disclosed_at", "fs_div", "currency"]
 
@@ -88,6 +93,22 @@ def _opt_int(v) -> Optional[int]:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _opt_bool(v) -> Optional[bool]:
+    """``True`` / ``False`` / ``None``(모름) 을 그대로 보존한다.
+
+    **``None`` 을 ``False`` 로 바꾸지 마라.** "자본잠식이 아니다" 와 "자본총계를 모른다" 는
+    전략 입장에서 전혀 다른 이야기다.
+    """
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return bool(v)
 
 
 def _opt_float(v) -> Optional[float]:
@@ -185,6 +206,11 @@ class DartStore:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
         for c in ("debt_ratio_pct", "current_ratio_pct"):
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+        # 3값 논리를 지키려면 nullable boolean 이어야 한다. 예전 파일에는 이 컬럼이
+        # 아예 없어서 통째로 pd.NA 가 되는데, 그게 정확히 "모름" 이라 옳다.
+        df["capital_impaired"] = pd.array(
+            [_opt_bool(v) for v in df["capital_impaired"]], dtype="boolean"
+        )
         # 같은 (code, year, quarter) 가 여러 벌이면(정정공시) **여기서 지우지 않는다.**
         # 지우면 정정 전 시점의 조회가 정정 후 숫자를 보게 되거나(룩어헤드),
         # 정정 전 숫자가 통째로 사라진다. 어느 것을 쓸지는 as-of 필터를 통과한

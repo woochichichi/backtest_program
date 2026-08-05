@@ -309,6 +309,10 @@
         <!-- base / overlay 캔버스는 chart.js 가 삽입한다 -->
         <div class="legend" id="legend" aria-hidden="true"></div>
         <div class="chart-note" id="chartNote" hidden></div>
+        <div class="chart-edge-load" id="chartEdgeLoad" hidden aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="edge-tx">이전 데이터를 불러오는 중</span>
+        </div>
         <div class="chart-hint">휠 = 줌 · 드래그 = 팬 · 더블클릭 = 전체 보기</div>
         <div class="tt" id="tt" role="tooltip"></div>
         <div class="chart-empty" id="chartEmpty">

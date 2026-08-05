@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from conftest import B1_BAR, B2_BAR, REF_BAR, ROOT, SL_BAR, TP_BAR
@@ -1445,8 +1447,6 @@ def _write_marcap_years(tmp_path, dates, codes_by_year):
 @pytest.fixture
 def multiyear_store(tmp_path):
     """2023~2025년 3개 파일. 2023년만 앞자리 0 을 뗀 옛 표기('5930')."""
-    import pandas as pd  # noqa: F811
-
     dates = [d.date() for d in pd.bdate_range("2023-01-02", "2025-12-31")]
     root = _write_marcap_years(tmp_path, dates, {
         2023: [("5930", "삼성전자"), ("660", "SK하이닉스")],       # 옛 표기

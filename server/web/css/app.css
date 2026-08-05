@@ -1135,3 +1135,15 @@ tr.grp-first td.grp::after, tr.grp-mid td.grp::after {
   background: var(--accent-soft); color: var(--accent-tx); border: 1px solid var(--accent-bd);
 }
 .ind-tag.ui { background: var(--bg-3); color: var(--tx-sub); border-color: var(--bd); }
+
+/* ---------- 과거 구간 이어받기 표시 (점진 로딩) ---------- */
+.chart-edge-load {
+  position: absolute; left: 10px; top: 50%; transform: translateY(-50%); z-index: 3;
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 10px; border-radius: 14px;
+  background: var(--bg-1); border: 1px solid var(--bd-str);
+  box-shadow: var(--shadow-1);
+  font-size: 11px; color: var(--tx-sub); white-space: nowrap;
+  pointer-events: none;
+}
+.chart-edge-load[hidden] { display: none; }
