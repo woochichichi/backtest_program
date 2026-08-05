@@ -29,12 +29,16 @@ RESULT_KEYS = {
 ASSUMPTION_KEYS = {
     "resolution", "requested_resolution", "fill_model", "same_day_exit",
     "slippage_pct", "fee_pct", "exit_priority", "notes", "stats",
-    "ignored_filters", "dart",
+    "ignored_filters", "dart", "price_adjustment",
 }
+PRICE_ADJ_KEYS = {"applied", "events", "symbols", "method", "limitations"}
 DART_KEYS = {"available", "as_of", "coverage_pct", "on_missing", "last_fetch"}
 ASSUMPTION_STAT_KEYS = {
     "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
     "same_day_profit_exits_blocked", "missing_financials", "missing_financials_pct",
+    "halted_bars_skipped", "halted_symbols", "halted_reference_days_rejected",
+    "price_adjust_events", "price_adjust_symbols", "extreme_moves_flagged",
+    "limit_price_fills",
 }
 METRIC_KEYS = {
     "total_return_pct", "cagr_pct", "mdd_pct", "sharpe", "win_rate_pct",
@@ -204,6 +208,9 @@ def test_result_matches_api_schema(strategy1, tp_store):
     assert a["exit_priority"] == ["SL", "TP"]
     assert isinstance(a["notes"], list) and all(isinstance(n, str) and n for n in a["notes"])
     assert set(a["stats"]) == ASSUMPTION_STAT_KEYS
+    assert set(a["price_adjustment"]) == PRICE_ADJ_KEYS
+    assert a["price_adjustment"]["method"] == "stocks_ratio"
+    assert a["price_adjustment"]["limitations"]
     assert set(a["dart"]) == DART_KEYS
     assert a["dart"]["available"] is False and a["dart"]["as_of"] is False
     assert a["dart"]["coverage_pct"] is None
@@ -1566,7 +1573,7 @@ def test_symbol_cache_incremental_growth(multiyear_store):
 
 def test_bars_columns_option(multiyear_store):
     lean = multiyear_store.bars("005930", columns=["Date", "Code", "Close"])
-    assert set(lean.columns) == {"Code", "Close"}
+    assert set(lean.columns) == {"Code", "Close"}, "조정용으로 읽은 Stocks 는 돌려주지 않는다"
 
     allc = multiyear_store.bars("005930", columns="all", use_cache=False)
     assert {"Marcap", "Dept", "Market"} <= set(allc.columns)

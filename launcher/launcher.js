@@ -30,6 +30,7 @@ var S = {
   cfg: null,
   portInfo: null,
   dartLast: null,
+  headRev: "",
   dartBefore: 0,
   logMark: 0,
   force: false,
@@ -460,9 +461,12 @@ function buildPaths(root) {
   P.dartKey = root + "\\dart_key.txt";
   P.dartRecheck = root + "\\logs\\dart_recheck.txt";
   P.fetchDart = root + "\\tools\\fetch_dart.py";
+  P.dartParts = root + "\\dart\\.parts";
+  P.rebuildMark = root + "\\dart\\.rebuild_marker";
   P.pbBat = P.work + "\\probe.bat";
   P.pbLog = P.work + "\\probe.log";
   P.cfgFile = root + "\\launcher_config.json";
+  P.cfgDefault = root + "\\launcher_config.default.json";
 }
 
 /* ---------- 설정 파일 (없으면 기본값) ---------- */
@@ -470,7 +474,10 @@ function defaultCfg() { return { port: DEF_PORT, prog: true, quote: true }; }
 
 function loadConfig() {
   var c = defaultCfg();
+  /* 사용자 파일이 우선. 없으면 저장소에 들어 있는 기본값 파일을 읽는다.
+     (launcher_config.json 은 사용자별 값이라 .gitignore 대상이다) */
   var t = SYS.read(P.cfgFile);
+  if (!t) { t = SYS.read(P.cfgDefault); }
   if (t) {
     var m = /"port"\s*:\s*(\d+)/.exec(String(t));
     if (m) {
@@ -769,6 +776,8 @@ function step1() {
         }
       }
       var blind = trim(readOne("s1_blind.txt")) === "1";
+      /* 파생 지표 재계산이 필요한지 판단하는 근거 - 지금 돌고 있는 코드의 커밋 */
+      S.headRev = trim(newRev) || trim(oldRev) || "";
       var shortOld = oldRev ? oldRev.substring(0, 7) : "";
       var shortNew = newRev ? newRev.substring(0, 7) : "";
 
@@ -965,6 +974,9 @@ function runQuoteSync(firstTime) {
      3) 오늘 이미 받음     -> 건너뜀
      4) 새로 받을 분기 없음 -> 건너뜀
      5) 최근 분기 재확인은 주 1회로 제한
+
+   실행 순서는 --rebuild 가 먼저다. 기존 데이터를 정상화한 뒤에 새 분기를 받는다.
+   --rebuild 는 네트워크도 인증키도 필요 없고 멱등이라 실패해도 무시한다.
    ============================================================ */
 
 var DART_LAG = 45;          /* 분기 종료 후 공시까지 (tools/fetch_dart.py 와 같은 값) */
@@ -1063,21 +1075,52 @@ function decideDart() {
   return { skip: false, why: "recheck", st: st };
 }
 
-function s3Bat() {
-  return [
+/* 3단계 배치.
+   --rebuild : 파생 지표(부채비율·유동비율·자본잠식) 재계산.
+               네트워크도 인증키도 필요 없고 멱등이며 1초가 안 걸린다.
+               dart\.parts 가 없으면 종료 코드 2 를 내므로 감싸고 실패는 무시한다.
+               DART 를 안 쓰는 사용자에게 오류가 보이면 안 된다.
+   --resume  : 새 분기 받기. 기존 데이터를 먼저 정상화한 뒤에 돈다. */
+function s3Bat(doRebuild, doResume) {
+  var L = [
     "@echo off",
     "setlocal enabledelayedexpansion",
     "cd /d \"" + P.root + "\"",
     "rem  파이썬 출력을 UTF-8 로 고정하고 버퍼를 끈다 (진행률을 실시간으로 읽기 위해)",
     "set \"PYTHONIOENCODING=utf-8\"",
     "set \"PYTHONUNBUFFERED=1\"",
-    "rem  update_dart.bat 을 부르지 않는다. 그 안의 pause 때문에 멈춘다.",
-    "\"" + P.venvPy + "\" -m tools.fetch_dart --resume >> \"" + P.s3log + "\" 2>&1",
-    "set \"RC=!errorlevel!\"",
-    "> \"" + P.work + "\\s3_rc.txt\" echo.!RC!",
-    "> \"" + P.work + "\\s3.done\" echo done",
-    "endlocal"
+    "set \"RC=0\"",
+    "rem  update_dart.bat 을 부르지 않는다. 그 안의 pause 때문에 멈춘다."
   ];
+  if (doRebuild) {
+    L[L.length] = "if exist \"" + P.dartParts + "\" (";
+    L[L.length] = "    >> \"" + P.s3log + "\" echo [launcher] 재무 지표 재계산";
+    L[L.length] = "    \"" + P.venvPy + "\" -m tools.fetch_dart --rebuild >> \"" + P.s3log + "\" 2>&1";
+    L[L.length] = "    >> \"" + P.s3log + "\" echo [launcher] 재계산 끝";
+    L[L.length] = ")";
+  }
+  if (doResume) {
+    L[L.length] = "\"" + P.venvPy + "\" -m tools.fetch_dart --resume >> \"" + P.s3log + "\" 2>&1";
+    L[L.length] = "set \"RC=!errorlevel!\"";
+  }
+  L[L.length] = "> \"" + P.work + "\\s3_rc.txt\" echo.!RC!";
+  L[L.length] = "> \"" + P.work + "\\s3.done\" echo done";
+  L[L.length] = "endlocal";
+  return L;
+}
+
+/* 파생 지표 로직은 코드에 있다. 코드가 바뀌었으면 다시 계산해야 한다. */
+function needRebuild() {
+  if (!SYS.exists(P.dartParts)) { return false; }
+  var mark = trim(SYS.read(P.rebuildMark));
+  if (!mark) { return true; }                       /* 한 번도 안 했다 */
+  if (!S.headRev) { return false; }                 /* 코드 버전을 모르면 매번 돌리지 않는다 */
+  return mark.indexOf(S.headRev) < 0;               /* git pull 로 코드가 바뀌었다 */
+}
+
+function markRebuilt() {
+  SYS.write(P.rebuildMark,
+    (S.headRev || "unknown") + " " + fmtDate(nowDate()) + "\r\n", true);
 }
 
 function step3() {
@@ -1093,37 +1136,62 @@ function step3() {
     showOv("ovDart");
     return;
   }
+
+  var reb = needRebuild();
+
   if (dec.skip) {
+    var why;
     if (dec.why === "nokey") {
       S.tally.dartNokey = true;
-      finishStep(2, "skip", "재무 데이터 없이 실행합니다 (DART 키 미설정)", step4);
+      why = "재무 데이터 없이 실행합니다 (DART 키 미설정)";
     } else if (dec.why === "notool") {
-      finishStep(2, "skip", "수집기가 없어 건너뜁니다", step4);
+      why = "수집기가 없어 건너뜁니다";
     } else if (dec.why === "today") {
-      finishStep(2, "skip", "오늘 이미 받았습니다", step4);
+      why = "오늘 이미 받았습니다";
     } else {
-      finishStep(2, "skip", "이미 최신입니다 (" + mono(dartHaveLabel()) + ")", step4);
+      why = "이미 최신입니다 (" + mono(dartHaveLabel()) + ")";
     }
+    /* 받을 게 없어도 코드가 바뀌었으면 파생 지표는 다시 계산해야 한다 */
+    if (reb && dec.why !== "nokey" && dec.why !== "notool") {
+      runRebuildOnly(why);
+      return;
+    }
+    finishStep(2, "skip", why, step4);
     return;
   }
-  runDartSync(false, dec);
+  runDartSync(false, dec, reb);
 }
 
-function runDartSync(firstTime, dec) {
+/* 새로 받을 것은 없고 지표만 다시 계산하는 경우 */
+function runRebuildOnly(afterMsg) {
+  setStep(2, "run", "재무 지표 재계산 (1초)");
+  runBat(P.s3bat, s3Bat(true, false), P.work + "\\s3.done", P.s3log, 180000,
+    function () { tailLog(P.s3log); },
+    function () {
+      if (S.cancelled) { return; }
+      /* 재계산은 실패해도 넘어간다. 원래 하려던 말만 그대로 보여 준다. */
+      markRebuilt();
+      finishStep(2, "skip", afterMsg, step4);
+    });
+}
+
+function runDartSync(firstTime, dec, doRebuild) {
   var before = (dec && dec.st) ? dec.st.count : readDartState().count;
-  S.dartBefore = before;
+  var reb = firstTime ? false : !!doRebuild;
 
   setStep(2, "run", firstTime
     ? "처음 받는 중입니다. 2,400여 건을 부릅니다"
-    : (dec && dec.why === "newq"
-        ? ("새 분기를 받습니다 (" + mono(dec.q.y + "-" + dec.q.q + "분기") + ")")
-        : "최근 분기를 다시 확인합니다"));
+    : (reb ? "지표를 다시 계산하고 새 분기를 받습니다"
+           : (dec && dec.why === "newq"
+               ? ("새 분기를 받습니다 (" + mono(dec.q.y + "-" + dec.q.q + "분기") + ")")
+               : "최근 분기를 다시 확인합니다")));
 
-  runBat(P.s3bat, s3Bat(), P.work + "\\s3.done", P.s3log,
+  runBat(P.s3bat, s3Bat(reb, true), P.work + "\\s3.done", P.s3log,
     firstTime ? 5400000 : 1800000,
     function () { tailLog(P.s3log); },
     function (how) {
       if (S.cancelled) { return; }
+      if (reb) { markRebuilt(); }
       /* 재무는 없어도 백테스트가 돌아간다. 무슨 일이 있어도 4단계로 넘어간다. */
       if (how !== "ok") {
         S.tally.dartFail = true;
@@ -1146,13 +1214,13 @@ function runDartSync(firstTime, dec) {
         S.tally.fetched = true;
         finishStep(2, "done", "재무 " + mono(gained) + "개 분기를 받았습니다", step4);
       } else {
-        finishStep(2, "done", "재무 데이터가 최신입니다", step4);
+        finishStep(2, "done", reb ? "재무 지표를 다시 계산했습니다" : "재무 데이터가 최신입니다", step4);
       }
     });
 }
 
 /* ============================================================
-   8. 포트 조사
+   9. 포트 조사
    "HTTP 응답이 없다 = 서버가 없다" 가 아니다. 프록시 때문에 프로브가 막힐 수도,
    서버가 백테스트로 바쁠 수도 있다. 포트를 누가 잡고 있는지 반드시 따로 본다.
    ============================================================ */
@@ -1645,7 +1713,7 @@ function wire() {
   el("dartYes").onclick = function () {
     hideOv("ovDart");
     setNote("처음 한 번만 오래 걸립니다");
-    runDartSync(true, null);
+    runDartSync(true, null, false);
     return false;
   };
   el("dartNo").onclick = function () {

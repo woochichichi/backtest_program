@@ -999,6 +999,7 @@ def run_backtest(
                 requested_resolution, fill_model, same_day_exit, slippage, fee,
                 ordered_exits, stats, ignored_filters,
                 bool(dart_ok and financial_filters), on_missing,
+                bool(adjust_info.get("applied")) or bool(getattr(store, "adjusted", False)),
             ),
             "stats": dict(stats),
             "ignored_filters": [
@@ -1328,6 +1329,8 @@ def run_backtest(
                             f"{code} {rule.get('label') or rid} 조건 성립했으나 현금 부족으로 미체결", "09:05:00")
                     continue
 
+                if rec["limit_up"][li]:
+                    stats["limit_price_fills"] += 1
                 cost = qty * buy_px
                 cash -= cost
                 w["qty"] += qty
@@ -1408,6 +1411,8 @@ def run_backtest(
                         w, rec, code, rule, px, qty_out, exit_date, slippage, fee,
                         len(trades) + 1, rule.get("label") or rule.get("id"),
                     )
+                    if rec["limit_down"][li]:
+                        stats["limit_price_fills"] += 1
                     cash += proceeds
                     trades.append(trade)
                     w["exits_done"].add(rule.get("id"))
@@ -1572,7 +1577,8 @@ _SAME_DAY_NOTES = {
 def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit: str,
                       slippage: float, fee: float, ordered_exits: Sequence[Mapping],
                       stats: Mapping, ignored_filters: Sequence[Mapping] = (),
-                      dart_active: bool = False, on_missing: str = DEFAULT_ON_MISSING) -> List[str]:
+                      dart_active: bool = False, on_missing: str = DEFAULT_ON_MISSING,
+                      adjusted: bool = False) -> List[str]:
     """사용자에게 그대로 보여줄 실행 가정 문장들."""
     notes = [
         "일봉 데이터만 사용했습니다. 하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.",
@@ -1583,6 +1589,44 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
             "분봉 매매는 추후 지원 예정이며, 그 전까지는 일봉 근사로 동작합니다."
         )
     notes.append(_FILL_MODEL_NOTES.get(fill_model, f"fill_model={fill_model} 로 체결했습니다."))
+    halted_n = int(stats.get("halted_bars_skipped") or 0)
+    if halted_n:
+        notes.append(
+            f"거래정지일 {halted_n:,}건({int(stats.get('halted_symbols') or 0):,}종목)을 건너뛰었습니다. "
+            "KRX 는 거래정지일에 시가·고가·저가를 0 으로 발표하는데, 그대로 두면 "
+            "'저가 이하로 하락' 같은 조건이 무조건 성립해 아무도 거래할 수 없는 날에 체결됩니다. "
+            "보유 중이던 종목은 팔 수 없으므로 그대로 들고 갔고, 보유일수는 계속 셌습니다."
+        )
+    if stats.get("halted_reference_days_rejected"):
+        notes.append(
+            f"거래정지일이라 기준일로 채택하지 않은 경우가 "
+            f"{int(stats['halted_reference_days_rejected']):,}건 있었습니다."
+        )
+    if adjusted:
+        notes.append(
+            f"수정주가를 적용했습니다 — 상장주식수(Stocks) 변화로 액면분할·무상증자·액면병합을 "
+            f"찾아 과거 가격을 소급 조정했습니다 (이벤트 {int(stats.get('price_adjust_events') or 0):,}건 / "
+            f"{int(stats.get('price_adjust_symbols') or 0):,}종목). "
+            "조정하지 않으면 삼성전자 2018-05-04 50:1 분할이 하루 -98% 폭락으로 계산됩니다. "
+            "다만 유상증자·배당락은 상장주식수만으로 판별할 수 없어 반영되지 않았습니다."
+        )
+    else:
+        notes.append(
+            "수정주가를 적용하지 않았습니다(adjusted=False). 액면분할·무상증자가 있는 종목은 "
+            "그날 가격 급변이 실제 등락으로 계산되어 결과가 크게 왜곡됩니다."
+        )
+    if stats.get("extreme_moves_flagged"):
+        notes.append(
+            f"가격제한폭(±{PRICE_LIMIT_PCT:g}%)을 넘는 일간 변동이 "
+            f"{int(stats['extreme_moves_flagged']):,}건 남아 있습니다. "
+            "수정주가로 잡히지 않는 유상증자·배당락이거나 거래정지 해제 갭입니다. "
+            "많으면 해당 종목의 결과를 그대로 믿기 어렵습니다."
+        )
+    if stats.get("limit_price_fills"):
+        notes.append(
+            f"상한가·하한가로 마감한 봉에서 체결된 건이 {int(stats['limit_price_fills']):,}건 있습니다. "
+            "실제로는 그 가격에 물량을 잡기 어렵습니다."
+        )
     notes.append(_SAME_DAY_NOTES.get(same_day_exit, ""))
     notes.append(
         f"매수는 체결가 +{slippage * 100:g}%, 매도는 -{slippage * 100:g}% 슬리피지를 적용하고 "

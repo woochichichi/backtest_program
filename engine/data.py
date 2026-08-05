@@ -606,10 +606,12 @@ class MarcapStore:
                 pass
 
         cols = None
+        drop_stocks = False
         if columns is not None:
             wanted = list(columns)
-            if adj:
-                wanted.append("Stocks")      # 수정주가 계수 계산에 필요하다
+            if adj and "Stocks" not in wanted:
+                wanted.append("Stocks")      # 수정주가 계수 계산에만 쓰고 끝나면 버린다
+                drop_stocks = True
             cols = list(dict.fromkeys(["Date", "Code", *wanted]))
 
         frames = []
@@ -626,9 +628,14 @@ class MarcapStore:
             if on_year is not None:
                 on_year(i + 1.0, len(years), y)
             gc.collect()          # 직전 해의 중간 산출물을 바로 반납해 피크를 낮춘다
-            if cols is not None and len(df.columns) != len(cols):
+            if cols is not None:
+                # halted 는 parquet 에 없는 파생 컬럼이라 cols 에 안 들어 있다.
+                # 여기서 떨어뜨리면 백테스트가 거래정지일을 못 걸러낸다.
                 keep = [c for c in cols if c in df.columns]
-                df = df[keep]
+                if HALTED_COLUMN in df.columns and HALTED_COLUMN not in keep:
+                    keep.append(HALTED_COLUMN)
+                if len(keep) != len(df.columns):
+                    df = df[keep]
             m = (df["Date"] >= pd.Timestamp(s)) & (df["Date"] <= pd.Timestamp(e))
             if bool(m.all()):
                 # 그 해가 통째로 구간 안이면 복사하지 않는다.
@@ -655,6 +662,8 @@ class MarcapStore:
         self.last_adjustment = {"applied": False, "events": 0, "symbols": 0}
         if adj:
             self.last_adjustment = apply_price_adjustment(out, self.adjust_threshold)
+            if drop_stocks and "Stocks" in out.columns:
+                del out["Stocks"]
             beat(0.35)
 
         if use_cache and columns is None and len(out) <= self.CACHE_MAX_ROWS:
@@ -688,9 +697,12 @@ class MarcapStore:
             raise DataUnavailable(f"구간이 뒤집혔습니다: {s} ~ {e}")
 
         adj = self.adjusted if adjusted is None else bool(adjusted)
-        cols = None if columns == "all" else list(columns or BARS_DEFAULT_COLUMNS)
+        asked = None if columns == "all" else list(columns or BARS_DEFAULT_COLUMNS)
+        cols = asked
+        drop_stocks = False
         if cols is not None and adj and "Stocks" not in cols:
             cols = cols + ["Stocks"]
+            drop_stocks = True
         years = self._range_years(s, e)
         if adj:
             # 수정주가는 **최신 시점 기준**이라 요청 구간 뒤의 분할도 알아야 한다.
@@ -714,6 +726,8 @@ class MarcapStore:
         out = frame.loc[m]
         if not len(out):
             raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
+        if drop_stocks and "Stocks" in out.columns:
+            out = out.drop(columns=["Stocks"])
         return out.set_index("Date").sort_index()
 
     # ---------------------------------------------------------------- 단일 종목 읽기
@@ -742,6 +756,8 @@ class MarcapStore:
                 m = mem["Code"] == code
                 if bool(m.any()):
                     keep = [c for c in (cols or mem.columns) if c in mem.columns]
+                    if HALTED_COLUMN in mem.columns and HALTED_COLUMN not in keep:
+                        keep.append(HALTED_COLUMN)
                     frames.append(mem.loc[m, keep])
                 continue
             part = self._read_symbol_year(path, variants, cols)
