@@ -1076,3 +1076,51 @@ def test_strategy3_runs_on_synthetic_data(dates):
         "debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min",
     ]
     assert len(res["warnings"]) >= 3
+
+
+def test_close_entry_cannot_exit_same_bar(strategy1, tp_store, dates):
+    """종가에 진입한 봉에서는 청산을 평가하지 않는다 (장이 이미 끝났다)."""
+    s = json.loads(json.dumps(strategy1))
+    s["entries"] = [{
+        "id": "B1", "label": "종가 진입",
+        "when": {"op": "<=", "left": "low", "right": "ref.open"},
+        "price": "close", "size_pct": 100, "size_of": "planned_position",
+    }]
+    # 진입한 봉에서 바로 성립하는 청산 규칙
+    s["exits"] = [{
+        "id": "OUT", "label": "즉시 청산", "type": "signal",
+        "when": {"op": ">", "left": "close", "right": 0},
+        "price": "close", "size_pct": 100,
+    }]
+    s["exit_priority"] = ["OUT"]
+    s["params"] = [p for p in s["params"]
+                   if not p["path"].startswith("exits[") and not p["path"].startswith("entries[1]")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+
+    res = run_backtest(s, tp_store)
+    t = res["trades"][0]
+    assert t["exit_date"] > t["fills"][0]["date"], "종가 진입 당일에 팔면 안 된다"
+    assert t["hold_days"] >= 1
+    assert any("종가 진입 봉이라 당일 청산은 평가하지 않음" in sg["message"] for sg in res["signals"])
+
+
+def test_close_entry_block_is_independent_of_same_day_exit(strategy1, tp_store):
+    """same_day_exit=always 로 둬도 종가 진입 봉의 당일 청산은 막힌다."""
+    s = json.loads(json.dumps(strategy1))
+    s["execution"]["same_day_exit"] = "always"
+    s["entries"] = [{
+        "id": "B1", "label": "종가 진입",
+        "when": {"op": "<=", "left": "low", "right": "ref.open"},
+        "price": "close", "size_pct": 100, "size_of": "planned_position",
+    }]
+    s["exits"] = [{
+        "id": "OUT", "label": "즉시 청산", "type": "signal",
+        "when": {"op": ">", "left": "close", "right": 0},
+        "price": "close", "size_pct": 100,
+    }]
+    s["exit_priority"] = ["OUT"]
+    s["params"] = [p for p in s["params"]
+                   if not p["path"].startswith("exits[") and not p["path"].startswith("entries[1]")]
+    t = run_backtest(s, tp_store)["trades"][0]
+    assert t["exit_date"] > t["fills"][0]["date"]

@@ -500,13 +500,10 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
         return panel.iloc[0:0][[c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in panel.columns]]
 
     cols = [c for c in _PRICE_COLS if c in panel.columns]
-    sub = panel[panel["Code"].isin(codes)]
     total = len(codes)
     rows = []
-    for j, (code, g) in enumerate(sub.groupby("Code", sort=False, observed=True)):
-        if (j & 7) == 0:
-            rep.tick(18 + 7.0 * j / max(total, 1),
-                     f"기준일 조건 확인 중 ({j:,}/{total:,} 종목)", PHASE_SCAN)
+    for j, (code, g) in enumerate(_iter_candidate_bars(
+            panel, codes, rep, total, base=18.0, span=2.0, label="기준일 조건 확인 중")):
         df = g.set_index("Date")[cols]
         ctx = EvalContext(df, params=params, aliases=aliases)
         try:
@@ -619,6 +616,20 @@ def _warmup_bars(strategy: Mapping) -> int:
 # ======================================================================================
 # 체결
 # ======================================================================================
+
+
+def _fills_at_close(rule: Mapping, fill_model: str) -> bool:
+    """이 규칙이 **그 봉의 종가**로 체결되는가.
+
+    종가에 산 뒤 같은 봉에서 다시 파는 것은 물리적으로 불가능하다(장이 이미 끝났다).
+    ``same_day_exit`` 과 무관하게 막아야 하는 조건이라 따로 판정한다.
+    """
+    if fill_model == "close":
+        return True
+    spec = rule.get("price")
+    if spec is None:
+        return True                       # price 미지정 = 조건 성립 봉의 종가
+    return isinstance(spec, str) and spec.strip().lower() == "close"
 
 
 def _direction(rule: Mapping, side: str) -> str:
@@ -1076,6 +1087,7 @@ def run_backtest(
                     {"rule": rid, "date": fill_date.isoformat(), "price": _r(buy_px, 2), "qty": int(qty)}
                 )
                 w["last_entry_date"] = fill_date
+                w["last_entry_at_close"] = _fills_at_close(rule, fill_model)
                 if w["entry_date"] is None:
                     w["entry_date"] = fill_date
                     w["entry_li"] = li
@@ -1095,6 +1107,12 @@ def run_backtest(
                 w["peak"] = max(w["peak"] or bar["high"], bar["high"])
                 ctx = _ctx(rec, w, bar=bar, day=day, li=li, aliases=aliases)
                 entry_today = w["last_entry_date"] == day
+                # 종가에 진입한 봉에서는 더 이상 팔 수 없다 (장 종료). 순서 가정 이전의 문제다.
+                if entry_today and w["last_entry_at_close"]:
+                    sig.add(day, "POS", code,
+                            f"{code} 종가 진입 봉이라 당일 청산은 평가하지 않음 (다음 거래일부터)",
+                            "15:31:00")
+                    continue
                 ambiguous_here = False
                 blocked_here = False
                 for rule in ordered_exits:
@@ -1346,23 +1364,25 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
 CANDIDATE_BATCH = 80
 
 
-def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
+def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int,
+                         base: float = 20.0, span: float = 5.0,
+                         label: str = "후보 종목 데이터 준비 중"):
     """후보 종목의 일봉을 ``(code, DataFrame)`` 으로 흘려보낸다.
 
     700만 행짜리 패널에 groupby 를 한 번에 걸면 첫 그룹이 나오기까지 10초 가까이 걸리고
     그 사이 취소를 못 받는다. 후보를 배치로 잘라 각 단계가 1초를 넘지 않게 한다.
     """
     cols = [c for c in (["Date", "Code", "Name"] + _PRICE_COLS) if c in panel.columns]
-    rep.tick(20, "후보 종목 데이터 준비 중", PHASE_SCAN)
+    rep.tick(base, label, PHASE_SCAN)
     narrow = panel if list(panel.columns) == cols else panel[cols]
-    rep.tick(20, f"후보 종목 데이터 준비 중 (0/{total:,})", PHASE_SCAN)
+    rep.tick(base, f"{label} (0/{total:,})", PHASE_SCAN)
 
     codes = list(cand_codes)
     done = 0
     for i in range(0, len(codes), CANDIDATE_BATCH):
         batch = set(codes[i:i + CANDIDATE_BATCH])
-        rep.tick(20 + 5.0 * done / max(total, 1),
-                 f"후보 종목 데이터 준비 중 ({done:,}/{total:,})", PHASE_SCAN)
+        rep.tick(base + span * done / max(total, 1),
+                 f"{label} ({done:,}/{total:,})", PHASE_SCAN)
         mask = narrow["Code"].isin(batch)
         rep.check(force=True)
         part = narrow[mask]
@@ -1370,8 +1390,8 @@ def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
         for code, gdf in part.groupby("Code", sort=False, observed=True):
             done += 1
             if (done & 15) == 0:
-                rep.tick(20 + 5.0 * done / max(total, 1),
-                         f"후보 종목 데이터 준비 중 ({done:,}/{total:,})", PHASE_SCAN)
+                rep.tick(base + span * done / max(total, 1),
+                         f"{label} ({done:,}/{total:,})", PHASE_SCAN)
             yield code, gdf
 
 
@@ -1398,6 +1418,7 @@ def _new_watch(code: str, ref_date: dt.date, ref_li: int, ref_gi: int, refbar: d
         "entry_li": None,
         "entry_bar": {},
         "last_entry_date": None,
+        "last_entry_at_close": False,
         "peak": None,
         "group_id": None,
         "exits_done": set(),

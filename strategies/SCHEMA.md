@@ -22,6 +22,7 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `exits` | O | 청산 규칙 배열 |
 | `exit_priority` | | 같은 봉에서 여러 청산이 동시 성립할 때 우선순위. 기본 `["SL","TP"]` (보수적) |
 | `indicators` | | 차트에 그릴 지표 목록 |
+| `params` | | **UI 전용** 조절 가능 파라미터 선언. 엔진은 읽지 않는다 (아래 참조) |
 | `portfolio` | O | 자본·분산 |
 | `execution` | O | 체결 모델·비용 |
 | `period` | O | 백테스트 구간. `end: "auto"`면 데이터 최신 거래일 |
@@ -63,7 +64,37 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `amount_spike` | 거래대금이 `spike_amount_krw_eok` 이상인 날 = 기준일 |
 | `volume_spike` | 거래량 배수 기준 (`volume_mult`, `volume_ma_period`) |
 | `range_breakout` | N일 신고가 돌파일 |
+| `custom` | `when` 조건식을 그대로 평가해 성립한 날 = 기준일 (아래 참조) |
 | `none` | 기준일 개념 없이 전 종목 대상 |
+
+#### `rule: "custom"` — 조건식으로 기준일 정의하기
+
+`amount_spike` 같은 고정 규칙으로 표현할 수 없는 기준일은 `custom` + `when` 으로 쓴다.
+`when` 은 진입/청산과 **완전히 같은 조건식 문법**이다.
+
+```json
+"reference_day": {
+  "rule": "custom",
+  "lookback_days": 20,
+  "spike_amount_krw_eok": 1000,
+  "volume_mult": 5,
+  "close_change_min_pct": 15,
+  "when": { "op": "and", "conditions": [
+    { "op": ">=", "left": "amount", "right": { "expr": "spike_amount_krw_eok * 100000000" } },
+    { "op": ">=", "left": "volume", "right": { "expr": "VMA20 * volume_mult" } },
+    { "op": ">=", "left": "close",  "right": { "expr": "prev.close * (1 + close_change_min_pct / 100)" } },
+    { "op": ">=", "left": "close",  "right": "HIGH252" }
+  ]}
+}
+```
+
+- `reference_day` 안의 **숫자 필드는 그대로 조건식의 이름**으로 쓸 수 있다
+  (위의 `spike_amount_krw_eok`, `volume_mult`, `close_change_min_pct`).
+  이렇게 두면 `params` 가 그 필드를 가리켜 화면에서 조절할 수 있다.
+- `VMA20` / `HIGH252` 는 `indicators` 에 선언한 **지표 별칭**이다 (아래 "지표 별칭" 참조).
+- **`expr` 안에서 함수 호출은 쓸 수 없다.** `sma(volume, 20)` 같은 표기는 지원하지 않는다.
+  이동평균이 필요하면 `indicators` 에 별칭으로 선언하고 그 이름을 쓴다. 보안상 수식 파서가
+  함수 호출 노드를 통째로 거부하기 때문이다.
 
 `prev_day_amount_max_eok`는 "기준일 직전 영업일의 거래대금이 이 값 이하" 필터.
 조건을 만족하는 날이 여러 개면 **가장 최근 날**을 기준일로 채택한다.
@@ -78,6 +109,39 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `none` | 조건 없음 |
 
 `valid_days_after_reference` — 기준일 이후 이 영업일 안에 진입이 안 되면 후보 폐기.
+
+### `universe.filters` — 종목 스크리닝
+
+```json
+"filters": {
+  "market_cap_min_eok": 2000,
+  "debt_ratio_max_pct": 200
+}
+```
+
+엔진이 적용할 수 있는 키:
+
+| 키 | 의미 |
+|---|---|
+| `market_cap_min_eok` / `market_cap_max_eok` | 시가총액 하한 / 상한 (억) |
+| `price_min` / `price_max` | 주가 하한 / 상한 (원) |
+| `amount_min_eok` | 거래대금 하한 (억) |
+| `volume_min` | 거래량 하한 (주) |
+
+**그 밖의 키는 조용히 무시하지 않는다.** marcap 에 없는 데이터(재무제표 등)를 요구하는 조건은
+결과에 그대로 드러난다.
+
+- `warnings` 에 한국어 한 줄
+- `assumptions.notes` 에 같은 문장
+- `assumptions.ignored_filters` 에 `[{"key": "debt_ratio_max_pct", "reason": "..."}]`
+
+> "부채비율 상한 조건(200%)은 적용하지 않았습니다. marcap 에 재무 데이터가 없어 이 조건은
+> 적용되지 않습니다. DART 연동이 필요합니다. 실제보다 종목이 많이 잡힙니다."
+
+사유 문구는 같은 경로를 가리키는 `params[].unavailable_reason` 을 우선 쓴다.
+그러니 데이터가 없는 조건은 `filters` 에 값을 넣어두고 `params` 에서
+`available: false` + `unavailable_reason` 으로 선언해 두는 것이 좋다.
+나중에 데이터가 붙으면 그때 엔진만 고치면 된다.
 
 ---
 
@@ -104,7 +168,35 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `price` | 체결가. 지정 안 하면 조건 성립 봉의 종가 |
 | `size_pct` | 비중 % |
 | `size_of` | `planned_position`(계획 포지션 대비) / `equity`(총자산 대비) / `position`(현재 보유 대비, 청산용) |
-| `type` | 청산 전용: `take_profit` / `stop_loss` / `trailing_stop` / `time_exit` |
+| `type` | 청산 전용: `take_profit` / `stop_loss` / `trailing_stop` / `time_exit` / `signal` |
+
+### 부분 청산
+
+청산 규칙의 `size_pct` 가 100 미만이면 **그만큼만 팔고 포지션이 남는다.**
+남은 수량에 대해 나머지 청산 규칙이 같은 봉에서 이어 평가되고, 다음 날도 계속 평가된다.
+
+```json
+{ "id": "TP1", "type": "take_profit", "target_pct": 7, "size_pct": 50 },
+{ "id": "TP2", "type": "signal", "when": {"op":"<","left":"close","right":"MA5"}, "size_pct": 100 }
+```
+
+- 결과 페이로드에서는 **청산 이벤트마다 `trades` 레코드가 1건** 생긴다.
+  같은 진입에서 나온 것들은 **`group_id` 를 공유**한다 (문자열, 신규 필드).
+- 부분 청산 후에도 평단가는 그대로 유지된다 (수량과 원가를 같은 비율로 줄인다).
+- **한 청산 규칙은 한 포지션에서 한 번만 발동한다.** 그래야 `TP1` 이 매일 절반씩 파는 일이 없다.
+
+### `time_exit` — 보유 기간 기준 청산
+
+```json
+{ "id": "TIME", "type": "time_exit", "hold_days": 7, "pnl_min_pct": 3,
+  "when": { "op": "and", "conditions": [
+    { "op": ">=", "left": "position.hold_days", "right": "hold_days" },
+    { "op": "<",  "left": "position.pnl_pct",   "right": "pnl_min_pct" } ]},
+  "price": "close", "size_pct": 100 }
+```
+
+`when` 을 생략하면 `max_hold_days`(또는 `hold_days`)만 보고 종가로 청산한다.
+`position.hold_days` 는 **영업일(봉) 수**다.
 
 ### `when` 조건식
 
@@ -127,12 +219,23 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | 형태 | 예 | 의미 |
 |---|---|---|
 | 봉 필드 | `"open" "high" "low" "close" "volume" "amount"` | 당일 값 |
-| 기준일 참조 | `"ref.open" "ref.close" "ref.amount"` | 기준일 봉 값 |
+| 시가총액 | `"marcap"` | 당일 시가총액(원). marcap 의 `Marcap` 컬럼을 그대로 쓴다 |
+| 전일 값 | `"prev.close" "prev.high" "prev.volume" "prev.MA20"` | **직전 봉**의 값. 봉 필드·지표 별칭 모두 앞에 `prev.` 를 붙일 수 있다 |
+| 기준일 참조 | `"ref.open" "ref.high" "ref.low" "ref.close" "ref.volume" "ref.amount" "ref.marcap"` | 기준일 봉 값 (전 필드) |
+| 진입봉 참조 | `"entry.low" "entry.high" "entry.close" "entry.price"` | **진입이 체결된 봉**의 값. 청산 규칙에서만 쓸 수 있다 |
 | 체결 참조 | `"fill.B1.price"` | 해당 규칙 체결가 |
 | 포지션 참조 | `"position.avg_price" "position.pnl_pct" "position.hold_days"` | 현재 포지션 상태 |
 | 지표 | `{"indicator":"SMA","period":45,"source":"close"}` | 지표 값 |
-| 수식 | `{"expr":"position.avg_price * 1.1"}` | 산술식 (`+ - * / ( )` 와 위 참조들) |
-| 상수 | `10` `"2026-01-01"` | 리터럴 |
+| 지표 별칭 | `"MA20"` `"HIGH252"` | `indicators[].key` 로 선언한 지표 (아래 참조) |
+| 규칙 파라미터 | `"trigger_pct"` `"hold_days"` | 그 규칙 객체 안의 숫자 필드 |
+| 수식 | `{"expr":"position.avg_price * 1.1"}` | 산술식 (`+ - * / % ** ( )` 와 위 참조들) |
+| 상수 | `10` | 리터럴 |
+
+- `entry.*` 를 **진입 규칙**에서 쓰면 검증 오류다 (진입 전에는 값이 없다).
+- `position.hold_days` 는 **보유 영업일(봉) 수**다.
+  결과 페이로드의 `trades[].hold_days`(달력일)와 값이 다를 수 있으니 주의한다.
+- `expr` 은 `eval()` 을 쓰지 않는다. `ast` 로 파싱해 산술 노드만 통과시키며
+  **함수 호출·람다·컴프리헨션·속성 접근(`__`)은 전부 거부**한다.
 
 ---
 
@@ -154,6 +257,35 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `VWAP` | `anchor` | 거래량가중평균 |
 | `ENVELOPE` | `period`, `pct` | 이격도 밴드 |
 | `DONCHIAN` | `period` | 채널 (`.upper` `.lower`) |
+| `HIGHEST` | `period`, `source` | N봉 최고값 (52주 신고가 판정: `period: 252`) |
+| `LOWEST` | `period`, `source` | N봉 최저값 |
+
+`source` 로 쓸 수 있는 값: `close` `open` `high` `low` **`volume`** **`amount`** `hl2` `hlc3` `ohlc4`.
+`{"indicator":"SMA","period":20,"source":"volume"}` 처럼 쓰면 **거래량 이동평균**이 된다.
+
+### 지표 별칭 — `indicators[].key`
+
+`indicators` 에 선언한 지표는 `key` 이름으로 조건식과 수식 어디서나 참조할 수 있다.
+
+```json
+"indicators": [
+  { "key": "MA20",    "type": "SMA",     "period": 20,  "source": "close",  "plot": true },
+  { "key": "VMA20",   "type": "SMA",     "period": 20,  "source": "volume", "plot": false },
+  { "key": "HIGH252", "type": "HIGHEST", "period": 252, "source": "close",  "plot": true },
+  { "key": "MACD_MAIN", "type": "MACD", "fast": 12, "slow": 26, "signal": 9, "field": "macd" }
+]
+```
+
+```json
+{ "op": "<=", "left": "low",   "right": "MA20" }
+{ "op": ">=", "left": "close", "right": "HIGH252" }
+{ "op": ">",  "left": "prev.close", "right": "prev.MA20" }
+{ "op": ">=", "left": "volume", "right": { "expr": "VMA20 * volume_mult" } }
+```
+
+**별칭을 쓰면 `params` 가 지표 기간을 직접 가리킬 수 있다** (`indicators[0].period`).
+조건식 안에 `{"indicator": ...}` 를 인라인으로 박아 넣으면 같은 숫자가 여러 곳에 중복되어
+"기본값으로 되돌리기"가 제대로 동작하지 않는다. 되도록 별칭을 쓴다.
 
 조건식에서 서브 필드는 `field`로 지정한다:
 
@@ -162,6 +294,69 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 ```
 
 새 지표를 추가하려면 `engine/indicators.py`에 함수 하나를 등록하고 이 표에 한 줄 추가한다.
+
+---
+
+## `params` — 화면에서 조절할 파라미터 선언
+
+전략 JSON 최상위의 `params` 는 **UI 전용 메타데이터**다.
+**엔진 로직은 이 값을 절대 읽지 않는다.** 엔진은 `path` 가 가리키는 실제 값만 본다.
+화면의 파라미터 폼은 이 선언으로 렌더한다 (하드코딩 금지).
+
+```json
+"params": [
+  {
+    "key": "market_cap_min_eok",
+    "label": "최소 시가총액",
+    "group": "1. 종목 선정",
+    "path": "universe.filters.market_cap_min_eok",
+    "type": "number",
+    "unit": "억",
+    "default": 2000,
+    "min": 0, "max": 100000000, "step": 100,
+    "help": "이 금액을 초과하는 종목만 대상으로 합니다",
+    "available": true
+  },
+  {
+    "key": "debt_ratio_max_pct",
+    "label": "부채비율 상한",
+    "group": "1. 종목 선정",
+    "path": "universe.filters.debt_ratio_max_pct",
+    "type": "number", "unit": "%", "default": 200,
+    "available": false,
+    "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+  }
+]
+```
+
+| 키 | 필수 | 설명 |
+|---|---|---|
+| `key` | O | 고유 식별자 |
+| `label` | O | 화면 표시명 |
+| `group` | O | 폼에서 묶을 그룹명. 같은 문자열끼리 한 섹션 |
+| `path` | O | 실제 값의 위치. `entries[0].size_pct` 형식 (점 구분, 대괄호 정수 인덱스) |
+| `type` | O | `number` / `int` / `percent` / `select` / `bool` / `date` / `text` |
+| `default` | O | **초기화 버튼이 되돌릴 값.** 저장해도 이 값은 바뀌지 않는다 |
+| `unit` `min` `max` `step` `options` `help` | | 폼 렌더링 힌트 (`type: "select"` 는 `options` 필수) |
+| `available` | | `false` 면 입력 비활성화 + `unavailable_reason` 표시. 기본 `true` |
+
+**초기화 동작** — "기본값으로 되돌리기"는 모든 `params[].default` 를 각 `path` 에 다시 써넣는다.
+`available: false` 항목도 되돌린다. `params` 배열 자체는 절대 수정하지 않는다.
+
+```python
+from engine.params import get_by_path, set_by_path, reset_to_defaults, params_snapshot
+
+reset_to_defaults(strategy)     # 새 문서를 돌려준다 (원본은 그대로)
+params_snapshot(strategy)       # 각 파라미터의 현재 value / is_default 를 붙여 돌려준다
+```
+
+`validate_strategy` 는 모든 `path` 가 실제로 존재하는지 검사한다. 없으면
+`{"path": "params[3].path", "message": "가리키는 위치가 없습니다: universe.foo"}`.
+
+> **주의** — `path` 는 엔진이 실제로 읽는 위치를 가리켜야 한다.
+> 같은 숫자가 문서 안 여러 곳에 중복돼 있으면(예: 조건식과 `price` 에 각각 인라인으로 박힌 기간)
+> 한 곳만 바뀌어 동작이 어긋난다. 이동평균 기간 같은 값은 `indicators` 에 별칭으로 한 번만 두고
+> `path` 를 `indicators[0].period` 로 잡는다.
 
 ---
 
@@ -236,6 +431,15 @@ B1만 체결된 상태에서 다음 날 B2가 체결되면, B2 체결일에도 �
 > 현재는 일봉 근사로 동작한다. 1분봉 데이터가 연결되면 순서를 실제로 알 수 있으므로
 > `same_day_exit` 을 `always` 로 되돌리면 된다.
 
+#### 종가에 진입한 봉에서는 아예 청산하지 않는다
+
+`same_day_exit` 과 **무관하게** 적용되는 규칙이 하나 더 있다.
+`fill_model: "close"` 이거나 `price: "close"` 라서 **그 봉의 종가에 진입**했다면,
+같은 봉에서는 어떤 청산도 평가하지 않는다. 장이 이미 끝나서 팔 시간 자체가 없기 때문이다.
+(이걸 막지 않으면 "종가 매수 → 같은 종가 매도"가 성립해 수수료만 빠지는 가짜 거래가 대량으로 생긴다.)
+
+---
+
 백테스트 결과의 `assumptions` 블록에 실제로 적용된 값과 사람이 읽을 수 있는 설명(`notes`),
 그리고 아래 통계가 함께 담겨 나온다.
 
@@ -254,6 +458,13 @@ B1만 체결된 상태에서 다음 날 B2가 체결되면, B2 체결일에도 �
 3. 분할 매수/매도는 `entries`/`exits` 배열 원소를 늘려서 표현한다 (별도 필드 만들지 않음)
 4. 원문 자연어는 `description`에 그대로 보존한다 (나중에 재변환·검증용)
 5. 생성 후 `engine/validate.py`로 스키마 검증을 통과해야 등록된다
+6. 조절할 만한 숫자는 전부 `params` 에 노출한다. `path` 는 엔진이 읽는 위치를 정확히 가리켜야 하고,
+   `default` 는 문서에 실제로 들어간 값과 같아야 한다
+7. 이동평균·신고가 같은 지표는 `indicators` 에 `key` 를 붙여 선언하고 조건식에서는 그 이름을 쓴다
+   (인라인 `{"indicator": ...}` 를 여기저기 박지 않는다)
+8. `expr` 에 함수 호출을 쓰지 않는다 (`sma(...)` 불가). 지표는 반드시 별칭이나 `{"indicator": ...}` 로 쓴다
+9. marcap 으로 판정할 수 없는 조건(재무제표 등)은 지어내지 말고 `universe.filters` 에 값만 두고
+   `params` 에서 `available: false` + `unavailable_reason` 을 붙인다
 
 ### 프롬프트 템플릿
 
