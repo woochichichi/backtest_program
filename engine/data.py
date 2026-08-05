@@ -11,6 +11,7 @@ marcap 폴더가 없으면 ``available == False`` 이고 모든 조회는 ``Data
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import json
 import os
 import re
@@ -443,6 +444,7 @@ class MarcapStore:
             df = self.load_year(y, columns=cols, on_chunk=sub_cb, cache=cache_years)
             if on_year is not None:
                 on_year(i + 1.0, len(years), y)
+            gc.collect()          # 직전 해의 중간 산출물을 바로 반납해 피크를 낮춘다
             if cols is not None and len(df.columns) != len(cols):
                 keep = [c for c in cols if c in df.columns]
                 df = df[keep]
