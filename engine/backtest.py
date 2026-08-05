@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .dsl import EvalContext, evaluate_condition, evaluate_operand, safe_eval_expr
+from .data import ADJUST_LIMITATIONS, HALTED_COLUMN, PRICE_LIMIT_PCT
 from .errors import BacktestCancelled, DataUnavailable, DSLError, StrategyError
 from .indicators import REGISTRY
 from .metrics import _i, build_equity, by_stock_summary, compute_metrics, monthly_returns
@@ -42,7 +43,7 @@ SAME_DAY_EXIT_MODES = ("loss_only", "never", "always")
 #: 기본값. 일봉만으로는 저가·고가 순서를 알 수 없으므로 보수적으로 잡는다.
 DEFAULT_SAME_DAY_EXIT = "loss_only"
 
-_PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount", "Marcap"]
+_PRICE_COLS = ["Open", "High", "Low", "Close", "Volume", "Amount", "Marcap", HALTED_COLUMN]
 
 #: 진행률/취소 확인 주기 (초). 계약상 최소 1초에 한 번은 should_cancel 을 봐야 한다.
 CANCEL_INTERVAL_SEC = 0.25
@@ -510,7 +511,10 @@ def _cheap_prefilter(when: Any, panel: pd.DataFrame, params: Mapping):
     m = masks[0]
     for x in masks[1:]:
         m = m & x
-    return m.fillna(False)
+    m = m.fillna(False)
+    if HALTED_COLUMN in panel.columns:
+        m &= ~panel[HALTED_COLUMN].to_numpy(bool)
+    return m
 
 
 def _isna(v) -> bool:
@@ -647,9 +651,11 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
         except DSLError:
             continue
         if hits is True:
-            idx = np.arange(len(df))
-        else:
-            idx = np.flatnonzero(np.asarray(hits, dtype=bool))
+            hits = np.ones(len(df), dtype=bool)
+        hits = np.asarray(hits, dtype=bool)
+        if HALTED_COLUMN in df.columns:
+            hits &= ~df[HALTED_COLUMN].to_numpy(bool)   # 거래정지일은 기준일이 될 수 없다
+        idx = np.flatnonzero(hits)
         if idx.size == 0:
             continue
         take = g.iloc[idx]
@@ -676,6 +682,10 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
 
     beat("기준일 조건 계산 중 (종목별 그룹핑)")
     g = panel.groupby("Code", sort=False, observed=True)
+    halted = (
+        panel[HALTED_COLUMN].to_numpy(bool) if HALTED_COLUMN in panel.columns
+        else np.zeros(len(panel), dtype=bool)
+    )
 
     if rule == "none":
         mask = pd.Series(True, index=panel.index)
@@ -687,6 +697,11 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
             beat("기준일 조건 계산 중 (직전일 거래대금)")
             prev = g["Amount"].shift(1)
             mask &= prev.notna() & (prev <= float(prev_max) * EOK)
+            # 직전일이 거래정지면 거래대금이 0 이라 "조용한 날" 조건을 공짜로 통과한다.
+            # 거래가 없었던 것이지 조용했던 게 아니므로 후보에서 뺀다.
+            prev_halted = pd.Series(halted, index=panel.index).groupby(
+                panel["Code"], sort=False, observed=True).shift(1)
+            mask &= ~prev_halted.fillna(True).astype(bool)
     elif rule == "volume_spike":
         n = int(rd.get("volume_ma_period") or 20)
         mult = float(rd.get("volume_mult") or 3.0)
@@ -700,6 +715,8 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
         mask = pd.Series(False, index=panel.index)
 
     beat("기준일 조건 계산 중 (구간 필터)")
+    # 거래정지일은 OHLC 가 0 이라 어떤 가격 조건도 무의미하다. 기준일이 될 수 없다.
+    mask &= ~halted
     mask &= panel["Date"] >= pd.Timestamp(start)
     cols = [c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in panel.columns]
     out = panel.loc[mask, cols]
@@ -933,6 +950,13 @@ def run_backtest(
         "same_day_profit_exits_blocked": 0,
         "missing_financials": 0,
         "missing_financials_pct": 0.0,
+        "halted_bars_skipped": 0,
+        "halted_symbols": 0,
+        "halted_reference_days_rejected": 0,
+        "price_adjust_events": 0,
+        "price_adjust_symbols": 0,
+        "extreme_moves_flagged": 0,
+        "limit_price_fills": 0,
     }
 
     # 지표 별칭 — strategy["indicators"][].key 를 조건식/수식에서 이름으로 쓴다
@@ -980,6 +1004,13 @@ def run_backtest(
             "ignored_filters": [
                 {"key": ig["key"], "reason": ig["reason"]} for ig in ignored_filters
             ],
+            "price_adjustment": {
+                "applied": bool(adjust_info.get("applied")),
+                "events": int(stats["price_adjust_events"]),
+                "symbols": int(stats["price_adjust_symbols"]),
+                "method": "stocks_ratio",
+                "limitations": list(ADJUST_LIMITATIONS),
+            },
             "dart": {
                 "available": bool(dart_ok),
                 "as_of": bool(dart_ok and financial_filters),
@@ -1023,6 +1054,14 @@ def run_backtest(
     except TypeError:                       # 구버전 store (columns/on_year 미지원)
         panel = store.panel(hist_start, end)
     rep.check(force=True)
+    adjust_info = dict(getattr(store, "last_adjustment", None) or {})
+    stats["price_adjust_events"] = int(adjust_info.get("events") or 0)
+    stats["price_adjust_symbols"] = int(adjust_info.get("symbols") or 0)
+    if adjust_info.get("applied"):
+        warnings.append(
+            f"수정주가를 적용했습니다 (상장주식수 변화 기준, 이벤트 {stats['price_adjust_events']:,}건 / "
+            f"{stats['price_adjust_symbols']:,}종목). 유상증자·배당락은 반영되지 않습니다."
+        )
     report(17, "종목 목록 정리 중", PHASE_LOAD)
     # 연도 파일은 (Date, Code) 순으로 저장돼 있고 연도 순으로 이어붙였으므로 이미 Date 오름차순이다.
     # 700만 행 정렬은 몇 초가 걸리는데 중간에 취소 확인을 넣을 수 없어, 필요할 때만 한다.
@@ -1130,9 +1169,14 @@ def run_backtest(
             "close": df["Close"].to_numpy(),
             "volume": df["Volume"].to_numpy() if "Volume" in df else np.zeros(len(df)),
             "amount": df["Amount"].to_numpy() if "Amount" in df else np.zeros(len(df)),
+            "halted": (
+                df[HALTED_COLUMN].to_numpy(bool) if HALTED_COLUMN in df.columns
+                else np.zeros(len(df), dtype=bool)
+            ),
             "ind": {},
             "ctx": None,
         }
+        _flag_price_events(recs[code], stats)
 
     # 패널은 여기까지만 필요하다. 700만 행을 붙들고 있으면 시뮬레이션 내내 메모리를 잡아먹는다.
     panel = None
@@ -1161,6 +1205,7 @@ def run_backtest(
     # ---------------------------------------------------------------- 2단계 시뮬레이션
     report(25, "체결 시뮬레이션")
     cash = initial_capital
+    halted_codes: set = set()
     active: Dict[str, dict] = {}
     trades: List[dict] = []
     eq_values: List[float] = []
@@ -1191,6 +1236,9 @@ def run_backtest(
             li = int(rec["row_of_gi"][gi])
             if li < 0:
                 continue
+            if rec["halted"][li]:
+                stats["halted_reference_days_rejected"] += 1
+                continue
             w = active.get(code)
             if w is None:
                 active[code] = _new_watch(code, day, li, gi, refbar)
@@ -1219,7 +1267,13 @@ def run_backtest(
             rec = recs[code]
             li = int(rec["row_of_gi"][gi])
             if li < 0:
-                continue  # 거래정지 등 — 해당일 봉 없음
+                continue  # 그날 봉 자체가 없다 (상장 전/후)
+            if rec["halted"][li]:
+                # 거래정지일. OHLC 가 0 이라 어떤 조건도 성립시키면 안 된다.
+                # 보유 포지션은 팔 수 없으니 그대로 들고 간다 (보유일수는 계속 센다).
+                stats["halted_bars_skipped"] += 1
+                halted_codes.add(code)
+                continue
 
             bar = _bar(rec, li)
             nxt = _bar(rec, li + 1) if li + 1 < len(rec["close"]) else None
@@ -1428,6 +1482,7 @@ def run_backtest(
             f"시그널 로그가 {sig.limit:,}건을 넘어 이후 {sig.dropped:,}건은 생략했습니다."
         )
 
+    stats["halted_symbols"] = len(halted_codes)
     stats["same_day_entry_exit"] = sum(1 for t in trades if t["hold_days"] == 0)
     stats["same_day_entry_exit_pct"] = (
         _r(stats["same_day_entry_exit"] / len(trades) * 100.0) if trades else 0.0
@@ -1641,6 +1696,36 @@ def _new_watch(code: str, ref_date: dt.date, ref_li: int, ref_gi: int, refbar: d
         "group_id": None,
         "exits_done": set(),
     }
+
+
+def _flag_price_events(rec: dict, stats: dict) -> None:
+    """데이터 품질 표식을 미리 계산한다.
+
+    * ``limit_up`` / ``limit_down`` — 상·하한가로 마감한 봉 (실제로는 체결이 어렵다)
+    * ``extreme_moves_flagged`` — 가격제한폭을 넘는 변동. 수정주가로 못 잡은 권리락이나
+      정지 해제 갭이다. 많으면 결과를 의심해야 한다.
+    """
+    c = rec["close"].astype("float64")
+    n = c.shape[0]
+    up = np.zeros(n, dtype=bool)
+    dn = np.zeros(n, dtype=bool)
+    if n < 2:
+        rec["limit_up"], rec["limit_down"] = up, dn
+        return
+    h = rec["high"].astype("float64")
+    l = rec["low"].astype("float64")
+    prev = np.concatenate(([np.nan], c[:-1]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        chg = (c / prev - 1.0) * 100.0
+    live = ~rec["halted"]
+    prev_live = np.concatenate(([False], live[:-1]))
+    ok = live & prev_live & np.isfinite(chg)
+
+    near = PRICE_LIMIT_PCT - 0.5
+    up[ok & (chg >= near) & (c >= h - 1e-9)] = True
+    dn[ok & (chg <= -near) & (c <= l + 1e-9)] = True
+    rec["limit_up"], rec["limit_down"] = up, dn
+    stats["extreme_moves_flagged"] += int(np.count_nonzero(ok & (np.abs(chg) > PRICE_LIMIT_PCT)))
 
 
 def _row_maps(index: pd.DatetimeIndex, cal_ns: np.ndarray, n_cal: int) -> dict:
