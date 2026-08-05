@@ -1195,10 +1195,8 @@ def test_report_룩어헤드를_잡아낸다(tmp_path, capsys, monkeypatch):
     root = tmp_path / "dart"
     write_store(root, realistic_rows(codes, [2023, 2024, 2025]))
 
-    def broken_disclosed(self, date):
-        return self.load()          # 공시일 필터를 통째로 무시한다
-
-    monkeypatch.setattr(ed.DartStore, "_disclosed", broken_disclosed)
+    # as-of 컷오프가 걸리는 단 한 곳을 망가뜨린다 (조회일을 먼 미래로 읽게 만든다)
+    monkeypatch.setattr(ed.DartStore, "_date_ordinal", lambda self, date: 10**9)
 
     rc, out = run_report(root, tmp_path / "marcap", capsys)
     assert rc == fd.REPORT_ISSUES

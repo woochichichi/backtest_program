@@ -946,6 +946,9 @@ export class CandleChart {
     let pinch = null;   // {dist, i0, i1, frac}
 
     host.addEventListener('pointerdown', (e) => {
+      // 차트 위에 겹쳐 놓은 안내 패널의 버튼(다시 시도 / 종목 고르기 등)은 그대로 눌려야 한다.
+      // 여기서 포인터를 캡처해 버리면 이어지는 click 이 캔버스로 리타깃되어 버튼이 죽는다.
+      if (e.target.closest('button, a, input, select, textarea, [data-act]')) return;
       if (!this.hasData()) return;
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
