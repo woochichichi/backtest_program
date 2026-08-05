@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
+import json
 import math
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -240,6 +241,26 @@ SUPPORTED_FILTERS = {
 }
 
 _DEFAULT_IGNORED_REASON = "이 조건에 필요한 데이터가 marcap 에 없어 적용하지 않았습니다."
+
+
+#: 항상 필요한 컬럼
+_BASE_COLS = ["Date", "Code", "Name", "Open", "High", "Low", "Close", "Volume", "Amount"]
+
+
+def _needed_columns(strategy: Mapping) -> List[str]:
+    """전략이 실제로 쓰는 컬럼만 고른다 — 안 읽으면 그만큼 메모리가 안 든다."""
+    cols = list(_BASE_COLS)
+    universe = strategy.get("universe") or {}
+    if universe.get("markets"):
+        cols += ["Market", "MarketId"]
+    ex = {str(e).upper() for e in (universe.get("exclude") or [])}
+    if ex & {"ADMIN_ISSUE", "TRADE_HALT", "ETF", "ETN"}:
+        cols.append("Dept")
+    filters = universe.get("filters") or {}
+    blob = json.dumps(strategy, ensure_ascii=False, default=str)
+    if any(k.startswith("market_cap") for k in filters) or '"marcap"' in blob:
+        cols.append("Marcap")
+    return list(dict.fromkeys(cols))
 
 
 def _indicator_aliases(strategy: Mapping) -> Dict[str, dict]:
@@ -806,8 +827,7 @@ def run_backtest(
                  f"{year}년 데이터 읽는 중 ({min(int(idx) + 1, total)}/{total}년)",
                  PHASE_LOAD)
 
-    want_cols = ["Date", "Code", "Name", "Market", "MarketId", "Dept",
-                 "Open", "High", "Low", "Close", "Volume", "Amount", "Marcap"]
+    want_cols = _needed_columns(strategy)
     try:
         panel = store.panel(hist_start, end, columns=want_cols, on_year=_on_year)
     except TypeError:                       # 구버전 store (columns/on_year 미지원)
@@ -895,6 +915,10 @@ def run_backtest(
             "ind": {},
             "ctx": None,
         }
+
+    # 패널은 여기까지만 필요하다. 700만 행을 붙들고 있으면 시뮬레이션 내내 메모리를 잡아먹는다.
+    panel = None
+    del panel
 
     events_by_day: Dict[dt.date, List[Tuple[str, dict]]] = {}
     for _k, row in enumerate(events.itertuples(index=False)):
@@ -1308,7 +1332,7 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
 
 
 #: 후보 종목을 한 번에 몇 개씩 잘라 처리할지. groupby 한 번이 1초를 넘지 않도록 잡는다.
-CANDIDATE_BATCH = 150
+CANDIDATE_BATCH = 80
 
 
 def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
@@ -1319,7 +1343,7 @@ def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
     """
     cols = [c for c in (["Date", "Code", "Name"] + _PRICE_COLS) if c in panel.columns]
     rep.tick(20, "후보 종목 데이터 준비 중", PHASE_SCAN)
-    narrow = panel[cols]
+    narrow = panel if list(panel.columns) == cols else panel[cols]
     rep.tick(20, f"후보 종목 데이터 준비 중 (0/{total:,})", PHASE_SCAN)
 
     codes = list(cand_codes)

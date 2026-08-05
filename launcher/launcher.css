@@ -33,17 +33,16 @@ body {
   background: linear-gradient(to bottom, #141a2b 0%, #0d1118 55%, #0b0e11 100%);
   overflow: hidden;
 }
+/* 하드한 원이 보이지 않도록 radial-gradient 로 부드럽게 흘린다 (IE10+ 지원) */
 #glow {
-  position: absolute; left: -60px; top: -90px;
-  width: 320px; height: 320px;
-  border-radius: 50%;
-  background: rgba(41, 98, 255, .10);
+  position: absolute; left: -140px; top: -170px;
+  width: 460px; height: 460px;
+  background: radial-gradient(circle, rgba(41, 98, 255, .22) 0%, rgba(41, 98, 255, .07) 45%, rgba(41, 98, 255, 0) 70%);
 }
 #glow2 {
-  position: absolute; right: -80px; bottom: -120px;
-  width: 300px; height: 300px;
-  border-radius: 50%;
-  background: rgba(242, 54, 69, .07);
+  position: absolute; right: -170px; bottom: -190px;
+  width: 460px; height: 460px;
+  background: radial-gradient(circle, rgba(242, 54, 69, .16) 0%, rgba(242, 54, 69, .05) 45%, rgba(242, 54, 69, 0) 70%);
 }
 #candles { position: absolute; left: 0; right: 0; bottom: 0; height: 190px; }
 .cd {
@@ -60,19 +59,27 @@ body {
   position: absolute; left: 4px; width: 1px; bottom: 0;
   display: block;
 }
-.cd.up b { background: rgba(242, 54, 69, .16); }
-.cd.up i { background: rgba(242, 54, 69, .14); }
-.cd.dn b { background: rgba(72, 134, 255, .13); }
-.cd.dn i { background: rgba(72, 134, 255, .11); }
+.cd.up b { background: rgba(242, 54, 69, .075); }
+.cd.up i { background: rgba(242, 54, 69, .065); }
+.cd.dn b { background: rgba(72, 134, 255, .065); }
+.cd.dn i { background: rgba(72, 134, 255, .055); }
 @keyframes cdin { from { -ms-transform: scaleY(0); transform: scaleY(0); opacity: 0; }
                   to   { -ms-transform: scaleY(1); transform: scaleY(1); opacity: 1; } }
 
 #trend {
   position: absolute; left: 0; bottom: 34px;
   width: 560px; height: 2px;
-  background: rgba(242, 54, 69, .16);
+  background: rgba(242, 54, 69, .10);
   -ms-transform: rotate(-11deg); transform: rotate(-11deg);
   -ms-transform-origin: 0 50%; transform-origin: 0 50%;
+}
+
+/* 글자가 놓이는 아래쪽은 배경을 덮어 가독성을 지킨다 */
+#scrim {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 240px;
+  background: -ms-linear-gradient(top, rgba(11, 14, 17, 0) 0%, rgba(11, 14, 17, .62) 38%, rgba(11, 14, 17, .93) 100%);
+  background: linear-gradient(to bottom, rgba(11, 14, 17, 0) 0%, rgba(11, 14, 17, .62) 38%, rgba(11, 14, 17, .93) 100%);
 }
 
 /* ---------- 본문 ---------- */

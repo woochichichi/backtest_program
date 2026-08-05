@@ -40,7 +40,7 @@ NUMERIC_COLUMNS = [
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
 
-def _concat_columnwise(frames: List[pd.DataFrame], beat) -> pd.DataFrame:
+def _concat_columnwise(frames: List[pd.DataFrame], beat, consume: bool = True) -> pd.DataFrame:
     """여러 해치 프레임을 **컬럼 단위로** 이어붙인다.
 
     ``pd.concat(frames)`` 은 700만 행에서 수 초가 걸리는 단일 연산이라 그 사이 취소를 받을 수 없다.
@@ -51,9 +51,27 @@ def _concat_columnwise(frames: List[pd.DataFrame], beat) -> pd.DataFrame:
     data = {}
     for i, c in enumerate(cols):
         parts = [f[c] for f in frames if c in f.columns]
-        data[c] = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0].reset_index(drop=True)
+        if consume:
+            # 붙인 컬럼은 원본에서 떼어내 바로 메모리를 돌려준다 (데이터를 두 벌 들지 않도록)
+            for f in frames:
+                if c in f.columns:
+                    del f[c]
+        if len(parts) > 2:
+            # 문자열 컬럼은 한 번에 붙이면 1초를 넘길 수 있어 절반씩 나눈다
+            half = len(parts) // 2
+            a = pd.concat(parts[:half], ignore_index=True)
+            beat(0.05 + 0.2 * (i + 0.5) / max(n, 1))
+            b = pd.concat(parts[half:], ignore_index=True)
+            beat(0.05 + 0.2 * (i + 0.8) / max(n, 1))
+            data[c] = pd.concat([a, b], ignore_index=True)
+        else:
+            data[c] = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0].reset_index(drop=True)
+        parts.clear()
         beat(0.05 + 0.2 * (i + 1) / max(n, 1))
-    return pd.DataFrame(data, columns=cols)
+    out = pd.DataFrame(data, columns=cols)
+    data.clear()
+    beat(0.28)
+    return out
 
 
 def _to_date(v) -> dt.date:
@@ -125,11 +143,16 @@ class MarcapStore:
     CHUNK_ROWS = 250_000
 
     #: 이 행 수를 넘는 패널은 feather 캐시를 만들지 않는다.
-    #: 연도 단위 메모리 캐시로 이미 재사용되고, 쓰기가 수 초씩 걸려 취소를 막는다.
+    #: 쓰기가 수 초씩 걸려 취소를 막고, 파일도 수백 MB 가 된다.
     CACHE_MAX_ROWS = 1_500_000
 
+    #: 메모리에 붙들고 있을 연도 프레임 최대 개수 (LRU).
+    #: 여러 해를 한 번에 읽는 백테스트에서는 아예 캐시하지 않는다 — 안 그러면 데이터를 두 벌 든다.
+    MAX_CACHED_YEARS = 3
+
     def load_year(self, year: int, columns: Sequence[str] | None = None,
-                  on_chunk: Optional[Callable[[float], None]] = None) -> pd.DataFrame:
+                  on_chunk: Optional[Callable[[float], None]] = None,
+                  cache: bool = True) -> pd.DataFrame:
         """한 해치 parquet 를 읽어 정규화된 DataFrame 으로 돌려준다 (Date 는 컬럼).
 
         ``on_chunk(fraction)`` 을 주면 파일을 **행 묶음 단위로 나눠 읽으면서** 매번 호출한다.
@@ -160,7 +183,10 @@ class MarcapStore:
                 raise           # 콜백이 던진 취소 예외는 그대로 올린다
             raise DataUnavailable(f"{path} 를 읽을 수 없습니다: {e}") from e
         df = self._normalize(df, on_chunk)
-        self._years[ckey] = df
+        if cache:
+            self._years[ckey] = df
+            while len(self._years) > self.MAX_CACHED_YEARS:
+                self._years.pop(next(iter(self._years)))
         return df
 
     def _read_parquet(self, path: Path,
@@ -383,7 +409,8 @@ class MarcapStore:
             if on_year is not None:
                 def sub_cb(frac, _i=i, _n=len(years), _y=y):   # noqa: F811
                     on_year(_i + frac, _n, _y)
-            df = self.load_year(y, columns=cols, on_chunk=sub_cb)
+            df = self.load_year(y, columns=cols, on_chunk=sub_cb,
+                                cache=len(years) <= self.MAX_CACHED_YEARS)
             if on_year is not None:
                 on_year(i + 1.0, len(years), y)
             if cols is not None and len(df.columns) != len(cols):
@@ -405,6 +432,7 @@ class MarcapStore:
             out = frames[0].reset_index(drop=True)
         else:
             out = _concat_columnwise(frames, beat)
+            frames.clear()
         beat(0.3)
 
         if use_cache and columns is None and len(out) <= self.CACHE_MAX_ROWS:

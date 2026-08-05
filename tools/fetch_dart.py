@@ -1348,7 +1348,7 @@ def selftest(
             print(f"      {ln}", flush=True)
         return SELFTEST_NO_KEY
     src = "환경변수 DART_API_KEY" if os.environ.get("DART_API_KEY") else f"{KEY_FILENAME} 파일"
-    print(f"      결과: 성공 - {src} 에서 읽었습니다.", flush=True)
+    print(f"      결과: 성공 - {src}에서 읽었습니다.", flush=True)
     print(f"      키   : {mask_key(key)}", flush=True)
     if len(key) != 40:
         print(f"      [주의] DART 인증키는 보통 40자입니다. 지금 {len(key)}자입니다.", flush=True)
