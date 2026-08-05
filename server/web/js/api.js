@@ -315,7 +315,19 @@ export function runBacktest(strategy, period, opts = {}) {
   if (opts.jobId) body.job_id = opts.jobId;
   return request('/backtest', {
     method: 'POST', body: JSON.stringify(body), signal: opts.signal,
-  }, BACKTEST_TIMEOUT_MS);
+  }, BACKTEST_TIMEOUT_MS).then((r) => {
+    // v2 §2-2: 취소는 오류(499)가 아니라 200 + cancelled:true 로 온다.
+    // 오류 배너가 뜨지 않도록 aborted 로 표준화해서 던진다.
+    if (r && r.ok === false && r.cancelled) {
+      throw new ApiError(r.error || '사용자가 취소했습니다.', { kind: 'aborted', aborted: true, payload: r });
+    }
+    if (r && r.ok === false) {
+      throw new ApiError(r.error || '백테스트에 실패했습니다.', {
+        status: 200, payload: r, path: '/backtest', kind: 'server', detail: r.detail || '',
+      });
+    }
+    return r;
+  });
 }
 
 /**
@@ -331,6 +343,41 @@ export function backtestProgressStream(jobId) {
     return new EventSource(`${BASE}/backtest/progress/${encodeURIComponent(jobId)}`);
   } catch {
     return null;
+  }
+}
+
+/**
+ * POST /api/backtest/cancel/{job_id} (ARCHITECTURE-v2 §2-2)
+ * 서버가 취소를 지원한다고 알린 경우에만 호출한다.
+ * @returns {Promise<object|null>} 미지원이면 null
+ */
+export async function cancelBacktest(jobId) {
+  if (fallback || !jobId) return null;
+  if (!hasFeature('backtest_cancel', false)) return null;
+  try {
+    return await request(`/backtest/cancel/${encodeURIComponent(jobId)}`, { method: 'POST' }, 15000);
+  } catch (e) {
+    // 404 = 이미 끝났거나 없는 job. 취소 실패를 오류로 키우지 않는다.
+    if (e instanceof ApiError && e.status === 404) return { ok: true, cancelled: false, reason: '이미 완료됨' };
+    throw e;
+  }
+}
+
+/**
+ * POST /api/strategies/{id}/reset — params[].default 로 되돌리기 (v2 §1)
+ * 서버가 아직 구현하지 않았으면(404/501) null 을 돌려주고,
+ * 호출부가 클라이언트에서 직접 default 를 적용한다.
+ * @returns {Promise<object|null>} 되돌린 전략, 미지원이면 null
+ */
+export async function resetStrategy(id) {
+  if (fallback) return null;
+  // 서버가 이 기능을 알리지 않으면 호출하지 않는다. 호출부가 클라이언트에서 default 를 적용한다.
+  if (!hasFeature('strategy_reset', false)) return null;
+  try {
+    return await request(`/strategies/${encodeURIComponent(id)}/reset`, { method: 'POST' }, 20000);
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 501 || e.status === 405)) return null;
+    throw e;
   }
 }
 

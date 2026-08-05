@@ -870,3 +870,101 @@ table.diff .mono { font-family: var(--mono); font-size: 10px; }
   .stg-actions { grid-template-columns: repeat(2, 1fr); }
   #btnSave { grid-column: span 2; }
 }
+
+/* ============================================================
+   추가 v2 — params 폼 / 진행 패널 / 분할 청산 묶음 / 미적용 조건
+   ============================================================ */
+
+/* ---------- 적용되지 않는 파라미터 (available:false) ---------- */
+.fld-off { opacity: .72; }
+.fld-off .inp,
+.fld-off .sw { cursor: not-allowed; }
+.fld-off .inp:disabled {
+  background: var(--bg-3); color: var(--tx-dim);
+  border-style: dashed; text-decoration: line-through;
+}
+.fld-off .sw input:disabled + i { opacity: .5; }
+.fld-unavail {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin: 0 0 8px; padding: 6px 8px;
+  border-radius: var(--r-sm);
+  background: var(--bg-2); border: 1px dashed var(--bd-str);
+  font-size: 10.5px; line-height: 1.5; color: var(--tx-sub);
+}
+.fld-unavail svg { flex: 0 0 12px; margin-top: 1px; color: var(--warn); }
+.fld-unavail b { color: var(--warn-tx); font-weight: 700; }
+.grp-off {
+  margin-left: auto; padding: 0 5px; border-radius: 3px;
+  background: var(--warn-soft); color: var(--warn-tx); border: 1px solid var(--warn);
+  font-size: 9px; font-weight: 700; letter-spacing: 0;
+}
+.grp-t { display: flex; align-items: center; }
+
+/* ---------- 실행 기준: 미적용 조건 목록 ---------- */
+.ign-list { list-style: none; margin: 7px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.ign-list li {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 5px 7px; border-radius: var(--r-sm);
+  background: var(--bg-1); border: 1px solid var(--bd);
+}
+.ign-list li b { font-family: var(--mono); font-size: 10.5px; color: var(--danger-tx); }
+.ign-list li span { font-size: 10.5px; color: var(--tx-sub); line-height: 1.45; }
+
+/* ---------- 백테스트 진행 패널 ---------- */
+.run-panel {
+  flex: 0 0 auto; padding: 9px 16px;
+  background: var(--accent-soft); border-bottom: 1px solid var(--bd);
+}
+.run-panel[hidden] { display: none; }
+.run-top { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.run-phase { font-size: 13px; font-weight: 700; color: var(--tx); }
+.run-pct { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--accent-tx); min-width: 34px; }
+.run-meta { font-size: 11.5px; color: var(--tx-sub); font-family: var(--mono); }
+.run-top .btn { margin-left: auto; }
+.run-bar {
+  height: 6px; border-radius: 3px; margin-top: 7px;
+  background: var(--bg-3); overflow: hidden;
+}
+.run-bar > i {
+  display: block; height: 100%; width: 0;
+  background: var(--accent); border-radius: 3px;
+  transition: width .28s var(--ease);
+}
+.run-bar > i.indet {
+  width: 34% !important;
+  animation: runIndet 1.15s ease-in-out infinite;
+}
+@keyframes runIndet {
+  0% { margin-left: -34%; } 100% { margin-left: 100%; }
+}
+.run-msg {
+  margin-top: 5px; font-size: 11.5px; color: var(--tx-sub);
+  font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+@media (prefers-reduced-motion: reduce) {
+  .run-bar > i.indet { animation-duration: 3s; }
+}
+
+/* ---------- 분할 청산 묶음 (group_id) ---------- */
+tbody tr.grp-row td:first-child { position: relative; }
+/* 같은 매수에서 나온 줄들을 왼쪽 세로선으로 잇는다 */
+tbody tr.grp-row td:first-child::before {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0;
+  width: 2px; background: var(--accent-bd);
+}
+tbody tr.grp-row.grp-first td:first-child::before { top: 50%; border-radius: 1px 1px 0 0; }
+tbody tr.grp-row.grp-last td:first-child::before { bottom: 50%; border-radius: 0 0 1px 1px; }
+tbody tr.grp-row td { background: var(--accent-soft); }
+tbody tr.grp-row:hover td { background: var(--bg-2); }
+tbody tr.grp-row.sel td { background: var(--accent-soft); }
+tbody tr.grp-row:not(.grp-last) td { border-bottom-color: transparent; }
+.grp-mark {
+  display: inline-block; margin-right: 5px; padding: 0 5px;
+  border-radius: 3px; background: var(--accent-soft);
+  border: 1px solid var(--accent-bd); color: var(--accent-tx);
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+}
+
+/* ---------- 되돌리기 버튼이 길어질 때 ---------- */
+#btnRevert { grid-column: span 3; }
+@media (max-width: 1180px) { #btnRevert { grid-column: span 2; } }

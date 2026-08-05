@@ -1,0 +1,434 @@
+{
+  "schema": "krx-backtest-strategy/v1",
+  "id": "strategy3",
+  "name": "전략3 — 중단기 스윙 주도주 눌림목",
+  "description": "52주 신고가 거래대금 폭발 주도주 탐색 및 20일선 지지 반등 매매",
+  "author": "user",
+  "created_at": "2026-07-25",
+  "enabled": true,
+
+  "market": {
+    "country": "KR",
+    "asset": "stock",
+    "bar": "1d",
+    "trade_resolution": "1d"
+  },
+
+  "universe": {
+    "markets": ["KOSPI", "KOSDAQ"],
+    "exclude": ["ETF", "ETN", "SPAC", "PREFERRED", "ADMIN_ISSUE", "TRADE_HALT"],
+    "filters": {
+      "market_cap_min_eok": 2000,
+      "debt_ratio_max_pct": 200,
+      "current_ratio_min_pct": 100,
+      "profitable_quarters_min": 4,
+      "comment": "재무 3종(부채비율/유동비율/영업이익 연속 흑자)은 marcap 에 데이터가 없어 엔진이 적용하지 못한다. 결과의 assumptions.ignored_filters 로 보고된다."
+    },
+    "reference_day": {
+      "rule": "custom",
+      "lookback_days": 20,
+      "spike_amount_krw_eok": 1000,
+      "volume_mult": 5,
+      "close_change_min_pct": 15,
+      "gap_open_max_pct": 5,
+      "when": {
+        "op": "and",
+        "conditions": [
+          { "op": ">=", "left": "amount", "right": { "expr": "spike_amount_krw_eok * 100000000" } },
+          { "op": ">=", "left": "volume", "right": { "expr": "VMA20 * volume_mult" } },
+          { "op": ">=", "left": "close", "right": { "expr": "prev.close * (1 + close_change_min_pct / 100)" } },
+          { "op": "<", "left": "open", "right": { "expr": "prev.close * (1 + gap_open_max_pct / 100)" } },
+          { "op": ">=", "left": "close", "right": "HIGH252" },
+          { "op": ">", "left": "prev.close", "right": "prev.MA20" }
+        ]
+      },
+      "comment": "전부 AND. 거래대금 1,000억 초과 · 거래량 20일평균 5배 이상 · 종가 전일대비 +15% 이상 · 시가 갭상승 +5% 미만 · 52주(252봉) 종가 신고가 · 전일 종가가 20일선 위."
+    },
+    "condition": "none",
+    "valid_days_after_reference": 15
+  },
+
+  "entries": [
+    {
+      "id": "B1",
+      "label": "진입 (20일선 지지 반등 · 종가 매수)",
+      "pullback_amount_divisor": 3,
+      "when": {
+        "op": "and",
+        "conditions": [
+          { "op": "<=", "left": "low", "right": "MA20" },
+          { "op": ">", "left": "close", "right": "MA20" },
+          { "op": ">", "left": "MACD_MAIN", "right": 0 },
+          { "op": "<=", "left": "amount", "right": { "expr": "ref.amount / pullback_amount_divisor" } }
+        ]
+      },
+      "price": "close",
+      "size_pct": 100,
+      "size_of": "planned_position",
+      "comment": "눌림목 조건(일일 거래대금 <= 기준일 거래대금 x 1/3)을 4번째 AND 조건으로 함께 판정한다. 기준일 후 valid_days_after_reference(15거래일) 안에서만 유효하다."
+    }
+  ],
+
+  "exits": [
+    {
+      "id": "SL",
+      "label": "손절 (진입일 저가 이탈 또는 20일선 이탈)",
+      "type": "stop_loss",
+      "when": {
+        "op": "or",
+        "conditions": [
+          { "op": "<", "left": "close", "right": "entry.low" },
+          { "op": "<", "left": "close", "right": "MA20" }
+        ]
+      },
+      "price": "close",
+      "size_pct": 100
+    },
+    {
+      "id": "TP1",
+      "label": "1차 익절 (평단 +7% 도달 · 50%)",
+      "type": "take_profit",
+      "target_pct": 7,
+      "when": { "op": ">=", "left": "high", "right": { "expr": "position.avg_price * (1 + target_pct / 100)" } },
+      "price": { "expr": "position.avg_price * (1 + target_pct / 100)" },
+      "size_pct": 50
+    },
+    {
+      "id": "TP2",
+      "label": "2차 익절 (5일선 이탈 · 잔량 전량)",
+      "type": "signal",
+      "when": { "op": "<", "left": "close", "right": "MA5" },
+      "price": "close",
+      "size_pct": 100
+    },
+    {
+      "id": "TIME",
+      "label": "시간 청산 (보유 7일 경과 & 수익률 +3% 미만)",
+      "type": "time_exit",
+      "hold_days": 7,
+      "pnl_min_pct": 3,
+      "when": {
+        "op": "and",
+        "conditions": [
+          { "op": ">=", "left": "position.hold_days", "right": "hold_days" },
+          { "op": "<", "left": "position.pnl_pct", "right": "pnl_min_pct" }
+        ]
+      },
+      "price": "close",
+      "size_pct": 100
+    }
+  ],
+
+  "exit_priority": ["SL", "TIME", "TP1", "TP2"],
+
+  "indicators": [
+    { "key": "MA20", "type": "SMA", "period": 20, "source": "close", "plot": true, "color": "#ffb74d" },
+    { "key": "MA5", "type": "SMA", "period": 5, "source": "close", "plot": true, "color": "#4dd0e1" },
+    { "key": "VMA20", "type": "SMA", "period": 20, "source": "volume", "plot": false },
+    { "key": "HIGH252", "type": "HIGHEST", "period": 252, "source": "close", "plot": true, "color": "#ba68c8" },
+    { "key": "MACD_MAIN", "type": "MACD", "fast": 12, "slow": 26, "signal": 9, "field": "macd", "plot": false }
+  ],
+
+  "portfolio": {
+    "initial_capital_manwon": 10000,
+    "max_positions": 10,
+    "position_sizing": "equal_weight",
+    "allow_duplicate_symbol": false
+  },
+
+  "execution": {
+    "resolution": "1d",
+    "fill_model": "touch",
+    "same_day_exit": "loss_only",
+    "slippage_pct": 0.1,
+    "fee_pct": 0.23
+  },
+
+  "period": {
+    "start": "2016-01-01",
+    "end": "auto"
+  },
+
+  "params": [
+    {
+      "key": "market_cap_min_eok",
+      "label": "최소 시가총액",
+      "group": "1. 종목 선정",
+      "path": "universe.filters.market_cap_min_eok",
+      "type": "number", "unit": "억", "default": 2000,
+      "min": 0, "max": 100000000, "step": 100,
+      "help": "이 금액을 초과하는 종목만 대상으로 합니다",
+      "available": true
+    },
+    {
+      "key": "debt_ratio_max_pct",
+      "label": "부채비율 상한",
+      "group": "1. 종목 선정",
+      "path": "universe.filters.debt_ratio_max_pct",
+      "type": "number", "unit": "%", "default": 200,
+      "min": 0, "max": 10000, "step": 10,
+      "available": false,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+    },
+    {
+      "key": "current_ratio_min_pct",
+      "label": "유동비율 하한",
+      "group": "1. 종목 선정",
+      "path": "universe.filters.current_ratio_min_pct",
+      "type": "number", "unit": "%", "default": 100,
+      "min": 0, "max": 10000, "step": 10,
+      "available": false,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+    },
+    {
+      "key": "profitable_quarters_min",
+      "label": "영업이익 연속 흑자 분기",
+      "group": "1. 종목 선정",
+      "path": "universe.filters.profitable_quarters_min",
+      "type": "int", "unit": "분기", "default": 4,
+      "min": 0, "max": 20, "step": 1,
+      "available": false,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+    },
+
+    {
+      "key": "spike_amount_krw_eok",
+      "label": "거래대금 하한",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "universe.reference_day.spike_amount_krw_eok",
+      "type": "number", "unit": "억", "default": 1000,
+      "min": 0, "max": 1000000, "step": 100,
+      "help": "기준일 당일 거래대금이 이 금액을 초과해야 합니다",
+      "available": true
+    },
+    {
+      "key": "volume_mult",
+      "label": "거래량 배수 (직전 20일 평균 대비)",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "universe.reference_day.volume_mult",
+      "type": "number", "unit": "배", "default": 5,
+      "min": 1, "max": 100, "step": 0.5,
+      "available": true
+    },
+    {
+      "key": "volume_ma_period",
+      "label": "거래량 평균 기간",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "indicators[2].period",
+      "type": "int", "unit": "일", "default": 20,
+      "min": 2, "max": 250, "step": 1,
+      "available": true
+    },
+    {
+      "key": "close_change_min_pct",
+      "label": "종가 전일대비 상승률 하한",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "universe.reference_day.close_change_min_pct",
+      "type": "percent", "unit": "%", "default": 15,
+      "min": 0, "max": 30, "step": 1,
+      "available": true
+    },
+    {
+      "key": "gap_open_max_pct",
+      "label": "시가 갭상승 상한",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "universe.reference_day.gap_open_max_pct",
+      "type": "percent", "unit": "%", "default": 5,
+      "min": 0, "max": 30, "step": 1,
+      "help": "시가가 전일 종가 대비 이 비율 미만으로 출발해야 합니다 (갭 과열 제외)",
+      "available": true
+    },
+    {
+      "key": "high_period",
+      "label": "신고가 판정 기간",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "indicators[3].period",
+      "type": "int", "unit": "봉", "default": 252,
+      "min": 20, "max": 1000, "step": 1,
+      "help": "252봉 = 약 52주",
+      "available": true
+    },
+    {
+      "key": "ma_period",
+      "label": "기준 이동평균 기간 (20일선)",
+      "group": "2. 기준일 (전부 AND)",
+      "path": "indicators[0].period",
+      "type": "int", "unit": "일", "default": 20,
+      "min": 2, "max": 250, "step": 1,
+      "help": "기준일 판정(전일 종가 > 20일선)과 진입·손절에 함께 쓰입니다",
+      "available": true
+    },
+
+    {
+      "key": "pullback_amount_divisor",
+      "label": "눌림목 거래대금 분모",
+      "group": "3. 눌림목",
+      "path": "entries[0].pullback_amount_divisor",
+      "type": "number", "unit": "분의 1", "default": 3,
+      "min": 1, "max": 20, "step": 1,
+      "help": "일일 거래대금이 기준일 거래대금의 1/N 이하로 줄어야 합니다",
+      "available": true
+    },
+    {
+      "key": "valid_days_after_reference",
+      "label": "유효 기간",
+      "group": "3. 눌림목",
+      "path": "universe.valid_days_after_reference",
+      "type": "int", "unit": "거래일", "default": 15,
+      "min": 1, "max": 250, "step": 1,
+      "available": true
+    },
+
+    {
+      "key": "entry_size_pct",
+      "label": "진입 비중",
+      "group": "4. 진입",
+      "path": "entries[0].size_pct",
+      "type": "percent", "unit": "%", "default": 100,
+      "min": 1, "max": 100, "step": 5,
+      "help": "종목당 배정 자본(총자산 / 최대 보유종목수) 대비 비율입니다",
+      "available": true
+    },
+    {
+      "key": "macd_fast",
+      "label": "MACD 단기",
+      "group": "4. 진입",
+      "path": "indicators[4].fast",
+      "type": "int", "default": 12, "min": 2, "max": 100, "step": 1,
+      "available": true
+    },
+    {
+      "key": "macd_slow",
+      "label": "MACD 장기",
+      "group": "4. 진입",
+      "path": "indicators[4].slow",
+      "type": "int", "default": 26, "min": 3, "max": 200, "step": 1,
+      "available": true
+    },
+    {
+      "key": "macd_signal",
+      "label": "MACD 시그널",
+      "group": "4. 진입",
+      "path": "indicators[4].signal",
+      "type": "int", "default": 9, "min": 2, "max": 100, "step": 1,
+      "available": true
+    },
+
+    {
+      "key": "sl_size_pct",
+      "label": "손절 비중",
+      "group": "5. 청산",
+      "path": "exits[0].size_pct",
+      "type": "percent", "unit": "%", "default": 100,
+      "min": 1, "max": 100, "step": 5,
+      "available": true
+    },
+    {
+      "key": "tp1_target_pct",
+      "label": "1차 익절 목표",
+      "group": "5. 청산",
+      "path": "exits[1].target_pct",
+      "type": "percent", "unit": "%", "default": 7,
+      "min": 1, "max": 100, "step": 1,
+      "available": true
+    },
+    {
+      "key": "tp1_size_pct",
+      "label": "1차 익절 비중",
+      "group": "5. 청산",
+      "path": "exits[1].size_pct",
+      "type": "percent", "unit": "%", "default": 50,
+      "min": 1, "max": 100, "step": 5,
+      "available": true
+    },
+    {
+      "key": "ma_short_period",
+      "label": "2차 익절 이동평균 기간 (5일선)",
+      "group": "5. 청산",
+      "path": "indicators[1].period",
+      "type": "int", "unit": "일", "default": 5,
+      "min": 2, "max": 120, "step": 1,
+      "available": true
+    },
+    {
+      "key": "tp2_size_pct",
+      "label": "2차 익절 비중 (잔량 대비)",
+      "group": "5. 청산",
+      "path": "exits[2].size_pct",
+      "type": "percent", "unit": "%", "default": 100,
+      "min": 1, "max": 100, "step": 5,
+      "available": true
+    },
+    {
+      "key": "time_hold_days",
+      "label": "시간 청산 보유일",
+      "group": "5. 청산",
+      "path": "exits[3].hold_days",
+      "type": "int", "unit": "거래일", "default": 7,
+      "min": 1, "max": 250, "step": 1,
+      "available": true
+    },
+    {
+      "key": "time_pnl_min_pct",
+      "label": "시간 청산 수익률 기준",
+      "group": "5. 청산",
+      "path": "exits[3].pnl_min_pct",
+      "type": "percent", "unit": "%", "default": 3,
+      "min": -100, "max": 100, "step": 1,
+      "help": "보유일이 지났을 때 수익률이 이 값 미만이면 청산합니다",
+      "available": true
+    },
+
+    {
+      "key": "initial_capital_manwon",
+      "label": "초기 자본",
+      "group": "6. 자본 · 비용",
+      "path": "portfolio.initial_capital_manwon",
+      "type": "int", "unit": "만원", "default": 10000,
+      "min": 100, "max": 100000000, "step": 100,
+      "available": true
+    },
+    {
+      "key": "max_positions",
+      "label": "최대 보유 종목수",
+      "group": "6. 자본 · 비용",
+      "path": "portfolio.max_positions",
+      "type": "int", "unit": "종목", "default": 10,
+      "min": 1, "max": 100, "step": 1,
+      "available": true
+    },
+    {
+      "key": "slippage_pct",
+      "label": "슬리피지",
+      "group": "6. 자본 · 비용",
+      "path": "execution.slippage_pct",
+      "type": "percent", "unit": "%", "default": 0.1,
+      "min": 0, "max": 5, "step": 0.01,
+      "available": true
+    },
+    {
+      "key": "fee_pct",
+      "label": "매도 비용 (수수료+세금)",
+      "group": "6. 자본 · 비용",
+      "path": "execution.fee_pct",
+      "type": "percent", "unit": "%", "default": 0.23,
+      "min": 0, "max": 5, "step": 0.01,
+      "available": true
+    },
+    {
+      "key": "same_day_exit",
+      "label": "진입 당일 청산 허용",
+      "group": "6. 자본 · 비용",
+      "path": "execution.same_day_exit",
+      "type": "select",
+      "options": [
+        { "value": "loss_only", "label": "손실 청산만 (권장)" },
+        { "value": "never", "label": "허용 안 함" },
+        { "value": "always", "label": "전부 허용 (낙관적)" }
+      ],
+      "default": "loss_only",
+      "help": "일봉만으로는 하루 안의 체결 순서를 알 수 없습니다. SCHEMA.md 의 same_day_exit 절을 참고하세요",
+      "available": true
+    }
+  ]
+}

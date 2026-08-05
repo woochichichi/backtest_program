@@ -39,6 +39,10 @@ const S = {
   syncFailed: false,
   noAutoSymbol: false,   // 서버가 code 없는 /api/chart 를 거절했는가
   abort: null,             // 실행 중인 백테스트의 AbortController
+  jobId: null,             // 진행률 SSE / 취소용
+  cancelling: false,
+  longRunAck: false,       // 긴 구간 안내를 이미 확인했는가
+  formMode: 'legacy',      // 'params' | 'legacy'
   chart: null, eq: null, mo: null,
 };
 
@@ -434,9 +438,12 @@ async function selectStrategy(id) {
     S.strategy = st;
     S.draft = structuredClone(st);
     setDirty(false);
+    S.formMode = P.renderParamForm(S.draft);   // params 있으면 선언 기반, 없으면 기존 폼
+    P.bindForm(onFormChange);                  // 폼이 새로 그려졌으므로 리스너를 다시 건다
     P.fillForm(S.draft);
     P.renderFieldHints();
     checkForm();
+    updateRevertButton();
     rebuildActive();
     drawChips();
     P.renderJson(S.draft);
@@ -452,7 +459,29 @@ function setDirty(on) {
   S.dirty = on;
   P.markTabDirty('pnJson', on);
   P.setDirtyBadge(on);
-  $('btnRevert').disabled = !on;
+  updateRevertButton();
+}
+
+/**
+ * 되돌리기 버튼의 라벨/활성 상태.
+ * params 가 있으면 "PDF 기본값으로 되돌리기"(선언된 default 로),
+ * 없으면 "저장된 값으로 되돌리기"(마지막 저장 상태로) — 동작이 다르므로 라벨도 달라야 한다.
+ */
+function updateRevertButton() {
+  const btn = $('btnRevert'), lab = $('btnRevertLabel');
+  if (!btn || !lab) return;
+  if (P.hasParams(S.draft)) {
+    const n = P.countChangedFromDefault(S.draft);
+    lab.textContent = 'PDF 기본값으로 되돌리기';
+    btn.title = n
+      ? `${n}개 항목이 기본값과 다릅니다. 전략에 선언된 기본값으로 모두 되돌립니다.`
+      : '모든 값이 이미 기본값과 같습니다.';
+    btn.disabled = n === 0;
+  } else {
+    lab.textContent = '저장된 값으로';
+    btn.title = '마지막으로 저장된 값으로 되돌립니다.';
+    btn.disabled = !S.dirty;
+  }
 }
 function markDirty() { setDirty(true); }
 
@@ -463,6 +492,7 @@ function onFormChange() {
   markDirty();
   P.renderJson(S.draft);
   checkForm();
+  updateRevertButton();
   syncResolutionNote();
 }
 
@@ -483,8 +513,9 @@ function syncResolutionNote() {
   const sel = $('p_res');
   const want = (S.draft && (S.draft.execution || {}).resolution) || '1d';
   // 셀렉트는 항상 일봉으로 보인다 (1분봉 option 은 disabled)
-  sel.value = '1d';
+  if (sel) sel.value = '1d';
   const note = $('resNote');
+  if (!note) return;   // params 기반 폼에는 이 안내가 없다
   note.innerHTML = want !== '1d'
     ? `<span class="soon">추후 지원 예정</span>
        이 전략의 JSON 에는 <b>${P.esc(want)}</b> 체결이 적혀 있지만, 분봉 데이터가 없어
@@ -543,24 +574,63 @@ async function saveStrategy(o = {}) {
   }
 }
 
-function revertStrategy() {
-  if (!S.strategy) return;
-  const diffs = P.diffStrategies(S.draft, S.strategy);
-  P.modal('저장된 값으로 되돌릴까요?',
-    '<p>마지막으로 저장된 상태로 되돌립니다. 지금 고친 내용은 사라집니다.</p>' + P.renderDiffTable(diffs),
+/**
+ * 되돌리기.
+ * params 가 있으면 params[].default 로 초기화한다 (서버 reset API 우선, 없으면 클라이언트 폴백).
+ * params 가 없으면 기존처럼 마지막 저장 상태로 되돌린다.
+ */
+async function revertStrategy() {
+  if (!S.draft) return;
+
+  if (!P.hasParams(S.draft)) {
+    const diffs = P.diffStrategies(S.draft, S.strategy);
+    P.modal('저장된 값으로 되돌릴까요?',
+      '<p>마지막으로 저장된 상태로 되돌립니다. 지금 고친 내용은 사라집니다.</p>' + P.renderDiffTable(diffs),
+      [{ label: '취소' }, {
+        label: '되돌리기', primary: true,
+        onClick: () => applyRevert(structuredClone(S.strategy), '저장된 값으로 되돌렸습니다.', false),
+      }]);
+    return;
+  }
+
+  const target = P.applyParamDefaults(S.draft);
+  const diffs = P.diffStrategies(S.draft, target);
+  P.modal('기본값으로 되돌릴까요?',
+    `<p>이 전략에 선언된 <b>기본값</b>(PDF 원문 기준)으로 모든 파라미터를 되돌립니다.</p>
+     <p class="hint">되돌린 뒤에도 <b>저장</b>을 눌러야 파일에 반영됩니다.</p>` +
+    P.renderDiffTable(diffs),
     [{ label: '취소' }, {
-      label: '되돌리기', primary: true, onClick: () => {
-        S.draft = structuredClone(S.strategy);
-        P.fillForm(S.draft);
-        checkForm();
-        rebuildActive(); drawChips();
-        P.renderJson(S.draft);
-        syncResolutionNote();
-        setDirty(false);
-        P.toast('저장된 값으로 되돌렸습니다.', 'ok');
-        loadChart();
+      label: '기본값으로 되돌리기', primary: true,
+      onClick: async () => {
+        // 서버에 reset API 가 있으면 그쪽을 쓴다 (없으면 null → 클라이언트에서 처리)
+        let next = null;
+        try {
+          next = await api.resetStrategy(S.strategyId);
+        } catch (e) {
+          handleError(e, '기본값 되돌리기');
+          return;
+        }
+        applyRevert(next && next.params ? next : target,
+          next ? '서버에서 기본값으로 되돌렸습니다.' : '기본값으로 되돌렸습니다.', true);
       },
     }]);
+}
+
+/**
+ * @param {boolean} dirty 기본값으로 되돌린 경우 true(저장 전 상태),
+ *                        저장된 값으로 되돌린 경우 false(파일과 같아짐)
+ */
+function applyRevert(next, msg, dirty) {
+  S.draft = next;
+  P.fillForm(S.draft);
+  checkForm();
+  rebuildActive(); drawChips();
+  P.renderJson(S.draft);
+  syncResolutionNote();
+  setDirty(!!dirty);
+  updateRevertButton();
+  P.toast(msg, 'ok');
+  loadChart();
 }
 
 async function cloneStrategy() {
@@ -878,17 +948,55 @@ function setRange(months) {
 
 function setRunning(on) {
   S.running = on;
+  if (on) P.renderNextStep(null);      // 진행 패널과 겹치지 않게 안내를 잠시 치운다
   $('btnRun').disabled = on;
   $('btnRunIcon').style.display = on ? 'none' : '';
   $('btnCancelRun').hidden = !on;
   $('btnRunLabel').textContent = on ? '실행 중…' : '백테스트 실행';
 }
 
-async function runBacktest() {
+/** 백테스트 구간이 몇 년인지 */
+function periodYears(strategy) {
+  const per = (strategy && strategy.period) || {};
+  const start = per.start;
+  const end = (!per.end || per.end === 'auto')
+    ? ((S.status && S.status.latest_trade_date) || isoOf(new Date()))
+    : per.end;
+  if (!start || !end) return 0;
+  const ms = ymdDate(end) - ymdDate(start);
+  return ms > 0 ? ms / (365.25 * 86400000) : 0;
+}
+
+const LONG_RUN_YEARS = 5;
+
+/** 5년을 넘는 구간은 실행 전에 미리 알려 준다 */
+function runBacktest() {
+  if (S.running || !S.draft) return;
+  const years = periodYears(S.draft);
+  if (years > LONG_RUN_YEARS && !S.longRunAck) {
+    P.modal('시간이 걸릴 수 있습니다',
+      `<p>백테스트 구간이 <b>약 ${years.toFixed(1)}년</b>입니다.</p>
+       <p>구간이 길어 <b>수 분</b> 걸릴 수 있습니다. 진행 상황은 화면 위에 단계와 남은 시간으로 표시되며,
+       <b>실행 중에 언제든 취소할 수 있습니다.</b></p>
+       <p class="hint">기간을 줄이려면 파라미터의 백테스트 시작일을 뒤로 옮기세요.</p>`,
+      [
+        { label: '취소' },
+        {
+          label: '이대로 실행', primary: true, onClick: () => {
+            S.longRunAck = true;          // 같은 세션에서 반복해 묻지 않는다
+            doRunBacktest();
+          },
+        },
+      ]);
+    return;
+  }
+  doRunBacktest();
+}
+
+async function doRunBacktest() {
   if (S.running || !S.draft) return;
   if (S.status && S.status.available === false) {
     P.toast('주가 데이터가 없어 백테스트를 실행할 수 없습니다.', 'err', 4000);
-    P.focusFirstError();
     return;
   }
   const errs = checkForm().filter((i) => i.level === 'err');
@@ -897,44 +1005,54 @@ async function runBacktest() {
     P.toast(`고쳐야 할 값이 ${errs.length}개 있습니다.`, 'err');
     return;
   }
-  // 시세를 받는 중이어도 막지 않는다. 대신 어느 시점 데이터인지 알린다.
-  if (S.syncing) {
-    P.toast('시세를 받는 중입니다. 어제까지 데이터로 실행합니다.', '', 4000);
-  }
+  if (S.syncing) P.toast('시세를 받는 중입니다. 어제까지 데이터로 실행합니다.', '', 4000);
 
   setRunning(true);
+  S.cancelling = false;
   P.clearBanner('no-trades');
-  P.clearBanner('slow');
+  P.clearBanner('cancelled');
   P.renderTrades([], gotoTrade, { loading: true });
   P.renderByStock([], { loading: true });
   P.renderSignals([], { loading: true });
 
   const jobId = api.newJobId();
+  S.jobId = jobId;
   S.abort = new AbortController();
+  const serverCancel = api.hasFeature('backtest_cancel', false);
 
-  // 오래 걸리면 왜 걸리는지 알려 준다
-  const slowTimer = setTimeout(() => {
-    P.banner('slow', 'info',
-      '<b>계산에 시간이 걸리고 있습니다.</b>' +
-      '<div class="err-advice">전 종목을 하루씩 훑어보는 중입니다. 종목 수와 기간이 길수록 오래 걸립니다. 그대로 두면 끝나고, 급하면 오른쪽 위 [취소] 를 누르세요.</div>');
-  }, 5000);
-
-  // 진행률 SSE 는 job_id 를 먼저 열고 같은 id 로 실행한다
-  let es = api.backtestProgressStream(jobId);
-  let sawProgress = false;
+  // 진행 상태 — 취소 버튼은 실행 즉시 노출한다
+  const t0 = Date.now();
+  const prog = { phase: '백테스트 준비 중', message: '', pct: null, etaSec: null };
+  const paint = () => P.renderRunProgress({
+    phase: S.cancelling ? '취소하는 중…' : prog.phase,
+    message: prog.message,
+    pct: prog.pct,
+    elapsedSec: (Date.now() - t0) / 1000,
+    etaSec: prog.etaSec,
+    cancellable: !S.cancelling,
+  });
+  paint();
+  const tick = setInterval(paint, 500);
   P.progress(null);
+
+  // SSE: job_id 를 먼저 열고 같은 id 로 실행한다
+  let es = api.backtestProgressStream(jobId);
   if (es) {
     es.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
-        if (d.message) $('btnRunLabel').textContent = String(d.message).slice(0, 20);
+        if (d.phase) prog.phase = String(d.phase);
+        if (d.message) prog.message = String(d.message);
         if (Number.isFinite(d.done) && Number.isFinite(d.total) && d.total > 0) {
-          sawProgress = true;
-          P.progress((d.done / d.total) * 100);
+          prog.pct = (d.done / d.total) * 100;
+          P.progress(prog.pct);
         }
-      } catch { /* 진행률 파싱 실패는 무시하고 인디터미닛 유지 */ }
+        // eta_sec 이 null 이면 "계산 중…" 으로 남겨 둔다
+        prog.etaSec = Number.isFinite(d.eta_sec) ? d.eta_sec : null;
+        paint();
+      } catch { /* 진행률 파싱 실패는 무시 */ }
     };
-    es.onerror = () => { if (es) { es.close(); es = null; } if (!sawProgress) P.progress(null); };
+    es.onerror = () => { if (es) { es.close(); es = null; } };
   }
 
   try {
@@ -946,14 +1064,17 @@ async function runBacktest() {
     P.toast(`백테스트 완료 — ${res.metrics.trades}거래 · ${P.pct1(res.metrics.total_return_pct)} · ${(res.elapsed_sec ?? 0).toFixed(1)}초`, 'ok', 3800);
   } catch (e) {
     if (e && e.aborted) {
-      // 서버 취소 API 가 없으므로 거짓 안내를 하지 않는다
+      // 취소는 오류가 아니다. 빨간 배너 대신 중립 토스트.
       P.renderTrades(S.result ? S.result.trades : [], gotoTrade, { ran: S.ran });
       P.renderSignals(S.result ? S.result.signals : [], { ran: S.ran });
       P.renderByStock(S.result ? S.result.by_stock : [], { ran: S.ran });
-      P.banner('cancelled', 'warn',
-        '<b>화면에서 실행을 취소했습니다.</b>' +
-        '<div class="err-advice">결과를 받지 않고 화면만 되돌렸습니다. 프로그램 서버에서는 계산이 계속 진행 중일 수 있으며, 끝날 때까지 다음 실행이 느려질 수 있습니다.</div>');
-      P.toast('실행을 취소했습니다.', '', 3000);
+      P.toast('백테스트를 취소했습니다.', '', 3000);
+      if (!serverCancel) {
+        // 서버 취소 API 가 없을 때만 사실대로 덧붙인다
+        P.banner('cancelled', 'warn',
+          '<b>화면에서 실행을 취소했습니다.</b>' +
+          '<div class="err-advice">이 서버는 실행 취소 기능이 없어, 프로그램 서버에서는 계산이 계속 진행 중일 수 있습니다.</div>');
+      }
     } else if (e instanceof ApiError && e.status === 422 && e.errors) {
       P.showFieldErrors(e.errors);
       P.focusFirstError();
@@ -970,22 +1091,38 @@ async function runBacktest() {
       P.renderByStock([], { ran: false });
     }
   } finally {
-    clearTimeout(slowTimer);
-    P.clearBanner('slow');
+    clearInterval(tick);
+    P.renderRunProgress(null);
     if (es) es.close();
-    S.abort = null;
+    S.abort = null; S.jobId = null; S.cancelling = false;
     setRunning(false);
     P.progress(false);
     updateNextStep();
   }
 }
 
-function cancelBacktest() {
-  if (S.abort) S.abort.abort();
+/** 취소 — 서버 취소 API 가 있으면 서버에 알리고, 없으면 요청만 끊는다 */
+async function cancelBacktest() {
+  if (!S.running || S.cancelling) return;
+  S.cancelling = true;
+  $('btnCancelRun').disabled = true;
+  try {
+    if (api.hasFeature('backtest_cancel', false) && S.jobId) {
+      await api.cancelBacktest(S.jobId);
+      // 서버가 취소 처리하면 실행 중인 POST 가 cancelled:true 로 돌아온다
+    } else if (S.abort) {
+      S.abort.abort();
+    }
+  } catch (e) {
+    handleError(e, '백테스트 취소');
+    if (S.abort) S.abort.abort();
+  } finally {
+    $('btnCancelRun').disabled = false;
+  }
 }
 
 function applyResult(res) {
-  P.renderAssumptions(res.assumptions, res.metrics);
+  P.renderAssumptions(res.assumptions, res.metrics, S.draft && S.draft.params);
   P.renderKpis(res.metrics);
   S.eq.set(res.equity || null);
   S.mo.set(res.monthly || null);
@@ -1119,6 +1256,7 @@ function wire() {
     run: runBacktest,
     pickSymbol: openSymbolPicker,
     sync: () => startSync({}),
+    cancelRun: cancelBacktest,
   });
 
   P.bindTabs((name) => {
@@ -1248,7 +1386,7 @@ async function boot() {
   $('btnRevert').disabled = true;
 
   // 초기 빈 상태 (왜 비었는지 + 무엇을 하면 되는지)
-  P.renderAssumptions(null, null);
+  P.renderAssumptions(null, null, null);
   P.renderKpis(null);
   P.renderTrades([], gotoTrade, { ran: false });
   P.renderSignals([], { ran: false });

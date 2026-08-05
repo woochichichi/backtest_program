@@ -30,9 +30,12 @@ def df():
 
 
 @pytest.fixture
-def ctx(df):
+def ctx(df, strategy1_json):
+    from engine.backtest import _indicator_aliases
+
     return EvalContext(
         df,
+        aliases=_indicator_aliases(strategy1_json),
         ref={"open": 100.0, "high": 110.0, "low": 95.0, "close": 105.0, "amount": 1.2e11},
         fills={"B1": {"price": 100.0, "qty": 10, "date": dt.date(2026, 1, 5)}},
         position={

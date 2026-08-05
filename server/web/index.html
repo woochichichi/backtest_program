@@ -95,6 +95,7 @@
 
   <!-- ================= 지금 할 일 / 전역 안내 ================= -->
   <div class="next-step" id="nextStep" hidden></div>
+  <div class="run-panel" id="runPanel" hidden aria-live="polite"></div>
   <div class="banners" id="banners" role="status" aria-live="polite"></div>
 
   <div class="body">
@@ -118,7 +119,10 @@
           <div class="spacer"></div>
           <span class="note">수정하면 JSON 탭에 반영</span>
         </div>
-        <div class="sec-bd" id="paramForm">
+        <!-- params 선언이 있는 전략은 여기에 동적으로 그려진다.
+             params 가 없는 전략은 아래 legacyForm 템플릿을 복제해 쓴다(하위 호환). -->
+        <div class="sec-bd" id="paramForm"></div>
+        <template id="legacyForm">
 
           <div class="grp">
             <div class="grp-t"><span class="n">1</span>종목 선정</div>
@@ -242,13 +246,13 @@
             <div class="chips" id="indChips" aria-label="차트에 표시할 지표"></div>
           </div>
 
-        </div>
+        </template>
       </div>
 
       <div class="sec" style="border-bottom:none">
         <div class="sec-bd stg-actions">
           <button class="btn btn-sm btn-primary" id="btnSave">저장</button>
-          <button class="btn btn-sm" id="btnRevert" title="마지막으로 저장된 값으로 되돌립니다">기본값으로</button>
+          <button class="btn btn-sm" id="btnRevert" title="기본값으로 되돌립니다"><span id="btnRevertLabel">기본값으로</span></button>
           <button class="btn btn-sm" id="btnClone">복제</button>
           <button class="btn btn-sm" id="btnExport">내보내기</button>
           <button class="btn btn-sm btn-danger" id="btnDelete">삭제</button>

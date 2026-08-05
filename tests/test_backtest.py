@@ -27,6 +27,7 @@ RESULT_KEYS = {
 ASSUMPTION_KEYS = {
     "resolution", "requested_resolution", "fill_model", "same_day_exit",
     "slippage_pct", "fee_pct", "exit_priority", "notes", "stats",
+    "ignored_filters",
 }
 ASSUMPTION_STAT_KEYS = {
     "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
@@ -38,7 +39,7 @@ METRIC_KEYS = {
     "avg_hold_days", "initial_capital", "final_capital", "period",
 }
 TRADE_KEYS = {
-    "no", "code", "name", "ref_date", "ref_amount_eok", "ref_open", "fills",
+    "no", "group_id", "code", "name", "ref_date", "ref_amount_eok", "ref_open", "fills",
     "avg_price", "exit_date", "exit_price", "exit_rule", "exit_reason",
     "hold_days", "return_pct", "pnl",
 }
@@ -254,6 +255,7 @@ def test_same_day_exit_default_is_loss_only(strategy1_json, tp_store, dates):
     s = json.loads(json.dumps(strategy1_json))
     s["period"] = {"start": dates[90].isoformat(), "end": "auto"}
     s["execution"].pop("same_day_exit", None)
+    s["params"] = [p for p in s["params"] if p["path"] != "execution.same_day_exit"]
     assert run_backtest(s, tp_store)["assumptions"]["same_day_exit"] == "loss_only"
 
 
@@ -662,3 +664,415 @@ def test_performance_budget(strategy1, dates):
     elapsed = time.perf_counter() - t
     assert elapsed < 3.0, f"{elapsed:.2f}s"
     assert len(res["trades"]) == 1
+
+
+# ======================================================================================
+# ★ ARCHITECTURE-v2 — 취소 / 진행률
+# ======================================================================================
+
+
+def test_should_cancel_raises(strategy1, tp_store):
+    from engine.errors import BacktestCancelled
+
+    with pytest.raises(BacktestCancelled) as ei:
+        run_backtest(strategy1, tp_store, should_cancel=lambda: True)
+    assert "취소" in str(ei.value)
+    assert ei.value.phase
+
+
+def test_should_cancel_false_runs_normally(strategy1, tp_store):
+    res = run_backtest(strategy1, tp_store, should_cancel=lambda: False)
+    assert res["trades"]
+
+
+def test_cancel_midway(strategy1, tp_store):
+    """N 번째 확인부터 True 를 돌려주면 그 지점에서 멈춘다."""
+    from engine.errors import BacktestCancelled
+
+    calls = {"n": 0}
+
+    def cancel():
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    with pytest.raises(BacktestCancelled):
+        run_backtest(strategy1, tp_store, should_cancel=cancel)
+    assert calls["n"] >= 4
+
+
+def test_cancel_callback_errors_are_swallowed(strategy1, tp_store):
+    def boom():
+        raise RuntimeError("nope")
+
+    assert run_backtest(strategy1, tp_store, should_cancel=boom)["trades"]
+
+
+def test_progress_v1_three_arg_callback_still_works(strategy1, tp_store):
+    seen = []
+    run_backtest(strategy1, tp_store, progress=lambda d, t, m: seen.append((d, t, m)))
+    assert seen and all(t == 100 for _, t, _ in seen)
+    assert seen[-1][0] == 100
+
+
+def test_progress_v2_five_arg_callback(strategy1, tp_store):
+    seen = []
+
+    def prog(done, total, message, phase=None, eta_sec=None):
+        seen.append((done, total, message, phase, eta_sec))
+
+    run_backtest(strategy1, tp_store, progress=prog)
+    assert seen
+    phases = {p for _, _, _, p, _ in seen}
+    assert {"데이터 읽는 중", "기준일 찾는 중", "종목별 매매 계산 중", "성과 계산 중"} & phases
+    assert all(e is None or isinstance(e, (int, float)) for *_, e in seen)
+    assert all(isinstance(m, str) and m for _, _, m, _, _ in seen)
+    assert seen[-1][0] == 100
+
+
+def test_progress_messages_show_concrete_progress(strategy1, tp_store):
+    seen = []
+    run_backtest(strategy1, tp_store,
+                 progress=lambda d, t, m, phase=None, eta=None: seen.append(m))
+    assert any("/" in m for m in seen), "진척이 보이는 (n/m) 형태 메시지가 있어야 한다"
+
+
+def test_progress_never_goes_backwards(strategy1, tp_store):
+    seen = []
+    run_backtest(strategy1, tp_store,
+                 progress=lambda d, t, m, phase=None, eta=None: seen.append(d))
+    assert seen == sorted(seen)
+
+
+# ======================================================================================
+# ★ ARCHITECTURE-v2 — DSL 확장
+# ======================================================================================
+
+
+def _v2_strategy(strategy1, **over):
+    s = json.loads(json.dumps(strategy1))
+    s.update(over)
+    return s
+
+
+def test_custom_reference_day_matches_amount_spike(strategy1, tp_store, dates):
+    """rule="custom" 으로 amount_spike 와 동등한 조건을 쓰면 같은 결과가 나와야 한다."""
+    base = run_backtest(strategy1, tp_store)
+
+    s = json.loads(json.dumps(strategy1))
+    s["universe"]["reference_day"] = {
+        "rule": "custom",
+        "lookback_days": 20,
+        "spike_amount_krw_eok": 1000,
+        "prev_day_amount_max_eok": 200,
+        "when": {"op": "and", "conditions": [
+            {"op": ">=", "left": "amount", "right": {"expr": "spike_amount_krw_eok * 100000000"}},
+            {"op": "<=", "left": "prev.amount", "right": {"expr": "prev_day_amount_max_eok * 100000000"}},
+        ]},
+    }
+    s["params"] = [p for p in s["params"]
+                   if not p["path"].startswith("universe.reference_day")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+
+    got = run_backtest(s, tp_store)
+    assert [t["ref_date"] for t in got["trades"]] == [t["ref_date"] for t in base["trades"]]
+    assert [t["exit_rule"] for t in got["trades"]] == [t["exit_rule"] for t in base["trades"]]
+
+
+def test_custom_rule_requires_when(strategy1):
+    s = json.loads(json.dumps(strategy1))
+    s["universe"]["reference_day"] = {"rule": "custom", "lookback_days": 20}
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("universe.reference_day")]
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "universe.reference_day.when" for e in errors)
+
+
+def test_highest_operand_in_reference_day(strategy1, tp_store, dates):
+    """HIGHEST 로 신고가 조건을 걸면 기준일이 실제로 걸러진다."""
+    s = json.loads(json.dumps(strategy1))
+    s["indicators"].append({"key": "HIGH252", "type": "HIGHEST", "period": 252,
+                            "source": "close", "plot": False})
+    s["universe"]["reference_day"] = {
+        "rule": "custom", "lookback_days": 20, "spike_amount_krw_eok": 1000,
+        "when": {"op": "and", "conditions": [
+            {"op": ">=", "left": "amount", "right": {"expr": "spike_amount_krw_eok * 100000000"}},
+            {"op": ">=", "left": "close", "right": "HIGH252"},
+        ]},
+    }
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("universe.reference_day")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+    # 200봉짜리 합성 데이터라 252봉 HIGHEST 는 전부 NaN → 조건이 성립하지 않는다
+    assert run_backtest(s, tp_store)["trades"] == []
+
+    s["indicators"][-1]["period"] = 20
+    got = run_backtest(s, tp_store)
+    assert got["trades"], "20봉 신고가로 낮추면 기준일이 잡혀야 한다"
+
+
+def test_entry_operand_only_in_exits(strategy1):
+    s = json.loads(json.dumps(strategy1))
+    s["entries"][0]["when"] = {"op": "<=", "left": "low", "right": "entry.low"}
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any("entry.*" in e["message"] for e in errors)
+
+
+def test_entry_operand_in_exit_rule(strategy1, tp_store, dates):
+    """entry.low 이탈 손절 — 진입 봉의 저가를 참조한다."""
+    s = json.loads(json.dumps(strategy1))
+    s["exits"] = [{
+        "id": "SL", "label": "손절 (진입일 저가 이탈)", "type": "stop_loss",
+        "when": {"op": "<", "left": "close", "right": "entry.low"},
+        "price": "close", "size_pct": 100,
+    }]
+    s["exit_priority"] = ["SL"]
+    s["params"] = [p for p in s["params"]
+                   if not p["path"].startswith("exits[1]")
+                   and not p["path"].startswith("exits[0].target")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+    res = run_backtest(s, tp_store)
+    t = res["trades"][0]
+    assert t["exit_rule"] == "SL"
+    # 진입봉(B1, bar 104)의 저가 3,900 아래로 종가(3,820)가 내려간 바로 다음 봉에서 청산
+    assert t["exit_date"] == dates[B1_BAR + 1].isoformat()
+
+
+def test_marcap_operand(strategy1, tp_store):
+    """시가총액 조건 — marcap 은 원 단위 그대로 쓴다."""
+    s = json.loads(json.dumps(strategy1))
+    s["universe"]["reference_day"] = {
+        "rule": "custom", "lookback_days": 20, "spike_amount_krw_eok": 1000,
+        "market_cap_min_eok": 100000000,
+        "when": {"op": "and", "conditions": [
+            {"op": ">=", "left": "amount", "right": {"expr": "spike_amount_krw_eok * 100000000"}},
+            {"op": ">=", "left": "marcap", "right": {"expr": "market_cap_min_eok * 100000000"}},
+        ]},
+    }
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("universe.reference_day")]
+    assert run_backtest(s, tp_store)["trades"] == []   # 합성 종목은 시총이 훨씬 작다
+
+
+def test_prev_operand(ohlcv):
+    from engine.dsl import EvalContext, evaluate_operand
+
+    ctx = EvalContext(ohlcv)
+    close = evaluate_operand("close", ctx)
+    prev = evaluate_operand("prev.close", ctx)
+    assert np_isnan(prev[0])
+    assert list(prev[1:]) == list(close[:-1])
+
+
+def np_isnan(x):
+    import math
+
+    return math.isnan(float(x))
+
+
+# --------------------------------------------------------------------------------------
+# 부분 청산 + group_id
+# --------------------------------------------------------------------------------------
+
+
+def test_partial_exit_keeps_position(strategy1, tp_store, dates):
+    """size_pct 50 이면 절반만 팔고 잔량이 남아 나머지 청산 규칙이 계속 평가된다."""
+    s = json.loads(json.dumps(strategy1))
+    s["exits"][0]["size_pct"] = 50            # TP 를 1차 익절로
+    res = run_backtest(s, tp_store)
+
+    assert len(res["trades"]) == 2, res["trades"]
+    first, second = res["trades"]
+    assert first["exit_rule"] == "TP"
+    assert first["exit_date"] == dates[TP_BAR].isoformat()
+    # 잔량은 계속 살아남아 나머지 청산 규칙(SL)이 이어서 평가된다
+    assert second["exit_rule"] == "SL"
+    assert second["exit_date"] > first["exit_date"]
+
+    # 같은 진입에서 나온 청산이므로 group_id 를 공유한다
+    assert first["group_id"] == second["group_id"]
+    assert isinstance(first["group_id"], str) and first["group_id"]
+
+    # 부분 청산 후에도 평단은 그대로 유지된다
+    assert first["avg_price"] == second["avg_price"]
+    assert first["fills"] == second["fills"]
+
+    # 매도 수량은 원래 수량의 절반씩
+    total_qty = sum(f["qty"] for f in first["fills"])
+    sells = [sg for sg in res["signals"] if sg["level"] == "FILL" and "SELL" in sg["message"]]
+    assert len(sells) == 2
+    assert f"{total_qty // 2}주 (일부)" in sells[0]["message"]
+    assert "(전량)" in sells[1]["message"]
+    assert any("부분 청산 후 잔량" in sg["message"] for sg in res["signals"])
+
+
+def test_partial_exit_rule_fires_once(strategy1, tp_store):
+    """부분 청산 규칙은 한 포지션에서 한 번만 발동한다 (반복 매도 방지)."""
+    s = json.loads(json.dumps(strategy1))
+    s["exits"][0]["size_pct"] = 50
+    res = run_backtest(s, tp_store)
+    assert sum(1 for t in res["trades"] if t["exit_rule"] == "TP") == 1
+
+
+def test_group_id_present_on_every_trade(strategy1, tp_store):
+    res = run_backtest(strategy1, tp_store)
+    assert all(isinstance(t["group_id"], str) and t["group_id"] for t in res["trades"])
+
+
+# --------------------------------------------------------------------------------------
+# time_exit
+# --------------------------------------------------------------------------------------
+
+
+def test_time_exit_by_when(strategy1, tp_store, dates):
+    """position.hold_days 는 **영업일(봉) 수** 다."""
+    s = json.loads(json.dumps(strategy1))
+    s["exits"] = [{
+        "id": "TIME", "label": "시간 청산", "type": "time_exit",
+        "hold_days": 3,
+        "when": {"op": ">=", "left": "position.hold_days", "right": "hold_days"},
+        "price": "close", "size_pct": 100,
+    }]
+    s["exit_priority"] = ["TIME"]
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("exits[")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+    t = run_backtest(s, tp_store)["trades"][0]
+    assert t["exit_rule"] == "TIME"
+    assert t["exit_date"] == dates[B1_BAR + 3].isoformat()   # 진입봉 + 3봉
+
+
+def test_time_exit_without_when(strategy1, tp_store, dates):
+    s = json.loads(json.dumps(strategy1))
+    s["exits"] = [{"id": "TIME", "label": "시간 청산", "type": "time_exit",
+                   "max_hold_days": 2, "size_pct": 100}]
+    s["exit_priority"] = ["TIME"]
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("exits[")]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+    t = run_backtest(s, tp_store)["trades"][0]
+    assert t["exit_rule"] == "TIME"
+    assert t["exit_date"] == dates[B1_BAR + 2].isoformat()
+
+
+def test_time_exit_needs_limit_or_when(strategy1):
+    s = json.loads(json.dumps(strategy1))
+    s["exits"] = [{"id": "TIME", "type": "time_exit", "size_pct": 100}]
+    s["exit_priority"] = ["TIME"]
+    s["params"] = [p for p in s["params"] if not p["path"].startswith("exits[")]
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "exits[0].max_hold_days" for e in errors)
+
+
+# --------------------------------------------------------------------------------------
+# universe.filters / ignored_filters
+# --------------------------------------------------------------------------------------
+
+
+def test_ignored_filters_are_reported(strategy1, tp_store):
+    s = json.loads(json.dumps(strategy1))
+    s["universe"]["filters"] = {"debt_ratio_max_pct": 200, "market_cap_min_eok": 1}
+    s["params"] = list(s["params"]) + [{
+        "key": "debt_ratio_max_pct", "label": "부채비율 상한", "group": "1. 종목 선정",
+        "path": "universe.filters.debt_ratio_max_pct", "type": "number", "unit": "%",
+        "default": 200, "available": False,
+        "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다.",
+    }]
+    ok, errors = validate_strategy(s)
+    assert ok, errors
+
+    res = run_backtest(s, tp_store)
+    ig = res["assumptions"]["ignored_filters"]
+    assert [x["key"] for x in ig] == ["debt_ratio_max_pct"]
+    assert "재무 데이터" in ig[0]["reason"]
+    assert any("부채비율 상한" in w and "적용하지 않았습니다" in w for w in res["warnings"])
+    assert any("부채비율 상한" in n for n in res["assumptions"]["notes"])
+    # 지원되는 필터는 무시 목록에 없어야 한다
+    assert "market_cap_min_eok" not in [x["key"] for x in ig]
+
+
+def test_market_cap_filter_applies(strategy1, tp_store):
+    s = json.loads(json.dumps(strategy1))
+    s["universe"]["filters"] = {"market_cap_min_eok": 100000000}   # 1경원 — 아무것도 안 남는다
+    res = run_backtest(s, tp_store)
+    assert res["trades"] == []
+    assert res["assumptions"]["ignored_filters"] == []
+
+
+def test_ignored_filters_empty_by_default(strategy1, tp_store):
+    assert run_backtest(strategy1, tp_store)["assumptions"]["ignored_filters"] == []
+
+
+# --------------------------------------------------------------------------------------
+# 전략3
+# --------------------------------------------------------------------------------------
+
+
+def test_strategy3_is_registered_and_valid():
+    doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
+    ok, errors = validate_strategy(doc)
+    assert ok, errors
+    assert doc["id"] == "strategy3"
+    assert doc["description"] == "52주 신고가 거래대금 폭발 주도주 탐색 및 20일선 지지 반등 매매"
+    assert doc["universe"]["reference_day"]["rule"] == "custom"
+    assert doc["exit_priority"] == ["SL", "TIME", "TP1", "TP2"]
+    assert doc["universe"]["valid_days_after_reference"] == 15
+
+
+def test_strategy3_defaults_match_spec():
+    from engine.params import get_by_path
+
+    doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
+    expect = {
+        "universe.filters.market_cap_min_eok": 2000,
+        "universe.filters.debt_ratio_max_pct": 200,
+        "universe.filters.current_ratio_min_pct": 100,
+        "universe.filters.profitable_quarters_min": 4,
+        "universe.reference_day.spike_amount_krw_eok": 1000,
+        "universe.reference_day.volume_mult": 5,
+        "universe.reference_day.close_change_min_pct": 15,
+        "universe.reference_day.gap_open_max_pct": 5,
+        "indicators[3].period": 252,
+        "indicators[0].period": 20,
+        "indicators[1].period": 5,
+        "indicators[2].period": 20,
+        "entries[0].pullback_amount_divisor": 3,
+        "universe.valid_days_after_reference": 15,
+        "entries[0].size_pct": 100,
+        "exits[0].size_pct": 100,
+        "exits[1].target_pct": 7,
+        "exits[1].size_pct": 50,
+        "exits[2].size_pct": 100,
+        "exits[3].hold_days": 7,
+        "exits[3].pnl_min_pct": 3,
+    }
+    for path, want in expect.items():
+        assert get_by_path(doc, path) == want, path
+
+
+def test_strategy3_financial_params_marked_unavailable():
+    doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
+    fin = {"debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min"}
+    got = {p["key"] for p in doc["params"] if p.get("available") is False}
+    assert got == fin
+    for p in doc["params"]:
+        if p["key"] in fin:
+            assert "재무" in p["unavailable_reason"]
+
+
+def test_strategy3_runs_on_synthetic_data(dates):
+    """실데이터 없이도 끝까지 돌아가야 한다 (조건이 까다로워 거래는 안 나올 수 있다)."""
+    from conftest import FakeStore, make_frame
+
+    doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
+    doc["period"] = {"start": dates[90].isoformat(), "end": "auto"}
+    store = FakeStore([make_frame("100010", "테스트에이", "tp", dates),
+                       make_frame("100030", "필러", "flat", dates)])
+    res = run_backtest(doc, store)
+    assert set(res) == RESULT_KEYS
+    assert [x["key"] for x in res["assumptions"]["ignored_filters"]] == [
+        "debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min",
+    ]
+    assert len(res["warnings"]) >= 3

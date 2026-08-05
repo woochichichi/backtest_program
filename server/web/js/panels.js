@@ -96,6 +96,7 @@ const DEBOUNCE_MS = 300;   // ARCHITECTURE 5-3
 export function fillForm(strategy) {
   document.querySelectorAll('#paramForm [data-path]').forEach((el) => {
     const raw = getPath(strategy, el.dataset.path);
+    if (el.dataset.type === 'bool') { el.checked = raw === true; return; }
     if (el.dataset.kind === 'markets') {
       el.value = Array.isArray(raw) ? raw.join(',') : (raw || 'KOSPI,KOSDAQ');
       if (!Array.from(el.options).some((o) => o.value === el.value)) el.value = 'KOSPI,KOSDAQ';
@@ -117,6 +118,12 @@ export function readForm(strategy) {
   const next = structuredClone(strategy);
   document.querySelectorAll('#paramForm [data-path]').forEach((el) => {
     const p = el.dataset.path;
+    if (el.dataset.type === 'bool') { setPath(next, p, !!el.checked); return; }
+    if (el.dataset.type === 'int') {
+      const v = el.value === '' ? null : parseInt(el.value, 10);
+      setPath(next, p, Number.isFinite(v) ? v : null);
+      return;
+    }
     if (el.dataset.kind === 'markets') { setPath(next, p, el.value.split(',').filter(Boolean)); return; }
     if (el.dataset.kind === 'autodate') { setPath(next, p, el.value ? el.value : 'auto'); return; }
     if (el.type === 'number') {
@@ -138,15 +145,35 @@ function syncDerived(s) {
   // market.trade_resolution 은 execution.resolution 과 항상 같다
   const res = getPath(s, 'execution.resolution');
   if (res) setPath(s, 'market.trade_resolution', res);
-  // 손절 이동평균 기간은 조건식/체결가 양쪽 지표에 반영
-  const ma = getPath(s, 'exits[1].ma_period');
-  if (Number.isFinite(ma)) {
-    for (const p of ['exits[1].when.right', 'exits[1].price']) {
-      const node = getPath(s, p);
-      if (node && typeof node === 'object' && node.indicator) node.period = ma;
+
+  // 규칙에 ma_period 가 있으면 그 규칙 안의 이동평균 지표 period 를 함께 맞춘다.
+  // (전략1의 45일선 손절, 전략3의 20일선/5일선 규칙 모두 같은 방식으로 동작한다)
+  for (const key of ['entries', 'exits']) {
+    const arr = s[key];
+    if (!Array.isArray(arr)) continue;
+    for (const rule of arr) {
+      if (!rule || typeof rule !== 'object') continue;
+      const ma = Number(rule.ma_period);
+      if (!Number.isFinite(ma)) continue;
+      walkIndicatorNodes(rule, (node) => {
+        if (node.indicator === 'SMA' || node.indicator === 'EMA' || node.indicator === 'WMA') {
+          node.period = ma;
+        }
+      });
     }
   }
   return s;
+}
+
+/** 중첩 구조 안의 {indicator:...} 노드를 모두 찾아 콜백에 넘긴다 */
+function walkIndicatorNodes(o, fn, depth = 0) {
+  if (!o || typeof o !== 'object' || depth > 8) return;
+  if (Array.isArray(o)) { for (const x of o) walkIndicatorNodes(x, fn, depth + 1); return; }
+  if (o.indicator) fn(o);
+  for (const k of Object.keys(o)) {
+    if (k === 'indicator') continue;
+    walkIndicatorNodes(o[k], fn, depth + 1);
+  }
 }
 
 /** 폼 변경 → 300ms 디바운스 → 콜백 */
@@ -323,7 +350,8 @@ export function renderByStock(rows, ctx = {}) {
    ============================================================ */
 
 const EXIT_LABEL = {
-  TP: ['익절', 's'], SL: ['손절', 'x'], TIME: ['시간청산', 'x'],
+  TP: ['익절', 's'], TP1: ['1차 익절', 's'], TP2: ['잔량 청산', 's'],
+  SL: ['손절', 'x'], TIME: ['시간청산', 'x'],
   TRAIL: ['트레일링', 'x'], END: ['기간종료', 'x'],
 };
 
@@ -366,14 +394,28 @@ export function renderTrades(trades, onRowClick, ctx = {}) {
   const fillOf = (t, rule, idx) =>
     (t.fills || []).find((f) => f.rule === rule) || (t.fills || [])[idx] || null;
 
+  // 같은 진입에서 나온 분할 청산은 group_id 로 묶어 한 덩어리로 보이게 한다.
+  // (묶지 않으면 같은 종목이 두 줄로 보여 중복 거래로 오해한다)
+  const gcount = {};
+  for (const t of trades) if (t.group_id) gcount[t.group_id] = (gcount[t.group_id] || 0) + 1;
+  let seen = {};
+
   tb.innerHTML = trades.map((t) => {
     const b1 = fillOf(t, 'B1', 0);
     const b2 = fillOf(t, 'B2', 1);
     const [exLabel, exCls] = EXIT_LABEL[t.exit_rule] || [t.exit_rule || '청산', 'x'];
     const win = (+t.return_pct) >= 0;
-    return `<tr data-no="${t.no}" data-code="${esc(t.code)}" tabindex="0">
+    const gid = t.group_id || '';
+    const gn = gid ? (gcount[gid] || 1) : 1;
+    const idx = gid ? (seen[gid] = (seen[gid] || 0) + 1) : 1;
+    const grouped = gn > 1;
+    const gcls = grouped ? ` grp-row${idx === 1 ? ' grp-first' : ''}${idx === gn ? ' grp-last' : ''}` : '';
+    const gmark = grouped
+      ? `<span class="grp-mark" title="같은 매수에서 나온 ${gn}번의 분할 매도 중 ${idx}번째">${idx}/${gn}</span>`
+      : '';
+    return `<tr class="${gcls.trim()}" data-no="${t.no}" data-code="${esc(t.code)}" data-gid="${esc(gid)}" tabindex="0">
       <td class="l">${t.no}</td>
-      <td class="l"><b>${esc(t.name || '')}</b> <span class="dim" style="font-family:var(--mono)">${esc(t.code)}</span></td>
+      <td class="l">${gmark}<b>${esc(t.name || '')}</b> <span class="dim" style="font-family:var(--mono)">${esc(t.code)}</span></td>
       <td class="l">${esc(t.ref_date || '—')}</td>
       <td>${Number.isFinite(t.ref_amount_eok) ? fmt(t.ref_amount_eok) + '억' : '—'}</td>
       <td class="l">${b1 ? `<span class="mk b">${TRI_UP}B1</span> ${esc(b1.date)}` : '—'}</td>
@@ -393,7 +435,10 @@ export function renderTrades(trades, onRowClick, ctx = {}) {
   tb.querySelectorAll('tr').forEach((tr) => {
     const go = () => {
       tb.querySelectorAll('tr').forEach((x) => x.classList.remove('sel'));
-      tr.classList.add('sel');
+      // 분할 청산은 한 거래이므로 같은 group 전체를 함께 선택 표시한다
+      const gid = tr.dataset.gid;
+      if (gid) tb.querySelectorAll(`tr[data-gid="${CSS.escape(gid)}"]`).forEach((x) => x.classList.add('sel'));
+      else tr.classList.add('sel');
       onRowClick(+tr.dataset.no);
     };
     tr.addEventListener('click', go);
@@ -407,7 +452,11 @@ export function selectTradeRow(no) {
   const tb = $('tradeBody');
   tb.querySelectorAll('tr').forEach((x) => x.classList.remove('sel'));
   const tr = tb.querySelector(`tr[data-no="${no}"]`);
-  if (tr) { tr.classList.add('sel'); tr.scrollIntoView({ block: 'nearest' }); }
+  if (!tr) return;
+  const gid = tr.dataset.gid;
+  if (gid) tb.querySelectorAll(`tr[data-gid="${CSS.escape(gid)}"]`).forEach((x) => x.classList.add('sel'));
+  else tr.classList.add('sel');
+  tr.scrollIntoView({ block: 'nearest' });
 }
 
 /* ============================================================
@@ -767,14 +816,21 @@ export function assumptionsSummary(a) {
   const res = RES_LABEL[a.resolution] || a.resolution || '일봉';
   const sde = SDE_LABEL[a.same_day_exit] || a.same_day_exit || '';
   const cost = (Number(a.slippage_pct) || 0) + (Number(a.fee_pct) || 0);
-  return `${res} 기준 · ${sde} · 비용 ${(+cost.toFixed(3))}% 반영`;
+  const ign = Array.isArray(a.ignored_filters) ? a.ignored_filters.length : 0;
+  return `${res} 기준 · ${sde} · 비용 ${(+cost.toFixed(3))}% 반영`
+    + (ign ? ` · 미적용 조건 ${ign}개` : '');
 }
 
 /**
  * @param {object} a  result.assumptions
  * @param {object} metrics result.metrics (거래 수 대비 비율 계산용)
  */
-export function renderAssumptions(a, metrics) {
+export function renderAssumptions(a, metrics, params) {
+  // params 선언이 있으면 raw key 대신 사람이 읽는 라벨을 쓴다
+  const labelOf = {};
+  for (const prm of (params || [])) {
+    if (prm && prm.key) labelOf[prm.key] = prm.label || prm.key;
+  }
   const sum = $('assumeSum');
   const body = $('assumeBody');
   const flag = $('assumeFlag');
@@ -799,9 +855,12 @@ export function renderAssumptions(a, metrics) {
   const optimistic = a.same_day_exit === 'always';
 
   // 접힌 상태에서도 위험 신호는 보이게 한다
-  flag.innerHTML = optimistic
-    ? '<span class="flag danger">낙관적 설정</span>'
-    : (ambHot ? '<span class="flag warn">가정 의존 높음</span>' : '');
+  const ignoredN = Array.isArray(a.ignored_filters) ? a.ignored_filters.length : 0;
+  flag.innerHTML = ignoredN
+    ? `<span class="flag danger">미적용 조건 ${ignoredN}</span>`
+    : (optimistic
+      ? '<span class="flag danger">낙관적 설정</span>'
+      : (ambHot ? '<span class="flag warn">가정 의존 높음</span>' : ''));
 
   const rows = [];
   const row = (k, v, note, tone) => rows.push(
@@ -833,8 +892,18 @@ export function renderAssumptions(a, metrics) {
   }
 
   const notes = (a.notes || []).filter((n) => n && String(n).trim());
+  const ignored = Array.isArray(a.ignored_filters) ? a.ignored_filters : [];
 
   body.innerHTML =
+    (ignored.length
+      ? `<div class="as-alert danger">
+           <b>적용되지 않은 조건이 ${ignored.length}개 있습니다.</b>
+           전략에는 있지만 데이터가 없어 계산에서 빠진 조건입니다.
+           이 조건들이 걸러 냈어야 할 종목까지 포함되어 있으므로,
+           <b>실제로 이 전략을 돌렸을 때보다 결과가 좋게 나올 수 있습니다.</b>
+           <ul class="ign-list">${ignored.map((f) => `<li><b>${esc(labelOf[f.key] || f.key)}</b><span>${esc(f.reason)}</span></li>`).join('')}</ul>
+         </div>`
+      : '') +
     (optimistic
       ? `<div class="as-alert danger">
            <b>결과가 실제보다 좋게 나올 수 있는 설정입니다.</b>
@@ -1030,9 +1099,14 @@ export function renderFieldHints() {
     const min = el.getAttribute('min'), max = el.getAttribute('max');
     if (min === null && max === null) return;
     const unit = (el.parentElement.querySelector('.unit') || {}).textContent || '';
+    const nice = (v) => {
+      if (v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) && Math.abs(n) >= 10000 ? n.toLocaleString('ko-KR') : String(v);
+    };
     const s = document.createElement('span');
     s.className = 'fld-range';
-    s.textContent = `${min ?? '−∞'} ~ ${max ?? '∞'}${unit ? ' ' + unit.trim() : ''}`;
+    s.textContent = `${nice(min) ?? '−∞'} ~ ${nice(max) ?? '∞'}${unit ? ' ' + unit.trim() : ''}`;
     el.parentElement.querySelector('label')?.appendChild(s);
   });
 }
@@ -1044,7 +1118,11 @@ export function renderFieldHints() {
  */
 export function formIssues() {
   const issues = [];
+  const byPath = {};
+  document.querySelectorAll('#paramForm [data-path]').forEach((el) => { byPath[el.dataset.path] = el; });
+
   document.querySelectorAll('#paramForm input[type="number"][data-path]').forEach((el) => {
+    if (el.disabled) return;                       // 적용되지 않는 항목은 검증하지 않는다
     if (el.value === '') { issues.push({ id: el.id, level: 'err', message: '값을 입력하세요.' }); return; }
     const v = Number(el.value);
     if (!Number.isFinite(v)) { issues.push({ id: el.id, level: 'err', message: '숫자만 입력할 수 있습니다.' }); return; }
@@ -1053,28 +1131,38 @@ export function formIssues() {
     else if (max !== null && v > Number(max)) issues.push({ id: el.id, level: 'err', message: `${max} 이하여야 합니다. 지금은 ${v} 입니다.` });
   });
 
-  // 분할 매수 비중 합 — 100%가 아니면 계획 자본을 다 쓰지 않는다는 뜻
-  const b1 = Number(($('p_b1') || {}).value), b2 = Number(($('p_b2') || {}).value);
-  if (Number.isFinite(b1) && Number.isFinite(b2)) {
-    const sum = b1 + b2;
-    if (Math.abs(sum - 100) > 0.001) {
+  // 분할 매수 비중 합 — entries[*].size_pct 를 path 로 모아 검사한다(전략 구조와 무관)
+  const sizeEls = Object.keys(byPath)
+    .filter((k) => /^entries\[\d+\]\.size_pct$/.test(k))
+    .map((k) => byPath[k])
+    .filter((el) => el && !el.disabled && el.value !== '');
+  if (sizeEls.length > 1) {
+    const sum = sizeEls.reduce((a, el) => a + Number(el.value), 0);
+    if (Number.isFinite(sum) && Math.abs(sum - 100) > 0.001) {
       issues.push({
-        id: 'p_b2', level: 'warn',
+        id: sizeEls[sizeEls.length - 1].id, level: 'warn',
         message: sum < 100
-          ? `매수 1·2 비중 합이 ${+sum.toFixed(1)}% 입니다. 종목당 배정 자본의 ${+(100 - sum).toFixed(1)}% 는 사용하지 않습니다.`
-          : `매수 1·2 비중 합이 ${+sum.toFixed(1)}% 로 100% 를 넘습니다. 배정 자본보다 많이 사려고 합니다.`,
+          ? `분할 매수 비중 합이 ${+sum.toFixed(1)}% 입니다. 종목당 배정 자본의 ${+(100 - sum).toFixed(1)}% 는 사용하지 않습니다.`
+          : `분할 매수 비중 합이 ${+sum.toFixed(1)}% 로 100% 를 넘습니다. 배정 자본보다 많이 사려고 합니다.`,
       });
     }
   }
 
-  // 시작일 / 종료일 순서
-  const s = ($('p_start') || {}).value, e = ($('p_end') || {}).value;
-  if (s && e && s > e) issues.push({ id: 'p_end', level: 'err', message: '종료일이 시작일보다 빠릅니다.' });
+  // 하락률 성격의 트리거는 음수여야 의미가 있다
+  for (const key of Object.keys(byPath)) {
+    if (!/trigger_pct$/.test(key)) continue;
+    const el = byPath[key];
+    if (!el || el.disabled || el.value === '') continue;
+    const t = Number(el.value);
+    if (Number.isFinite(t) && t >= 0) {
+      issues.push({ id: el.id, level: 'warn', message: '이 값은 매수가 대비 하락률이라 보통 음수입니다 (예: -10).' });
+    }
+  }
 
-  // 2차 트리거는 하락률이므로 음수여야 의미가 있다
-  const t = Number(($('p_b2d') || {}).value);
-  if (Number.isFinite(t) && t >= 0) {
-    issues.push({ id: 'p_b2d', level: 'warn', message: '2차 트리거는 1차 매수가 대비 하락률이라 보통 음수입니다 (예: -10).' });
+  // 시작일 / 종료일 순서
+  const sEl = byPath['period.start'], eEl = byPath['period.end'];
+  if (sEl && eEl && sEl.value && eEl.value && sEl.value > eEl.value) {
+    issues.push({ id: eEl.id, level: 'err', message: '종료일이 시작일보다 빠릅니다.' });
   }
   return issues;
 }
@@ -1133,4 +1221,179 @@ export function renderNextStep(step) {
     `<span class="ns-num">${esc(step.num || '1')}</span>
      <div class="ns-tx"><b>${esc(step.title)}</b>${step.desc ? `<span>${step.desc}</span>` : ''}</div>
      ${step.action ? `<button type="button" class="btn btn-primary btn-sm" data-act="${esc(step.action.act)}">${esc(step.action.label)}</button>` : ''}`;
+}
+
+/* ============================================================
+   21. params 선언 기반 파라미터 폼 (ARCHITECTURE-v2 §1)
+   ------------------------------------------------------------
+   전략 JSON 의 params 배열로 폼을 생성한다. 하드코딩 금지.
+   params 가 없는 전략은 index.html 의 <template id="legacyForm"> 으로 폴백한다.
+   ============================================================ */
+
+/** 전략이 params 선언을 갖고 있는가 */
+export function hasParams(strategy) {
+  return !!(strategy && Array.isArray(strategy.params) && strategy.params.length);
+}
+
+/** "1. 종목 선정" → {num:'1', name:'종목 선정'} */
+function splitGroup(g, fallbackNum) {
+  const m = String(g || '').match(/^\s*(\d+)\s*[.)]\s*(.+)$/);
+  return m ? { num: m[1], name: m[2] } : { num: String(fallbackNum), name: String(g || '기타') };
+}
+
+const PARAM_INPUT_TYPE = { number: 'number', int: 'number', percent: 'number', date: 'date' };
+
+function paramField(p, i) {
+  const id = 'pp_' + String(p.key || i).replace(/[^\w-]/g, '_');
+  const off = p.available === false;
+  const dis = off ? ' disabled' : '';
+  const common =
+    ` id="${esc(id)}" data-path="${esc(p.path)}" data-key="${esc(p.key)}" data-type="${esc(p.type || 'number')}"${dis}`;
+
+  let control;
+  if (p.type === 'bool') {
+    control = `<span class="sw"><input type="checkbox"${common}><i></i></span>`;
+  } else if (p.type === 'select') {
+    const opts = (p.options || []).map((o) => {
+      const val = (o && typeof o === 'object') ? o.value : o;
+      const lab = (o && typeof o === 'object') ? (o.label ?? o.value) : o;
+      return `<option value="${esc(val)}">${esc(lab)}</option>`;
+    }).join('');
+    control = `<select class="inp wide"${common}>${opts}</select>`;
+  } else {
+    const t = PARAM_INPUT_TYPE[p.type] || 'number';
+    const attrs = [
+      p.min !== undefined ? ` min="${esc(p.min)}"` : '',
+      p.max !== undefined ? ` max="${esc(p.max)}"` : '',
+      p.step !== undefined ? ` step="${esc(p.step)}"` : '',
+    ].join('');
+    control = `<input class="inp${t === 'date' ? ' wide' : ''}" type="${t}"${attrs}${common}>`;
+  }
+
+  return `<div class="fld${off ? ' fld-off' : ''}">
+      <label for="${esc(id)}"><b>${esc(p.label || p.key)}</b>${p.help ? esc(p.help) : ''}</label>
+      ${control}
+      <span class="unit">${esc(p.unit || '')}</span>
+    </div>` +
+    (off
+      ? `<p class="fld-unavail">
+           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+           <span><b>적용되지 않음</b> ${esc(p.unavailable_reason || '이 조건에 필요한 데이터가 없습니다.')}</span>
+         </p>`
+      : '');
+}
+
+/**
+ * 파라미터 폼을 그린다.
+ * @returns {'params'|'legacy'} 어떤 방식으로 그렸는지
+ */
+export function renderParamForm(strategy) {
+  const host = $('paramForm');
+  if (!hasParams(strategy)) {
+    // 하위 호환 — params 가 없는 전략은 기존 고정 폼을 쓴다
+    host.innerHTML = '';
+    const tpl = document.getElementById('legacyForm');
+    if (tpl) host.appendChild(tpl.content.cloneNode(true));
+    host.dataset.mode = 'legacy';
+    return 'legacy';
+  }
+
+  const order = [];
+  const byGroup = new Map();
+  for (const p of strategy.params) {
+    const g = p.group || '기타';
+    if (!byGroup.has(g)) { byGroup.set(g, []); order.push(g); }
+    byGroup.get(g).push(p);
+  }
+
+  let html = '';
+  order.forEach((g, gi) => {
+    const { num, name } = splitGroup(g, gi + 1);
+    const items = byGroup.get(g);
+    const offN = items.filter((x) => x.available === false).length;
+    html += `<div class="grp">
+      <div class="grp-t"><span class="n">${esc(num)}</span>${esc(name)}` +
+      (offN ? `<span class="grp-off" title="데이터가 없어 적용되지 않는 항목">미적용 ${offN}</span>` : '') +
+      `</div>`;
+    items.forEach((p, i) => { html += paramField(p, `${gi}_${i}`); });
+    html += '</div>';
+  });
+
+  // 차트 지표 칩은 params 와 별개로 항상 마지막에 둔다
+  html += `<div class="grp">
+    <div class="grp-t"><span class="n">${order.length + 1}</span>차트에 표시할 지표</div>
+    <div class="chips" id="indChips" aria-label="차트에 표시할 지표"></div>
+  </div>`;
+
+  host.innerHTML = html;
+  host.dataset.mode = 'params';
+  return 'params';
+}
+
+/**
+ * params[].default 를 각 path 에 다시 써넣은 새 전략 객체.
+ * available:false 항목도 되돌린다. params 자체는 건드리지 않는다. (v2 §1)
+ */
+export function applyParamDefaults(strategy) {
+  const next = structuredClone(strategy);
+  for (const p of (strategy.params || [])) {
+    if (!p || !p.path) continue;
+    setPath(next, p.path, p.default);
+  }
+  return next;
+}
+
+/** 지금 값이 기본값과 다른 param 개수 */
+export function countChangedFromDefault(strategy) {
+  let n = 0;
+  for (const p of (strategy && strategy.params) || []) {
+    if (!p || !p.path) continue;
+    if (JSON.stringify(getPath(strategy, p.path)) !== JSON.stringify(p.default)) n++;
+  }
+  return n;
+}
+
+/* ============================================================
+   22. 백테스트 진행 상황 (단계 · % · 경과 · 남은 시간)
+   ============================================================ */
+
+/** 초 → "1분 12초" */
+export function humanSec(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return '—';
+  const s = Math.round(sec);
+  if (s < 60) return `${s}초`;
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return r ? `${m}분 ${r}초` : `${m}분`;
+  const h = Math.floor(m / 60);
+  return `${h}시간 ${m % 60}분`;
+}
+
+/**
+ * @param {object} st {phase, message, pct, elapsedSec, etaSec, cancellable}
+ */
+export function renderRunProgress(st) {
+  const host = $('runPanel');
+  if (!host) return;
+  if (!st) { host.hidden = true; host.innerHTML = ''; return; }
+  host.hidden = false;
+
+  const pct = Number.isFinite(st.pct) ? Math.max(0, Math.min(100, st.pct)) : null;
+  const eta = st.etaSec === null || st.etaSec === undefined
+    ? '계산 중…'
+    : `약 ${humanSec(st.etaSec)} 남음`;
+
+  // "종목별 매매 계산 중 (1,240/2,700 종목)" 처럼 단계명이 되풀이되면 뒷부분만 남긴다
+  let msg = st.message || '';
+  if (st.phase && msg.startsWith(st.phase)) msg = msg.slice(st.phase.length).trim();
+
+  host.innerHTML =
+    `<div class="run-top">
+       <span class="spinner" aria-hidden="true"></span>
+       <b class="run-phase">${esc(st.phase || '백테스트 실행 중')}</b>
+       <span class="run-pct">${pct === null ? '' : pct.toFixed(0) + '%'}</span>
+       <span class="run-meta">${esc(humanSec(st.elapsedSec))} 경과 · ${esc(eta)}</span>
+       ${st.cancellable ? '<button type="button" class="btn btn-sm" data-act="cancelRun">취소</button>' : ''}
+     </div>
+     <div class="run-bar"><i class="${pct === null ? 'indet' : ''}" style="${pct === null ? '' : `width:${pct}%`}"></i></div>
+     ${msg ? `<div class="run-msg">${esc(msg)}</div>` : ''}`;
 }

@@ -12,6 +12,7 @@ from engine.indicators import REGISTRY, compute, indicator_key, source_series, s
 ALL_KEYS = [
     "SMA", "EMA", "WMA", "BBANDS", "RSI", "MACD", "STOCH",
     "ATR", "ADX", "CCI", "OBV", "VWAP", "ENVELOPE", "DONCHIAN",
+    "HIGHEST", "LOWEST",          # ARCHITECTURE-v2 3-2
 ]
 
 SUBFIELD_KEYS = {"BBANDS", "MACD", "STOCH", "ADX", "ENVELOPE", "DONCHIAN"}
@@ -221,6 +222,31 @@ def test_donchian_channel(rng_ohlcv):
     np.testing.assert_allclose(
         d["upper"], rng_ohlcv["High"].rolling(20).max().to_numpy(), equal_nan=True
     )
+
+
+def test_highest_lowest(rng_ohlcv):
+    hi = compute("HIGHEST", {"period": 20, "source": "close"}, rng_ohlcv)
+    lo = compute("LOWEST", {"period": 20, "source": "close"}, rng_ohlcv)
+    want_hi = rng_ohlcv["Close"].rolling(20).max().to_numpy()
+    np.testing.assert_allclose(hi, want_hi, equal_nan=True)
+    np.testing.assert_allclose(lo, rng_ohlcv["Close"].rolling(20).min().to_numpy(), equal_nan=True)
+    ok = ~np.isnan(hi)
+    assert (hi[ok] >= rng_ohlcv["Close"].to_numpy()[ok] - 1e-9).all()
+    assert (lo[ok] <= hi[ok]).all()
+
+
+def test_highest_default_is_52_weeks():
+    assert dict(p["name"] for p in [] ) == {} or True
+    spec = REGISTRY["HIGHEST"]
+    assert {p["name"]: p["default"] for p in spec["params"]}["period"] == 252
+
+
+def test_indicator_source_volume_amount(rng_ohlcv):
+    """거래량 이동평균 (ARCHITECTURE-v2 3-2 source 확장)."""
+    v = compute("SMA", {"period": 20, "source": "volume"}, rng_ohlcv)
+    np.testing.assert_allclose(v, rng_ohlcv["Volume"].rolling(20).mean().to_numpy(), equal_nan=True)
+    a = compute("SMA", {"period": 5, "source": "amount"}, rng_ohlcv)
+    np.testing.assert_allclose(a, rng_ohlcv["Amount"].rolling(5).mean().to_numpy(), equal_nan=True)
 
 
 def test_source_variants(rng_ohlcv):

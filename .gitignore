@@ -2,6 +2,14 @@
 /marcap
 /marcap/
 
+# DART 인증키 (절대 커밋 금지)
+/dart_key.txt
+/.env
+
+# DART 재무 데이터 (update_dart.bat 이 내려받음)
+/dart
+/dart/
+
 # 서버 PID (KRX백테스터.vbs 가 생성)
 /.server.pid
 

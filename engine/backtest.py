@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .dsl import EvalContext, evaluate_condition, evaluate_operand
+from .dsl import EvalContext, evaluate_condition, evaluate_operand, safe_eval_expr
 from .errors import BacktestCancelled, DataUnavailable, DSLError, StrategyError
 from .indicators import REGISTRY
 from .metrics import _i, build_equity, by_stock_summary, compute_metrics, monthly_returns
@@ -109,6 +109,106 @@ class _Signals:
         )
 
 
+class _Reporter:
+    """진행률 보고 + 취소 확인 (ARCHITECTURE-v2 §2-1).
+
+    * ``progress`` 는 v1 3인자 ``(done, total, message)`` 와
+      v2 5인자 ``(done, total, message, phase, eta_sec)`` 를 **둘 다** 지원한다.
+    * ``should_cancel()`` 은 최소 ``CANCEL_INTERVAL_SEC`` 마다 확인한다.
+    * ``eta_sec`` 은 현재 단계의 실제 진척 속도로 추정하고, 근거가 없으면 ``None``.
+    """
+
+    def __init__(self, progress=None, should_cancel=None):
+        self.progress = progress
+        self.should_cancel = should_cancel
+        self._ext = self._detect(progress)
+        self._t0 = time.perf_counter()
+        self._last_emit = 0.0
+        self._last_cancel = 0.0
+        self._anchor_done = 0.0
+        self._anchor_t = self._t0
+        self.phase = PHASE_LOAD
+        self.max_gap = 0.0          # 진행률 호출 간격 최댓값 (계측용)
+        self.calls = 0
+
+    @staticmethod
+    def _detect(progress) -> bool:
+        if progress is None:
+            return False
+        try:
+            inspect.signature(progress).bind(0, 100, "", None, None)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    # -- 취소 --------------------------------------------------------------------
+    def check(self, force: bool = False) -> None:
+        """취소 여부 확인. ``True`` 면 ``BacktestCancelled``."""
+        if self.should_cancel is None:
+            return
+        now = time.perf_counter()
+        if not force and (now - self._last_cancel) < CANCEL_INTERVAL_SEC:
+            return
+        self._last_cancel = now
+        try:
+            cancelled = bool(self.should_cancel())
+        except Exception:  # pragma: no cover - 콜백 오류로 백테스트를 죽이지 않는다
+            return
+        if cancelled:
+            raise BacktestCancelled("사용자가 취소했습니다.", phase=self.phase)
+
+    # -- 진행률 ------------------------------------------------------------------
+    def set_phase(self, phase: str, done: float) -> None:
+        self.phase = phase
+        self._anchor_done = float(done)
+        self._anchor_t = time.perf_counter()
+
+    def _eta(self, done: float, now: float):
+        prog = done - self._anchor_done
+        elapsed = now - self._anchor_t
+        if prog <= 0.0 or elapsed < 0.5 or done >= 100:
+            return None
+        remaining = max(100.0 - done, 0.0)
+        return round(elapsed / prog * remaining, 1)
+
+    def emit(self, done: float, message: str, phase: str | None = None,
+             force: bool = False) -> None:
+        now = time.perf_counter()
+        if not force and (now - self._last_emit) < PROGRESS_INTERVAL_SEC:
+            return
+        if self.calls:
+            self.max_gap = max(self.max_gap, now - self._last_emit)
+        self._last_emit = now
+        self.calls += 1
+        if phase:
+            self.phase = phase
+        if self.progress is None:
+            return
+        eta = self._eta(float(done), now)
+        d = int(max(0, min(100, round(done))))
+        try:
+            if self._ext:
+                self.progress(d, 100, message, self.phase, eta)
+            else:
+                self.progress(d, 100, message)
+        except TypeError:
+            self._ext = not self._ext
+            try:
+                if self._ext:
+                    self.progress(d, 100, message, self.phase, eta)
+                else:
+                    self.progress(d, 100, message)
+            except Exception:  # pragma: no cover
+                pass
+        except Exception:  # pragma: no cover - 콜백 오류가 백테스트를 죽이면 안 된다
+            pass
+
+    def tick(self, done: float, message: str, phase: str | None = None) -> None:
+        """취소 확인 + 진행률 보고를 한 번에 (긴 루프 안에서 호출)."""
+        self.check()
+        self.emit(done, message, phase)
+
+
 def _fmt(v) -> str:
     try:
         return f"{float(v):,.0f}"
@@ -129,8 +229,89 @@ def _market_mask(series: pd.Series, markets: Sequence[str]) -> pd.Series:
     return s.isin(allowed)
 
 
-def _eligible_codes(panel: pd.DataFrame, universe: Mapping) -> Tuple[pd.Index, dict]:
-    """시장 / 제외 조건을 종목 단위로 적용한다 (각 종목의 최신 행 기준)."""
+#: ``universe.filters`` 중 엔진이 실제로 적용할 수 있는 키
+SUPPORTED_FILTERS = {
+    "market_cap_min_eok": ("시가총액 하한", "억"),
+    "market_cap_max_eok": ("시가총액 상한", "억"),
+    "price_min": ("주가 하한", "원"),
+    "price_max": ("주가 상한", "원"),
+    "amount_min_eok": ("거래대금 하한", "억"),
+    "volume_min": ("거래량 하한", "주"),
+}
+
+_DEFAULT_IGNORED_REASON = "이 조건에 필요한 데이터가 marcap 에 없어 적용하지 않았습니다."
+
+
+def _indicator_aliases(strategy: Mapping) -> Dict[str, dict]:
+    """``strategy["indicators"][].key`` → 지표 스펙. 조건식/수식에서 이름으로 참조한다."""
+    out: Dict[str, dict] = {}
+    for spec in strategy.get("indicators") or []:
+        if not isinstance(spec, Mapping):
+            continue
+        key = spec.get("key")
+        name = spec.get("type") or spec.get("indicator")
+        if not isinstance(key, str) or not key.strip() or not isinstance(name, str):
+            continue
+        if name.upper() not in REGISTRY:
+            continue
+        params = {
+            k: v for k, v in spec.items()
+            if k not in ("key", "type", "indicator", "plot", "color", "label", "pane")
+        }
+        params["indicator"] = name
+        out[key] = params
+    return out
+
+
+def _split_filters(strategy: Mapping) -> Tuple[dict, List[dict]]:
+    """``universe.filters`` 를 (적용 가능, 무시됨) 으로 나눈다.
+
+    무시된 항목의 사유는 같은 경로를 가리키는 ``params[].unavailable_reason`` 을 우선 쓴다.
+    """
+    filters = (strategy.get("universe") or {}).get("filters") or {}
+    if not isinstance(filters, Mapping):
+        return {}, []
+
+    by_path = {}
+    for prm in strategy.get("params") or []:
+        if isinstance(prm, Mapping) and isinstance(prm.get("path"), str):
+            by_path[prm["path"]] = prm
+
+    applied: dict = {}
+    ignored: List[dict] = []
+    for key, value in filters.items():
+        if str(key).startswith("_") or key == "comment":
+            continue
+        if value is None:
+            continue
+        if key in SUPPORTED_FILTERS:
+            try:
+                applied[key] = float(value)
+            except (TypeError, ValueError):
+                pass
+            continue
+        prm = by_path.get(f"universe.filters.{key}") or {}
+        label = prm.get("label") or key
+        unit = prm.get("unit") or ""
+        reason = prm.get("unavailable_reason") or _DEFAULT_IGNORED_REASON
+        ignored.append(
+            {
+                "key": key,
+                "label": label,
+                "value": value,
+                "reason": reason,
+                "message": (
+                    f"{label} 조건({_fmt(value) if isinstance(value, (int, float)) else value}"
+                    f"{unit})은 적용하지 않았습니다. {reason} 실제보다 종목이 많이 잡힙니다."
+                ),
+            }
+        )
+    return applied, ignored
+
+
+def _eligible_codes(panel: pd.DataFrame, universe: Mapping,
+                    filters: Mapping | None = None) -> Tuple[pd.Index, dict]:
+    """시장 / 제외 조건 / universe.filters 를 종목 단위로 적용한다 (각 종목의 최신 행 기준)."""
     last = panel.drop_duplicates("Code", keep="last")
     stats = {"total": int(len(last))}
     keep = pd.Series(True, index=last.index)
@@ -167,9 +348,154 @@ def _eligible_codes(panel: pd.DataFrame, universe: Mapping) -> Tuple[pd.Index, d
     if "TRADE_HALT" in ex:
         keep &= ~dept.str.contains("정지", regex=False)
 
-    codes = pd.Index(last.loc[keep, "Code"].unique())
+    f = dict(filters or {})
+    if f:
+        if "market_cap_min_eok" in f and "Marcap" in last.columns:
+            keep &= last["Marcap"] >= f["market_cap_min_eok"] * EOK
+        if "market_cap_max_eok" in f and "Marcap" in last.columns:
+            keep &= last["Marcap"] <= f["market_cap_max_eok"] * EOK
+        if "price_min" in f and "Close" in last.columns:
+            keep &= last["Close"] >= f["price_min"]
+        if "price_max" in f and "Close" in last.columns:
+            keep &= last["Close"] <= f["price_max"]
+        if "amount_min_eok" in f and "Amount" in last.columns:
+            keep &= last["Amount"] >= f["amount_min_eok"] * EOK
+        if "volume_min" in f and "Volume" in last.columns:
+            keep &= last["Volume"] >= f["volume_min"]
+
+    codes = pd.Index(last.loc[keep.fillna(False), "Code"].unique())
     stats["eligible"] = int(len(codes))
     return codes, stats
+
+
+_PANEL_COLS = {
+    "open": "Open", "high": "High", "low": "Low", "close": "Close",
+    "volume": "Volume", "amount": "Amount", "marcap": "Marcap",
+}
+
+
+def _rule_params(rd: Mapping) -> dict:
+    """reference_day 딕셔너리의 숫자 필드 = 조건식에서 쓸 수 있는 파라미터."""
+    return {
+        k: v for k, v in rd.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
+def _cheap_operand(op: Any, params: Mapping):
+    """패널 전체에 바로 적용 가능한 피연산자인가.
+
+    ``("col", "Amount")`` / ``("scalar", 1e11)`` / ``None``(비쌈).
+    """
+    if isinstance(op, bool):
+        return None
+    if isinstance(op, (int, float)):
+        return ("scalar", float(op))
+    if isinstance(op, str):
+        low = op.strip().lower()
+        if low in _PANEL_COLS:
+            return ("col", _PANEL_COLS[low])
+        try:
+            return ("scalar", float(op.strip()))
+        except ValueError:
+            pass
+        v = params.get(op.strip())
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return ("scalar", float(v))
+        return None
+    if isinstance(op, Mapping) and "expr" in op:
+        try:
+            v = safe_eval_expr(op["expr"], EvalContext(pd.DataFrame(), params=params))
+        except Exception:
+            return None
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            return ("scalar", float(v))
+    return None
+
+
+_CHEAP_CMP = {
+    "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+}
+
+
+def _cheap_prefilter(when: Any, panel: pd.DataFrame, params: Mapping):
+    """``when`` 중 패널 전체에 바로 걸 수 있는 조건만 뽑아 사전 필터를 만든다.
+
+    이게 있으면 무거운 종목별 평가를 후보 종목에만 돌릴 수 있다 (ARCHITECTURE §3 성능 요구).
+    """
+    if not isinstance(when, Mapping):
+        return None
+    op = str(when.get("op") or "").lower()
+    conds = when.get("conditions") or [] if op == "and" else [when]
+    masks = []
+    for c in conds:
+        if not isinstance(c, Mapping):
+            continue
+        cop = str(c.get("op") or "").lower()
+        fn = _CHEAP_CMP.get(cop)
+        if fn is None:
+            continue
+        L = _cheap_operand(c.get("left"), params)
+        R = _cheap_operand(c.get("right"), params)
+        if not L or not R or (L[0] == "scalar" and R[0] == "scalar"):
+            continue
+        if (L[0] == "col" and L[1] not in panel.columns) or (R[0] == "col" and R[1] not in panel.columns):
+            continue
+        lv = panel[L[1]] if L[0] == "col" else L[1]
+        rv = panel[R[1]] if R[0] == "col" else R[1]
+        masks.append(fn(lv, rv))
+    if not masks:
+        return None
+    m = masks[0]
+    for x in masks[1:]:
+        m = m & x
+    return m.fillna(False)
+
+
+def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
+                   aliases: Mapping | None, rep) -> pd.DataFrame:
+    """``reference_day.rule = "custom"`` — when 조건식으로 기준일을 찾는다."""
+    rd = dict(universe.get("reference_day") or {})
+    when = rd.get("when")
+    params = _rule_params(rd)
+
+    cheap = _cheap_prefilter(when, panel, params)
+    if cheap is not None:
+        hot = panel.loc[cheap & (panel["Date"] >= pd.Timestamp(start)), "Code"]
+        codes = pd.Index(hot.unique())
+    else:
+        codes = pd.Index(panel["Code"].unique())
+    if len(codes) == 0:
+        return panel.iloc[0:0][[c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in panel.columns]]
+
+    cols = [c for c in _PRICE_COLS if c in panel.columns]
+    sub = panel[panel["Code"].isin(codes)]
+    total = len(codes)
+    rows = []
+    for j, (code, g) in enumerate(sub.groupby("Code", sort=False)):
+        if (j & 15) == 0:
+            rep.tick(18 + 7.0 * j / max(total, 1),
+                     f"기준일 조건 확인 중 ({j:,}/{total:,} 종목)", PHASE_SCAN)
+        df = g.set_index("Date")[cols]
+        ctx = EvalContext(df, params=params, aliases=aliases)
+        try:
+            hits = evaluate_condition(when, ctx)
+        except DSLError:
+            continue
+        if hits is True:
+            idx = np.arange(len(df))
+        else:
+            idx = np.flatnonzero(np.asarray(hits, dtype=bool))
+        if idx.size == 0:
+            continue
+        take = g.iloc[idx]
+        rows.append(take.loc[take["Date"] >= pd.Timestamp(start)])
+    if not rows:
+        return sub.iloc[0:0]
+    out = pd.concat(rows, ignore_index=True)
+    keep = [c for c in ("Code", "Date", "Amount", "Open", "High", "Low", "Close") if c in out.columns]
+    return out[keep]
 
 
 def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date) -> pd.DataFrame:
@@ -297,6 +623,9 @@ def _fill_price(
     spec = rule.get("price")
     if spec is None:
         return float(bar["close"])
+    if isinstance(spec, str) and spec.strip().lower() in ("open", "high", "low", "close"):
+        # 그 봉의 값 자체를 체결가로 쓰는 경우 — 목표가가 아니므로 갭 보정을 하지 않는다
+        return float(bar[spec.strip().lower()])
     try:
         target = evaluate_operand(spec, ctx, li)
     except DSLError:
@@ -324,18 +653,27 @@ def _fill_price(
 def run_backtest(
     strategy: Mapping,
     store,
-    progress: Optional[Callable[[int, int, str], None]] = None,
+    progress: Optional[Callable[..., None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> dict:
+    """백테스트를 실행한다.
+
+    Parameters
+    ----------
+    progress : callable | None
+        ``progress(done, total, message)`` (v1) 또는
+        ``progress(done, total, message, phase, eta_sec)`` (v2). ``total`` 은 항상 100.
+    should_cancel : callable | None
+        ``True`` 를 돌려주면 ``BacktestCancelled`` 를 던진다. 최소 1초에 한 번 확인한다.
+    """
     t0 = time.perf_counter()
     run_id = "r_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    rep = _Reporter(progress, should_cancel)
 
-    def report(done: int, message: str) -> None:
-        if progress is not None:
-            try:
-                progress(int(done), 100, message)
-            except Exception:  # pragma: no cover - 콜백 오류가 백테스트를 죽이면 안 된다
-                pass
+    def report(done: int, message: str, phase: str | None = None) -> None:
+        rep.emit(done, message, phase, force=True)
 
+    rep.check(force=True)
     ok, errors = validate_strategy(strategy)
     if not ok:
         raise StrategyError("전략 스키마 검증에 실패했습니다", errors)
@@ -395,6 +733,14 @@ def run_backtest(
         "same_day_profit_exits_blocked": 0,
     }
 
+    # 지표 별칭 — strategy["indicators"][].key 를 조건식/수식에서 이름으로 쓴다
+    aliases = _indicator_aliases(strategy)
+
+    # universe.filters — 지원하는 키만 적용하고 나머지는 사유와 함께 남긴다
+    applied_filters, ignored_filters = _split_filters(strategy)
+    for ig in ignored_filters:
+        warnings.append(ig["message"])
+
     def make_assumptions() -> dict:
         return {
             "resolution": "1d",
@@ -406,9 +752,12 @@ def run_backtest(
             "exit_priority": [r.get("id") for r in ordered_exits],
             "notes": _assumption_notes(
                 requested_resolution, fill_model, same_day_exit, slippage, fee,
-                ordered_exits, stats,
+                ordered_exits, stats, ignored_filters,
             ),
             "stats": dict(stats),
+            "ignored_filters": [
+                {"key": ig["key"], "reason": ig["reason"]} for ig in ignored_filters
+            ],
         }
 
     # ---------------------------------------------------------------- 기간
@@ -426,18 +775,36 @@ def run_backtest(
     hist_start = start - dt.timedelta(days=int(warm * 1.75) + 30)
 
     # ---------------------------------------------------------------- 패널 로드
-    report(5, "시세 데이터 로드")
-    panel = store.panel(hist_start, end)
-    panel = panel.sort_values(["Code", "Date"], kind="stable").reset_index(drop=True)
+    rep.set_phase(PHASE_LOAD, 3)
+    report(3, f"{hist_start.year}~{end.year}년 데이터 읽는 중", PHASE_LOAD)
 
-    codes, ustats = _eligible_codes(panel, universe)
-    if len(codes) < ustats["total"]:
-        panel = panel[panel["Code"].isin(codes)]
+    def _on_year(idx: int, total: int, year: int) -> None:
+        rep.check(force=True)
+        rep.emit(3 + 14.0 * idx / max(total, 1),
+                 f"{year}년 데이터 읽는 중 ({idx + 1}/{total}년)", PHASE_LOAD, force=True)
+
+    try:
+        panel = store.panel(hist_start, end, on_year=_on_year)
+    except TypeError:                       # 구버전 store (on_year 미지원)
+        panel = store.panel(hist_start, end)
+    rep.check(force=True)
+    report(18, "종목 목록 정리 중", PHASE_LOAD)
+    panel = panel.sort_values(["Code", "Date"], kind="stable").reset_index(drop=True)
 
     calendar = [d.date() for d in pd.DatetimeIndex(sorted(panel["Date"].unique()))]
     calendar = [d for d in calendar if start <= d <= end]
     if not calendar:
         raise DataUnavailable(f"{start} ~ {end} 구간에 거래일이 없습니다")
+
+    codes, ustats = _eligible_codes(panel, universe, applied_filters)
+    if len(codes) == 0:
+        return _empty_result(
+            run_id, t0, warnings, sig, calendar, initial_capital, start, end,
+            "종목 선정 조건(시장·제외·filters)을 만족하는 종목이 없습니다.", make_assumptions(),
+        )
+    if len(codes) < ustats["total"]:
+        panel = panel[panel["Code"].isin(codes)]
+    rep.check(force=True)
 
     sig.add(
         calendar[0],
@@ -447,8 +814,13 @@ def run_backtest(
     )
 
     # ---------------------------------------------------------------- 1단계 스캔
-    report(12, "기준일 스캔")
-    events = _reference_events(panel, universe, start)
+    rep.set_phase(PHASE_SCAN, 18)
+    report(19, "기준일 찾는 중", PHASE_SCAN)
+    if str((universe.get("reference_day") or {}).get("rule") or "") == "custom":
+        events = _custom_events(panel, universe, start, aliases, rep)
+    else:
+        events = _reference_events(panel, universe, start)
+    rep.check(force=True)
     if events.empty:
         return _empty_result(
             run_id, t0, warnings, sig, calendar, initial_capital, start, end,
@@ -461,7 +833,11 @@ def run_backtest(
     # ---------------------------------------------------------------- 후보 종목 봉 준비
     sub = panel[panel["Code"].isin(cand_codes)]
     recs: Dict[str, dict] = {}
-    for code, gdf in sub.groupby("Code", sort=False):
+    _n_cand = len(cand_codes)
+    for _j, (code, gdf) in enumerate(sub.groupby("Code", sort=False)):
+        if (_j & 31) == 0:
+            rep.tick(20 + 5.0 * _j / max(_n_cand, 1),
+                     f"후보 종목 준비 중 ({_j:,}/{_n_cand:,})", PHASE_SCAN)
         gdf = gdf.sort_values("Date", kind="stable")
         df = gdf.set_index("Date")[[c for c in _PRICE_COLS if c in gdf.columns]]
         recs[code] = {
@@ -505,9 +881,21 @@ def run_backtest(
     dsl_error_logged = False
     n_days = len(calendar)
 
+    rep.set_phase(PHASE_SIM, 25)
     for gi, day in enumerate(calendar):
-        if progress is not None and (gi % 20 == 0 or gi == n_days - 1):
-            report(25 + int(65 * (gi + 1) / n_days), f"{day.isoformat()} 시뮬레이션")
+        if gi == 0 or gi == n_days - 1:
+            rep.check(force=True)
+            rep.emit(
+                25 + 65.0 * (gi + 1) / n_days,
+                f"종목별 매매 계산 중 ({gi + 1:,}/{n_days:,}일 · {day.isoformat()})",
+                PHASE_SIM, force=True,
+            )
+        rep.tick(
+            25 + 65.0 * (gi + 1) / n_days,
+            f"종목별 매매 계산 중 ({gi + 1:,}/{n_days:,}일 · {day.isoformat()} · "
+            f"보유 {sum(1 for x in active.values() if x['qty'] > 0)}종목 · 누적 {len(trades):,}거래)",
+            PHASE_SIM,
+        )
 
         # --- (a) 기준일 이벤트 등록 / 갱신 (조건 만족일이 여럿이면 가장 최근을 채택)
         for code, refbar in events_by_day.get(day, ()):
@@ -549,7 +937,7 @@ def run_backtest(
 
             bar = _bar(rec, li)
             nxt = _bar(rec, li + 1) if li + 1 < len(rec["close"]) else None
-            ctx = _ctx(rec, w)
+            ctx = _ctx(rec, w, li=li, aliases=aliases)
 
             # 유효기간 만료
             if not w["fills"] and (gi - w["ref_gi"]) > valid_days:
@@ -611,7 +999,11 @@ def run_backtest(
                 w["last_entry_date"] = fill_date
                 if w["entry_date"] is None:
                     w["entry_date"] = fill_date
+                    w["entry_li"] = li
                     w["peak"] = bar["high"]
+                    w["group_id"] = f"{code}-{w['ref_date'].isoformat()}-{fill_date.isoformat()}"
+                    w["entry_bar"] = dict(bar, price=float(px), qty=int(qty),
+                                          date=fill_date)
 
                 sig.add(day, "FILL", code,
                         f"BUY {code} @ {_fmt(buy_px)} × {qty}주 (비중 {rule.get('size_pct', 100)}%) "
@@ -622,14 +1014,17 @@ def run_backtest(
             # ---- 청산
             if w["qty"] > 0:
                 w["peak"] = max(w["peak"] or bar["high"], bar["high"])
-                ctx = _ctx(rec, w, bar=bar, day=day)
+                ctx = _ctx(rec, w, bar=bar, day=day, li=li, aliases=aliases)
                 entry_today = w["last_entry_date"] == day
                 ambiguous_here = False
                 blocked_here = False
                 for rule in ordered_exits:
                     if w["qty"] <= 0:
                         break
+                    if rule.get("id") in w["exits_done"]:
+                        continue      # 부분 청산 규칙은 포지션당 한 번만 발동한다
                     ctx.params = dict(rule)
+                    ctx.position = _position(w, bar, day, li)
                     hit, forced_price = _exit_hit(rule, ctx, li, bar, w, day)
                     if not hit:
                         continue
@@ -668,12 +1063,18 @@ def run_backtest(
                     )
                     cash += proceeds
                     trades.append(trade)
+                    w["exits_done"].add(rule.get("id"))
                     sig.add(day, "FILL", code,
                             f"SELL {code} @ {_fmt(trade['exit_price'])} × {qty_out}주 "
-                            f"— {trade['exit_reason']}", "15:30:00")
+                            f"({'전량' if w['qty'] <= 0 else '일부'}) — {trade['exit_reason']}",
+                            "15:30:00")
                     sig.add(day, "PNL", code,
                             f"{code} 실현손익 {trade['pnl']:+,.0f}원 ({trade['return_pct']:+.2f}%) "
                             f"· 보유 {trade['hold_days']}일", "15:30:00")
+                    if w["qty"] > 0:
+                        sig.add(day, "POS", code,
+                                f"{code} 부분 청산 후 잔량 {w['qty']}주 · 평단 "
+                                f"{_fmt(w['cost'] / w['qty'])} 유지", "15:30:00")
                 if ambiguous_here:
                     stats["ambiguous_bars"] += 1
                 if w["qty"] <= 0:
@@ -682,7 +1083,7 @@ def run_backtest(
         eq_values.append(cash + _mtm(active, recs, day))
 
     # ---------------------------------------------------------------- 미청산 강제 청산
-    report(92, "미청산 포지션 정리")
+    report(92, "미청산 포지션 정리", PHASE_SIM)
     last_day = calendar[-1]
     for code in sorted(active):
         w = active[code]
@@ -710,7 +1111,9 @@ def run_backtest(
     eq_values[-1] = cash + _mtm(active, recs, last_day)
 
     # ---------------------------------------------------------------- 성과
-    report(96, "성과 집계")
+    rep.set_phase(PHASE_METRICS, 94)
+    rep.check(force=True)
+    report(96, "성과 계산 중", PHASE_METRICS)
     metrics = compute_metrics(calendar, eq_values, trades, initial_capital, start, end)
     equity = build_equity(calendar, eq_values, initial_capital)
     monthly = monthly_returns(calendar, eq_values)
@@ -737,7 +1140,7 @@ def run_backtest(
             "일봉만으로는 하루 안의 체결 순서를 확정할 수 없습니다."
         )
 
-    report(100, "완료")
+    report(100, "완료", PHASE_METRICS)
     return {
         "run_id": run_id,
         "elapsed_sec": _r(time.perf_counter() - t0, 3),
@@ -814,7 +1217,7 @@ _SAME_DAY_NOTES = {
 
 def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit: str,
                       slippage: float, fee: float, ordered_exits: Sequence[Mapping],
-                      stats: Mapping) -> List[str]:
+                      stats: Mapping, ignored_filters: Sequence[Mapping] = ()) -> List[str]:
     """사용자에게 그대로 보여줄 실행 가정 문장들."""
     notes = [
         "일봉 데이터만 사용했습니다. 하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.",
@@ -848,6 +1251,8 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
             "이 규칙에 막혀 다음 거래일로 넘어갔습니다. "
             "same_day_exit=always 로 두면 이 {0:,}건이 그대로 수익에 잡힙니다.".format(blocked)
         )
+    for ig in ignored_filters:
+        notes.append(ig["message"])
     notes.append("미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).")
     return [n for n in notes if n]
 
@@ -872,8 +1277,12 @@ def _new_watch(code: str, ref_date: dt.date, ref_li: int, ref_gi: int, refbar: d
         "cost": 0.0,
         "planned": None,
         "entry_date": None,
+        "entry_li": None,
+        "entry_bar": {},
         "last_entry_date": None,
         "peak": None,
+        "group_id": None,
+        "exits_done": set(),
     }
 
 
@@ -903,29 +1312,40 @@ def _last_index_upto(rec: dict, day: dt.date) -> Optional[int]:
     return int(pos) if pos >= 0 else None
 
 
-def _ctx(rec: dict, w: dict, bar: Optional[dict] = None, day: Optional[dt.date] = None) -> EvalContext:
+def _ctx(rec: dict, w: dict, bar: Optional[dict] = None, day: Optional[dt.date] = None,
+         li: Optional[int] = None, aliases: Optional[Mapping] = None) -> EvalContext:
     """종목별로 하나의 EvalContext 를 재사용한다 (봉/지표 캐시 유지)."""
     ctx = rec["ctx"]
     if ctx is None:
-        ctx = EvalContext(rec["df"], indicator_cache=rec["ind"])
+        ctx = EvalContext(rec["df"], indicator_cache=rec["ind"], aliases=aliases)
         rec["ctx"] = ctx
     ctx.ref = w["ref"]
     ctx.fills = w["fills"]
-    ctx.position = _position(w, bar, day)
+    ctx.entry = w["entry_bar"]
+    ctx.position = _position(w, bar, day, li)
     return ctx
 
 
-def _position(w: dict, bar: Optional[dict], day: Optional[dt.date]) -> dict:
+def _position(w: dict, bar: Optional[dict], day: Optional[dt.date],
+              li: Optional[int] = None) -> dict:
     if w["qty"] <= 0:
         return {}
     avg = w["cost"] / w["qty"]
+    # position.hold_days 는 **영업일(봉) 수** 다 (ARCHITECTURE-v2 3-2).
+    # 결과 페이로드의 trades[].hold_days(달력일)와는 다른 값이다.
+    if li is not None and w["entry_li"] is not None:
+        hold = max(int(li) - int(w["entry_li"]), 0)
+    elif day and w["entry_date"]:
+        hold = (day - w["entry_date"]).days
+    else:
+        hold = 0
     pos = {
         "avg_price": avg,
         "qty": w["qty"],
         "cost": w["cost"],
         "entry_price": next(iter(w["fills"].values()))["price"] if w["fills"] else avg,
         "peak_price": w["peak"] if w["peak"] is not None else avg,
-        "hold_days": (day - w["entry_date"]).days if (day and w["entry_date"]) else 0,
+        "hold_days": hold,
     }
     if bar is not None:
         pos["pnl_pct"] = (bar["close"] / avg - 1.0) * 100.0
@@ -1001,8 +1421,9 @@ def _exit_hit(rule: Mapping, ctx: EvalContext, li: int, bar: dict, w: dict,
                 return True, min(max(target, bar["low"]), bar["high"]) if bar["open"] > target else bar["open"]
             return False, None
         if t == "time_exit":
-            hold = (day - w["entry_date"]).days if w["entry_date"] else 0
-            if hold >= int(rule.get("max_hold_days") or 0):
+            hold = int(ctx.position.get("hold_days") or 0)
+            limit = rule.get("max_hold_days", rule.get("hold_days"))
+            if limit is not None and hold >= int(limit):
                 return True, bar["close"]
             return False, None
         return False, None
@@ -1033,6 +1454,7 @@ def _close(w: dict, rec: dict, code: str, rule: Mapping, price: float, qty: int,
 
     trade = {
         "no": no,
+        "group_id": w.get("group_id") or f"{code}-{w['ref_date'].isoformat()}",
         "code": code,
         "name": rec["name"],
         "ref_date": w["ref_date"].isoformat(),

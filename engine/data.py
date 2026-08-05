@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
@@ -105,39 +105,94 @@ class MarcapStore:
         return files
 
     # ---------------------------------------------------------------- 연도 로드
-    def load_year(self, year: int, columns: Sequence[str] | None = None) -> pd.DataFrame:
-        """한 해치 parquet 를 읽어 정규화된 DataFrame 으로 돌려준다 (Date 는 컬럼)."""
+    #: parquet 를 나눠 읽는 단위 (행). 취소 확인 간격을 짧게 유지하기 위한 값.
+    CHUNK_ROWS = 250_000
+
+    def load_year(self, year: int, columns: Sequence[str] | None = None,
+                  on_chunk: Optional[Callable[[float], None]] = None) -> pd.DataFrame:
+        """한 해치 parquet 를 읽어 정규화된 DataFrame 으로 돌려준다 (Date 는 컬럼).
+
+        ``on_chunk(fraction)`` 을 주면 파일을 **행 묶음 단위로 나눠 읽으면서** 매번 호출한다.
+        ``fraction`` 은 0.0~1.0 의 진척도. 콜백이 예외를 던지면 그대로 전파된다
+        (백테스트 취소가 연도 하나를 다 읽을 때까지 기다리지 않도록 하기 위한 훅).
+        """
         files = self._require()
         path = files.get(int(year))
         if path is None:
             raise DataUnavailable(f"{year}년 marcap 파일이 없습니다: {self.data_dir}")
         cached = self._years.get(int(year))
         if cached is not None:
+            if on_chunk is not None:
+                on_chunk(1.0)
             return cached
         try:
-            df = pd.read_parquet(path)
-        except Exception as e:  # pragma: no cover - 손상 파일
+            df = self._read_parquet(path, on_chunk)
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            if on_chunk is not None and not isinstance(e, (OSError, ValueError)):
+                raise           # 콜백이 던진 취소 예외는 그대로 올린다
             raise DataUnavailable(f"{path} 를 읽을 수 없습니다: {e}") from e
-        df = self._normalize(df)
+        df = self._normalize(df, on_chunk)
         self._years[int(year)] = df
         return df
 
+    def _read_parquet(self, path: Path,
+                      on_chunk: Optional[Callable[[float], None]]) -> pd.DataFrame:
+        """행 묶음 단위로 나눠 읽는다 (취소 확인 지점을 파일 내부에도 만들기 위해)."""
+        if on_chunk is None:
+            return pd.read_parquet(path)
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:  # pragma: no cover
+            on_chunk(0.0)
+            out = pd.read_parquet(path)
+            on_chunk(0.9)
+            return out
+
+        pf = pq.ParquetFile(path)
+        total = max(int(pf.metadata.num_rows), 1)
+        batches = []
+        done = 0
+        on_chunk(0.0)
+        for batch in pf.iter_batches(batch_size=self.CHUNK_ROWS):
+            batches.append(batch)
+            done += batch.num_rows
+            on_chunk(min(0.9 * done / total, 0.9))
+        if not batches:
+            return pd.read_parquet(path)
+        return pa.Table.from_batches(batches).to_pandas()
+
     @staticmethod
-    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    def _normalize(df: pd.DataFrame,
+                   on_chunk: Optional[Callable[[float], None]] = None) -> pd.DataFrame:
+        def beat(f: float) -> None:
+            if on_chunk is not None:
+                on_chunk(min(0.9 + 0.1 * f, 1.0))
+
         if "Date" not in df.columns:
             df = df.reset_index()
         if "Date" not in df.columns:
             raise DataUnavailable("marcap 파일에 Date 컬럼이 없습니다")
         df["Date"] = pd.to_datetime(df["Date"])
+        beat(0.2)
         if "Code" in df.columns:
             df["Code"] = df["Code"].astype(str).str.zfill(6)
+        beat(0.4)
         for c in NUMERIC_COLUMNS:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+        beat(0.6)
         for c in ("Name", "Market", "MarketId", "Dept"):
             if c in df.columns:
                 df[c] = df[c].astype(str).fillna("")
-        return df.sort_values(["Date", "Code"], kind="stable").reset_index(drop=True)
+        beat(0.8)
+        # 이미 Date 오름차순이면 정렬을 건너뛴다 (7백만 행 정렬은 몇 초가 걸리고 중단할 수 없다)
+        if not df["Date"].is_monotonic_increasing:
+            df = df.sort_values(["Date", "Code"], kind="stable")
+        beat(1.0)
+        return df.reset_index(drop=True)
 
     def unload(self) -> None:
         """메모리 캐시 비우기."""
@@ -257,8 +312,15 @@ class MarcapStore:
         end,
         columns: Sequence[str] | None = None,
         use_cache: bool = True,
+        on_year: Optional[Callable[[float, int, int], None]] = None,
     ) -> pd.DataFrame:
-        """전 종목 구간 데이터. MultiIndex 없이 ``Date`` / ``Code`` 컬럼을 갖는다."""
+        """전 종목 구간 데이터. MultiIndex 없이 ``Date`` / ``Code`` 컬럼을 갖는다.
+
+        ``on_year(idx, total, year)`` 를 주면 진행 상황을 알린다. ``idx`` 는 **소수**로,
+        연도 파일을 읽는 도중에도 (행 묶음 단위로) 여러 번 호출된다.
+        진행률 보고와 취소 확인에 쓴다 — 콜백이 예외를 던지면 그대로 전파되므로
+        parquet 한 개를 다 읽을 때까지 기다리지 않고 즉시 중단할 수 있다.
+        """
         self._require()
         s = _to_date(start)
         e = _to_date(end)
@@ -279,8 +341,17 @@ class MarcapStore:
             cols = list(dict.fromkeys(["Date", "Code", *columns]))
 
         frames = []
-        for y in self._range_years(s, e):
-            df = self.load_year(y)
+        years = self._range_years(s, e)
+        for i, y in enumerate(years):
+            if on_year is not None:
+                on_year(i, len(years), y)
+            sub_cb = None
+            if on_year is not None:
+                def sub_cb(frac, _i=i, _n=len(years), _y=y):   # noqa: F811
+                    on_year(_i + frac, _n, _y)
+            df = self.load_year(y, on_chunk=sub_cb)
+            if on_year is not None:
+                on_year(i + 1.0, len(years), y)
             if cols is not None:
                 keep = [c for c in cols if c in df.columns]
                 df = df[keep]
@@ -289,6 +360,8 @@ class MarcapStore:
                 frames.append(df.loc[m])
         if not frames:
             raise DataUnavailable(f"{s} ~ {e} 구간에 데이터가 없습니다")
+        if on_year is not None:
+            on_year(len(years), len(years), years[-1] if years else 0)
         out = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0].reset_index(drop=True)
 
         if use_cache and columns is None:

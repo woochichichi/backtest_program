@@ -331,7 +331,13 @@ export function mockStatus() {
     row_count: 11043912,
     auto_sync: { registered: true, time: '18:30', task: 'KRXBacktesterDataSync' },
     // 프런트 기능 토글. 폴백 경로에는 API 키가 없으므로 ai_available 만 false.
-    features: { backtest_progress_sse: true, ai_available: false, symbol_search: true },
+    features: {
+      backtest_progress_sse: true,
+      ai_available: false,
+      symbol_search: true,
+      sync_status: true,
+      backtest_cancel: true,
+    },
   };
 }
 
@@ -435,11 +441,11 @@ export function mockStrategies() {
     },
     {
       id: 'strategy3',
-      name: '전략3 — RSI 과매도 반등 (비활성)',
+      name: '전략3 — 중단기 스윙 주도주 눌림목',
       description:
-        'RSI(14)가 30 아래로 내려간 뒤 다시 30을 상향 돌파하면 진입하고, RSI 65 도달 또는 -7% 손절로 청산한다.',
-      enabled: false,
-      updated_at: '2026-06-11',
+        '시가총액 2,000억 이상 종목 중 거래대금 1,000억 초과 · 거래량 20일 평균 5배 · 종가 +15% 이상 급등하며 52주 신고가를 낸 날을 기준일로 삼는다. 이후 15거래일 안에 거래대금이 기준일의 1/3 이하로 줄고 20일선까지 눌린 날 종가에 전량 매수한다. 평단 +7%에서 절반을 익절하고 잔량은 5일선 이탈 시 정리하며, 20일선이나 진입일 저가를 깨면 전량 손절한다.',
+      enabled: true,
+      updated_at: '2026-07-25',
     },
   ];
 }
@@ -449,7 +455,348 @@ export function mockStrategies() {
  * "strategy1" 은 strategies/strategy1.json 과 동일한 객체를 인라인 리터럴로 돌려준다.
  * 그 외 id는 SCHEMA.md 구조를 지키는 골든크로스 + ATR 추적손절 전략을 돌려준다.
  */
+
+/* ────────────── params 선언 (ARCHITECTURE-v2 §1) ──────────────
+   UI 전용 메타데이터. 엔진은 읽지 않고 path 가 가리키는 실제 값만 본다.
+   default 는 "기본값으로 되돌리기" 가 되돌릴 값이며 저장해도 변하지 않는다. */
+
+/** 전략1의 조절 가능한 파라미터 */
+function PARAMS_S1() {
+  return [
+    { key: 'spike_amount_krw_eok', label: '기준일 거래대금', group: '1. 종목 선정',
+      path: 'universe.reference_day.spike_amount_krw_eok', type: 'number', unit: '억',
+      default: 1000, min: 1, max: 100000, step: 10,
+      help: '하루 거래대금이 이 금액을 넘은 날을 "기준일"로 봅니다. 낮출수록 후보 종목이 많아집니다.' },
+    { key: 'lookback_days', label: '탐색 기간', group: '1. 종목 선정',
+      path: 'universe.reference_day.lookback_days', type: 'int', unit: '일',
+      default: 20, min: 1, max: 250, step: 1,
+      help: '최근 며칠 안에서 기준일을 찾을지 정합니다.' },
+    { key: 'prev_day_amount_max_eok', label: '전일 거래대금 상한', group: '1. 종목 선정',
+      path: 'universe.reference_day.prev_day_amount_max_eok', type: 'number', unit: '억',
+      default: 200, min: 0, max: 100000, step: 10,
+      help: '기준일 바로 전날은 이 금액보다 조용했어야 합니다. 갑자기 터진 종목만 고르기 위한 조건입니다.' },
+    { key: 'valid_days_after_reference', label: '유효 기간', group: '1. 종목 선정',
+      path: 'universe.valid_days_after_reference', type: 'int', unit: '일',
+      default: 60, min: 1, max: 500, step: 1,
+      help: '기준일 이후 이 기간 안에 매수 조건이 안 나오면 후보에서 제외합니다.' },
+
+    { key: 'b1_size_pct', label: '1차 매수 비중', group: '2. 진입 (분할 매수)',
+      path: 'entries[0].size_pct', type: 'percent', unit: '%',
+      default: 50, min: 0, max: 100, step: 5,
+      help: '기준일 시가에 닿았을 때 종목당 배정 자본의 몇 %를 살지 정합니다.' },
+    { key: 'b2_trigger_pct', label: '2차 트리거', group: '2. 진입 (분할 매수)',
+      path: 'entries[1].trigger_pct', type: 'percent', unit: '%',
+      default: -10, min: -90, max: 0, step: 1,
+      help: '1차 매수가보다 이만큼 더 떨어지면 추가로 삽니다. 하락률이라 음수로 적습니다.' },
+    { key: 'b2_size_pct', label: '2차 매수 비중', group: '2. 진입 (분할 매수)',
+      path: 'entries[1].size_pct', type: 'percent', unit: '%',
+      default: 50, min: 0, max: 100, step: 5,
+      help: '추가 매수에 쓸 비중입니다. 1차와 합쳐 100%가 되도록 맞추는 것이 보통입니다.' },
+
+    { key: 'tp_target_pct', label: '익절', group: '3. 청산',
+      path: 'exits[0].target_pct', type: 'percent', unit: '%',
+      default: 10, min: 0.1, max: 500, step: 1,
+      help: '평균 매수가보다 이만큼 오르면 전량 팝니다.' },
+    { key: 'sl_ma_period', label: '손절 이동평균', group: '3. 청산',
+      path: 'exits[1].ma_period', type: 'int', unit: '일선',
+      default: 45, min: 2, max: 240, step: 1,
+      help: '주가가 이 이동평균선까지 내려오면 전량 팝니다. 숫자가 작을수록 빨리 손절합니다.' },
+
+    { key: 'initial_capital_manwon', label: '초기 자본', group: '4. 실행 · 비용',
+      path: 'portfolio.initial_capital_manwon', type: 'number', unit: '만원',
+      default: 10000, min: 1, max: 100000000, step: 100,
+      help: '백테스트를 시작할 때의 총 자본입니다.' },
+    { key: 'max_positions', label: '최대 동시 보유', group: '4. 실행 · 비용',
+      path: 'portfolio.max_positions', type: 'int', unit: '종목',
+      default: 10, min: 1, max: 200, step: 1,
+      help: '동시에 몇 종목까지 들고 갈지 정합니다. 자본은 이 수만큼 나눠 배정합니다.' },
+    { key: 'slippage_pct', label: '슬리피지', group: '4. 실행 · 비용',
+      path: 'execution.slippage_pct', type: 'percent', unit: '%',
+      default: 0.1, min: 0, max: 10, step: 0.05,
+      help: '주문 가격과 실제 체결 가격의 차이입니다. 살 때는 불리하게 더 비싸게, 팔 때는 더 싸게 계산합니다.' },
+    { key: 'fee_pct', label: '수수료+세금', group: '4. 실행 · 비용',
+      path: 'execution.fee_pct', type: 'percent', unit: '%',
+      default: 0.23, min: 0, max: 5, step: 0.01,
+      help: '증권사 수수료와 거래세를 합한 값입니다. 팔 때 한 번에 차감합니다.' },
+  ];
+}
+
+/** 전략3의 조절 가능한 파라미터. 재무 3종은 데이터가 없어 available:false. */
+function PARAMS_S3() {
+  const NO_FIN = 'marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다.';
+  return [
+    { key: 'market_cap_min_eok', label: '최소 시가총액', group: '1. 종목 선정',
+      path: 'universe.filters.market_cap_min_eok', type: 'number', unit: '억',
+      default: 2000, min: 0, max: 100000000, step: 100, available: true,
+      help: '이 금액 이상인 종목만 대상으로 합니다. 너무 작은 종목을 걸러 냅니다.' },
+    { key: 'debt_ratio_max_pct', label: '부채비율 상한', group: '1. 종목 선정',
+      path: 'universe.filters.debt_ratio_max_pct', type: 'number', unit: '%',
+      default: 200, min: 0, max: 10000, step: 10,
+      available: false, unavailable_reason: NO_FIN,
+      help: '부채비율이 이 값보다 낮은 종목만 고릅니다.' },
+    { key: 'current_ratio_min_pct', label: '유동비율 하한', group: '1. 종목 선정',
+      path: 'universe.filters.current_ratio_min_pct', type: 'number', unit: '%',
+      default: 100, min: 0, max: 10000, step: 10,
+      available: false, unavailable_reason: NO_FIN,
+      help: '유동비율이 이 값보다 높은 종목만 고릅니다.' },
+    { key: 'operating_profit_positive_quarters', label: '영업이익 연속 흑자', group: '1. 종목 선정',
+      path: 'universe.filters.operating_profit_positive_quarters', type: 'int', unit: '분기',
+      default: 4, min: 0, max: 40, step: 1,
+      available: false, unavailable_reason: NO_FIN,
+      help: '최근 몇 분기 연속으로 영업이익이 흑자였는지 봅니다.' },
+
+    { key: 'spike_amount_krw_eok', label: '거래대금 초과', group: '2. 기준일 조건',
+      path: 'universe.reference_day.spike_amount_krw_eok', type: 'number', unit: '억',
+      default: 1000, min: 1, max: 100000, step: 10, available: true,
+      help: '기준일의 하루 거래대금이 이 금액을 넘어야 합니다.' },
+    { key: 'volume_mult', label: '거래량 배수', group: '2. 기준일 조건',
+      path: 'universe.reference_day.volume_mult', type: 'number', unit: '배',
+      default: 5, min: 1, max: 100, step: 0.5, available: true,
+      help: '거래량이 직전 20일 평균의 몇 배 이상이어야 하는지 정합니다.' },
+    { key: 'close_change_min_pct', label: '종가 상승률 이상', group: '2. 기준일 조건',
+      path: 'universe.reference_day.close_change_min_pct', type: 'percent', unit: '%',
+      default: 15, min: 0, max: 30, step: 1, available: true,
+      help: '기준일 종가가 전일 대비 이만큼 이상 올라야 합니다.' },
+    { key: 'gap_open_max_pct', label: '시가 갭상승 미만', group: '2. 기준일 조건',
+      path: 'universe.reference_day.gap_open_max_pct', type: 'percent', unit: '%',
+      default: 5, min: 0, max: 30, step: 1, available: true,
+      help: '시초가부터 너무 많이 뜬 날은 제외합니다. 갭이 이 값보다 작아야 합니다.' },
+    { key: 'require_52w_high', label: '52주 신고가 요구', group: '2. 기준일 조건',
+      path: 'universe.reference_day.require_52w_high', type: 'bool',
+      default: true, available: true,
+      help: '기준일 종가가 최근 252거래일 중 가장 높아야 합니다.' },
+    { key: 'require_prev_above_ma20', label: '전일 종가 > 20일선', group: '2. 기준일 조건',
+      path: 'universe.reference_day.require_prev_above_ma20', type: 'bool',
+      default: true, available: true,
+      help: '급등 직전에도 이미 20일선 위에 있던 종목만 고릅니다.' },
+    { key: 'lookback_days', label: '탐색 기간', group: '2. 기준일 조건',
+      path: 'universe.reference_day.lookback_days', type: 'int', unit: '일',
+      default: 20, min: 1, max: 250, step: 1, available: true,
+      help: '최근 며칠 안에서 기준일을 찾을지 정합니다.' },
+
+    { key: 'pullback_amount_divisor', label: '거래대금 감소 배수', group: '3. 눌림목',
+      path: 'universe.pullback_amount_divisor', type: 'number', unit: '분의 1',
+      default: 3, min: 1, max: 50, step: 1, available: true,
+      help: '눌림목으로 인정하려면 하루 거래대금이 기준일의 이 배수분의 1 이하로 줄어야 합니다.' },
+    { key: 'valid_days_after_reference', label: '유효 기간', group: '3. 눌림목',
+      path: 'universe.valid_days_after_reference', type: 'int', unit: '일',
+      default: 15, min: 1, max: 500, step: 1, available: true,
+      help: '기준일 이후 이 기간 안에 진입 조건이 안 나오면 후보에서 제외합니다.' },
+
+    { key: 'entry_ma_period', label: '진입 기준 이동평균', group: '4. 진입',
+      path: 'entries[0].ma_period', type: 'int', unit: '일선',
+      default: 20, min: 2, max: 240, step: 1, available: true,
+      help: '이 이동평균선까지 눌렸다가 그 위에서 종가가 마감하면 삽니다.' },
+    { key: 'entry_size_pct', label: '매수 비중', group: '4. 진입',
+      path: 'entries[0].size_pct', type: 'percent', unit: '%',
+      default: 100, min: 0, max: 100, step: 5, available: true,
+      help: '종목당 배정 자본의 몇 %를 한 번에 살지 정합니다.' },
+
+    { key: 'sl_ma_period', label: '손절 이동평균', group: '5. 청산',
+      path: 'exits[0].ma_period', type: 'int', unit: '일선',
+      default: 20, min: 2, max: 240, step: 1, available: true,
+      help: '종가가 이 이동평균선 아래로 내려가면 전량 손절합니다.' },
+    { key: 'tp1_target_pct', label: '1차 익절', group: '5. 청산',
+      path: 'exits[1].target_pct', type: 'percent', unit: '%',
+      default: 7, min: 0.1, max: 500, step: 0.5, available: true,
+      help: '평균 매수가보다 이만큼 오르면 절반을 팝니다.' },
+    { key: 'tp1_size_pct', label: '1차 익절 비중', group: '5. 청산',
+      path: 'exits[1].size_pct', type: 'percent', unit: '%',
+      default: 50, min: 0, max: 100, step: 5, available: true,
+      help: '1차 익절에서 파는 비중입니다. 나머지는 계속 들고 갑니다.' },
+    { key: 'tp2_ma_period', label: '잔량 청산 이동평균', group: '5. 청산',
+      path: 'exits[2].ma_period', type: 'int', unit: '일선',
+      default: 5, min: 2, max: 240, step: 1, available: true,
+      help: '남은 물량은 종가가 이 이동평균선을 깨면 전부 팝니다.' },
+    { key: 'time_hold_days', label: '시간 청산 보유일', group: '5. 청산',
+      path: 'exits[3].hold_days', type: 'int', unit: '일',
+      default: 7, min: 1, max: 250, step: 1, available: true,
+      help: '이 기간을 넘겼는데도 수익이 시원치 않으면 정리합니다.' },
+    { key: 'time_min_profit_pct', label: '시간 청산 수익 기준', group: '5. 청산',
+      path: 'exits[3].min_profit_pct', type: 'percent', unit: '%',
+      default: 3, min: -50, max: 100, step: 0.5, available: true,
+      help: '보유일이 지난 시점에 수익률이 이 값보다 낮으면 청산합니다.' },
+
+    { key: 'initial_capital_manwon', label: '초기 자본', group: '6. 실행 · 비용',
+      path: 'portfolio.initial_capital_manwon', type: 'number', unit: '만원',
+      default: 10000, min: 1, max: 100000000, step: 100, available: true,
+      help: '백테스트를 시작할 때의 총 자본입니다.' },
+    { key: 'max_positions', label: '최대 동시 보유', group: '6. 실행 · 비용',
+      path: 'portfolio.max_positions', type: 'int', unit: '종목',
+      default: 10, min: 1, max: 200, step: 1, available: true,
+      help: '동시에 몇 종목까지 들고 갈지 정합니다.' },
+    { key: 'slippage_pct', label: '슬리피지', group: '6. 실행 · 비용',
+      path: 'execution.slippage_pct', type: 'percent', unit: '%',
+      default: 0.1, min: 0, max: 10, step: 0.05, available: true,
+      help: '주문 가격과 실제 체결 가격의 차이입니다.' },
+    { key: 'fee_pct', label: '수수료+세금', group: '6. 실행 · 비용',
+      path: 'execution.fee_pct', type: 'percent', unit: '%',
+      default: 0.23, min: 0, max: 5, step: 0.01, available: true,
+      help: '증권사 수수료와 거래세를 합한 값입니다. 팔 때 한 번에 차감합니다.' },
+    { key: 'period_start', label: '백테스트 시작일', group: '6. 실행 · 비용',
+      path: 'period.start', type: 'date',
+      default: '2015-01-02', available: true,
+      help: '이 날짜부터 계산합니다. 10년 이상 구간은 계산에 수 분이 걸릴 수 있습니다.' },
+  ];
+}
+
+const MA20 = { indicator: 'SMA', period: 20, source: 'close' };
+
+/** 전략3 — 중단기 스윙 주도주 눌림목 (ARCHITECTURE-v2 §4) */
+function STRATEGY3() {
+  return {
+    schema: 'krx-backtest-strategy/v1',
+    id: 'strategy3',
+    name: '전략3 — 중단기 스윙 주도주 눌림목',
+    description:
+      '시가총액 2,000억 이상 종목 중 거래대금 1,000억 초과 · 거래량 20일 평균 5배 이상 · 종가 전일 대비 +15% 이상 상승하면서 시가 갭은 +5% 미만이고 52주 신고가를 낸 날을 기준일로 삼는다. 기준일 이후 15거래일 안에 하루 거래대금이 기준일의 1/3 이하로 줄고, 저가가 20일선까지 눌렸다가 종가가 20일선 위에서 마감하며 MACD가 0보다 크면 종가에 전량 매수한다. 평단 +7%에서 절반을 익절하고 잔량은 5일선 이탈 시 정리하며, 종가가 진입일 저가나 20일선을 깨면 전량 손절한다. 보유 7일이 지나도 수익률이 +3% 미만이면 시간 청산한다.',
+    author: 'user (PDF)',
+    created_at: '2026-07-25',
+    enabled: true,
+
+    market: { country: 'KR', asset: 'stock', bar: '1d', trade_resolution: '1d' },
+
+    universe: {
+      markets: ['KOSPI', 'KOSDAQ'],
+      exclude: ['ETF', 'ETN', 'SPAC', 'PREFERRED', 'ADMIN_ISSUE', 'TRADE_HALT'],
+      filters: {
+        market_cap_min_eok: 2000,
+        debt_ratio_max_pct: 200,
+        current_ratio_min_pct: 100,
+        operating_profit_positive_quarters: 4,
+      },
+      reference_day: {
+        rule: 'custom',
+        lookback_days: 20,
+        spike_amount_krw_eok: 1000,
+        volume_mult: 5,
+        close_change_min_pct: 15,
+        gap_open_max_pct: 5,
+        require_52w_high: true,
+        require_prev_above_ma20: true,
+        when: {
+          op: 'and',
+          conditions: [
+            { op: '>=', left: 'amount', right: { expr: 'spike_amount_krw_eok * 100000000' } },
+            { op: '>=', left: 'volume', right: { expr: 'sma(volume, 20)[-1] * volume_mult' } },
+            { op: '>=', left: { expr: '(close / prev.close - 1) * 100' }, right: { expr: 'close_change_min_pct' } },
+            { op: '<', left: { expr: '(open / prev.close - 1) * 100' }, right: { expr: 'gap_open_max_pct' } },
+            { op: '>=', left: 'close', right: { indicator: 'HIGHEST', period: 252, source: 'close' } },
+            { op: '>', left: 'prev.close', right: MA20 },
+          ],
+        },
+      },
+      condition: 'pullback_amount_ratio',
+      pullback_amount_divisor: 3,
+      valid_days_after_reference: 15,
+    },
+
+    entries: [
+      {
+        id: 'B1',
+        label: '눌림목 진입 (20일선 지지 + MACD 양전)',
+        ma_period: 20,
+        when: {
+          op: 'and',
+          conditions: [
+            { op: '<=', left: 'low', right: MA20 },
+            { op: '>', left: 'close', right: MA20 },
+            { op: '>', left: { indicator: 'MACD', fast: 12, slow: 26, signal: 9, field: 'macd' }, right: 0 },
+          ],
+        },
+        price: 'close',
+        size_pct: 100,
+        size_of: 'planned_position',
+      },
+    ],
+
+    exits: [
+      {
+        id: 'SL',
+        label: '손절 (진입일 저가 또는 20일선 이탈)',
+        type: 'stop_loss',
+        ma_period: 20,
+        when: {
+          op: 'or',
+          conditions: [
+            { op: '<', left: 'close', right: 'entry.low' },
+            { op: '<', left: 'close', right: MA20 },
+          ],
+        },
+        price: 'close',
+        size_pct: 100,
+      },
+      {
+        id: 'TP1',
+        label: '1차 익절 (평단 +7% · 절반)',
+        type: 'take_profit',
+        target_pct: 7,
+        when: { op: '>=', left: 'high', right: { expr: 'position.avg_price * (1 + target_pct / 100)' } },
+        price: { expr: 'position.avg_price * (1 + target_pct / 100)' },
+        size_pct: 50,
+        size_of: 'position',
+      },
+      {
+        id: 'TP2',
+        label: '잔량 청산 (5일선 이탈)',
+        type: 'take_profit',
+        ma_period: 5,
+        when: { op: '<', left: 'close', right: { indicator: 'SMA', period: 5, source: 'close' } },
+        price: 'close',
+        size_pct: 100,
+        size_of: 'position',
+      },
+      {
+        id: 'TIME',
+        label: '시간 청산 (보유 7일 · 수익 부진)',
+        type: 'time_exit',
+        hold_days: 7,
+        min_profit_pct: 3,
+        when: {
+          op: 'and',
+          conditions: [
+            { op: '>=', left: 'position.hold_days', right: { expr: 'hold_days' } },
+            { op: '<', left: 'position.pnl_pct', right: { expr: 'min_profit_pct' } },
+          ],
+        },
+        price: 'close',
+        size_pct: 100,
+      },
+    ],
+
+    exit_priority: ['SL', 'TIME', 'TP1', 'TP2'],
+
+    indicators: [
+      { key: 'MA20', type: 'SMA', period: 20, source: 'close', plot: true },
+      { key: 'MA5', type: 'SMA', period: 5, source: 'close', plot: true },
+      { key: 'MACD', type: 'MACD', fast: 12, slow: 26, signal: 9, plot: true },
+    ],
+
+    portfolio: {
+      initial_capital_manwon: 10000,
+      max_positions: 10,
+      position_sizing: 'equal_weight',
+      allow_duplicate_symbol: false,
+    },
+
+    execution: {
+      resolution: '1d',
+      fill_model: 'close',
+      slippage_pct: 0.1,
+      fee_pct: 0.23,
+      same_day_exit: 'loss_only',
+    },
+
+    // 10년이 넘는 구간 — 실행 전 "오래 걸릴 수 있음" 안내가 실제로 뜬다
+    period: { start: '2015-01-02', end: 'auto' },
+
+    params: PARAMS_S3(),
+  };
+}
+
 export function mockStrategy(id) {
+  if (id === 'strategy3') return STRATEGY3();
+
   if (id === undefined || id === null || id === 'strategy1') {
     return {
       schema: 'krx-backtest-strategy/v1',
@@ -563,6 +910,8 @@ export function mockStrategy(id) {
         start: '2025-01-02',
         end: 'auto',
       },
+
+      params: PARAMS_S1(),
     };
   }
 
@@ -1240,8 +1589,9 @@ export function mockBacktest(strategy) {
       (parseYmd(dates[exitIdx]).getTime() - parseYmd(dates[b1Idx]).getTime()) / 86400000
     );
 
-    trades.push({
-      no: k + 1,
+    // group_id: 같은 진입에서 나온 청산들을 묶는 값 (ARCHITECTURE-v2 §3-3)
+    const gid = 'g' + pad2(Math.floor((k + 1) / 100)) + pad2((k + 1) % 100);
+    const base = {
       code: stock[0],
       name: stock[1],
       ref_date: dates[refIdx],
@@ -1249,15 +1599,55 @@ export function mockBacktest(strategy) {
       ref_open: refOpen,
       fills: fills,
       avg_price: avgPrice,
-      exit_date: dates[exitIdx],
-      exit_price: exitPrice,
-      exit_rule: exitRule,
-      exit_reason: exitReason,
-      hold_days: holdDays,
-      return_pct: round((exitPrice / avgPrice - 1) * 100, 1),
-      pnl: Math.round((exitPrice - avgPrice) * qty),
-    });
+      group_id: gid,
+    };
+
+    // 5건에 1건꼴로 부분 청산(TP1 절반 → 잔량)을 만들어 같은 group_id 두 줄로 남긴다.
+    const partial = winFlags[k] && k % 5 === 2;
+    if (partial) {
+      const q1h = Math.max(1, Math.floor(qty / 2));
+      const q2h = Math.max(1, qty - q1h);
+      const tp1Price = Math.round(avgPrice * 1.07) || avgPrice + 1;
+      const tp1Idx = Math.min(len - 1, Math.max(lastBuy + 2, exitIdx - 4));
+      trades.push({
+        ...base,
+        exit_date: dates[tp1Idx],
+        exit_price: tp1Price,
+        exit_rule: 'TP1',
+        exit_reason: '평단 +7% 도달 · 50% 익절',
+        hold_days: Math.round(
+          (parseYmd(dates[tp1Idx]).getTime() - parseYmd(dates[b1Idx]).getTime()) / 86400000
+        ),
+        return_pct: round((tp1Price / avgPrice - 1) * 100, 1),
+        pnl: Math.round((tp1Price - avgPrice) * q1h),
+      });
+      const restPrice = exitPrice;
+      trades.push({
+        ...base,
+        exit_date: dates[exitIdx],
+        exit_price: restPrice,
+        exit_rule: exitRule === 'TP' ? 'TP2' : exitRule,
+        exit_reason: exitRule === 'TP' ? '5일선 이탈 · 잔량 청산' : exitReason,
+        hold_days: holdDays,
+        return_pct: round((restPrice / avgPrice - 1) * 100, 1),
+        pnl: Math.round((restPrice - avgPrice) * q2h),
+      });
+    } else {
+      trades.push({
+        ...base,
+        exit_date: dates[exitIdx],
+        exit_price: exitPrice,
+        exit_rule: exitRule,
+        exit_reason: exitReason,
+        hold_days: holdDays,
+        return_pct: round((exitPrice / avgPrice - 1) * 100, 1),
+        pnl: Math.round((exitPrice - avgPrice) * qty),
+      });
+    }
   }
+
+  // 분할 청산으로 줄 수가 늘었으므로 번호를 다시 매긴다.
+  for (let i = 0; i < trades.length; i++) trades[i].no = i + 1;
 
   // ── trades 배열에서 되계산하는 지표들
   let wins = 0;
@@ -1355,6 +1745,21 @@ export function mockBacktest(strategy) {
     ambiguous_bars: sameDayCount + 3,
   };
 
+  // universe.filters 중 marcap 만으로는 판정할 수 없는 항목을 조용히 버리지 않고 남긴다.
+  const IGNORABLE = {
+    debt_ratio_max_pct: '부채비율 조건은 재무 데이터가 없어 적용하지 않았습니다. 실제보다 종목이 많이 잡힙니다.',
+    current_ratio_min_pct: '유동비율 조건은 재무 데이터가 없어 적용하지 않았습니다. 실제보다 종목이 많이 잡힙니다.',
+    operating_profit_positive_quarters:
+      '영업이익 연속 흑자 조건은 재무 데이터가 없어 적용하지 않았습니다. 실제보다 종목이 많이 잡힙니다.',
+  };
+  const ignoredFilters = [];
+  const uFilters = (strategy && strategy.universe && strategy.universe.filters) || {};
+  for (const key of Object.keys(IGNORABLE)) {
+    if (uFilters[key] !== undefined && uFilters[key] !== null) {
+      ignoredFilters.push({ key: key, reason: IGNORABLE[key] });
+    }
+  }
+
   const assumptions = {
     resolution: '1d',
     requested_resolution: requestedResolution,
@@ -1367,11 +1772,15 @@ export function mockBacktest(strategy) {
       requestedResolution, fillModel, sameDayExit, slippagePct, feePct, exitIds, assumptionStats
     ),
     stats: assumptionStats,
+    // 엔진이 지원하지 않아 실제로는 적용되지 않은 조건 (ARCHITECTURE-v2 §3-5)
+    ignored_filters: ignoredFilters,
   };
+  for (const f of ignoredFilters) assumptions.notes.push(`${f.key} 조건: ${f.reason}`);
 
   // 경고: 1분봉 근사 문구는 ARCHITECTURE 2장이 요구하므로 항상 남긴다.
   // same_day_exit=always 경고는 backtest.py 와 같은 조건에서만 덧붙인다.
   const warnings = [WARN_1M_APPROX];
+  for (const f of ignoredFilters) warnings.push(f.reason);
   if (sameDayExit === 'always') {
     warnings.push(
       'same_day_exit=always 는 진입 당일 익절을 허용합니다. ' +
@@ -1429,4 +1838,11 @@ export function mockAiStrategy(prompt) {
       '입력한 프롬프트는 그대로 보존되어 있으니 키 설정 후 다시 시도하세요.' +
       (prompt ? '\n\n입력한 프롬프트: ' + String(prompt) : ''),
   };
+}
+
+
+/* ────────────────────────────── POST /api/backtest/cancel/{job_id} ──────────────────────────────
+   ARCHITECTURE-v2 §2-2: 취소된 실행은 오류가 아니라 200 + cancelled:true 로 온다. */
+export function mockCancelResult() {
+  return { ok: false, cancelled: true, error: '사용자가 취소했습니다.' };
 }
