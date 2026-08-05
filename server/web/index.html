@@ -260,6 +260,9 @@
       </div>
     </aside>
 
+    <div class="resizer rz-col" id="rzLeft" role="separator" aria-orientation="vertical"
+         tabindex="0" aria-label="왼쪽 패널 너비 조절 (좌우 화살표로 조절, 더블클릭하면 기본값)"></div>
+
     <!-- ================= 중앙: 차트 ================= -->
     <main class="pane-c">
       <div class="tb">
@@ -321,6 +324,8 @@
       </div>
 
       <!-- ================= 하단 독 ================= -->
+      <div class="resizer rz-row" id="rzDock" role="separator" aria-orientation="horizontal"
+           tabindex="0" aria-label="아래 패널 높이 조절 (위아래 화살표로 조절, 더블클릭하면 기본값)"></div>
       <div class="dock">
         <div class="tabs" role="tablist" aria-label="하단 패널">
           <button class="tab" role="tab" id="tab-pnTrades" aria-selected="true" aria-controls="pnTrades" data-pane="pnTrades">거래 내역<span class="cnt" id="tradeCnt">0</span></button>
@@ -333,11 +338,21 @@
         <div class="tabpane on" id="pnTrades" role="tabpanel" aria-labelledby="tab-pnTrades" tabindex="0">
           <table>
             <thead><tr>
-              <th class="l">#</th><th class="l">종목</th><th class="l">기준일</th>
-              <th>기준일 거래대금</th><th class="l">매수1</th><th>매수1가</th>
-              <th class="l">매수2</th><th>매수2가</th><th>평단</th>
-              <th class="l">매도일</th><th>매도가</th><th class="l">사유</th>
-              <th>보유일</th><th>수익률</th><th>손익</th>
+              <th class="l" data-sort="no" title="클릭하면 정렬합니다. 분할 매도는 한 거래로 묶여 함께 이동합니다.">#</th>
+              <th class="l" data-sort="name">종목</th>
+              <th class="l" data-sort="ref_date">기준일</th>
+              <th data-sort="ref_amount_eok">기준일 거래대금</th>
+              <th class="l" data-sort="b1_date">매수1</th>
+              <th data-sort="b1_price">매수1가</th>
+              <th class="l" data-sort="b2_date">매수2</th>
+              <th data-sort="b2_price">매수2가</th>
+              <th data-sort="avg_price">평단</th>
+              <th class="l" data-sort="exit_date">매도일</th>
+              <th data-sort="exit_price">매도가</th>
+              <th class="l" data-sort="exit_rule">사유</th>
+              <th data-sort="hold_days">보유일</th>
+              <th data-sort="return_pct">수익률</th>
+              <th data-sort="pnl" title="분할 매도는 합계 기준으로 정렬합니다">손익</th>
             </tr></thead>
             <tbody id="tradeBody"></tbody>
           </table>
@@ -385,6 +400,9 @@
         </div>
       </div>
     </main>
+
+    <div class="resizer rz-col" id="rzRight" role="separator" aria-orientation="vertical"
+         tabindex="0" aria-label="오른쪽 패널 너비 조절 (좌우 화살표로 조절, 더블클릭하면 기본값)"></div>
 
     <!-- ================= 우측: 성과 ================= -->
     <aside class="pane-r">

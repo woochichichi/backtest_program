@@ -1642,3 +1642,194 @@ def test_예전_parquet에_컬럼이_없어도_모름으로_읽힌다(tmp_path):
     store = DartStore(root=root)
     assert store.as_of("100001", "2025-06-01")["capital_impaired"] is None
     assert pd.isna(store.as_of_panel(None, "2025-06-01")["capital_impaired"].iloc[0])
+
+
+# ======================================================================================
+# 20. as-of 색인 — 빨라졌어도 결과는 한 글자도 달라지면 안 된다
+# ======================================================================================
+
+
+def _reference_as_of(store, code, date):
+    """색인을 쓰지 않는 느린 참조 구현 (색인 도입 전과 같은 로직)."""
+    sub = store._disclosed(date)
+    sub = sub[sub["code"] == str(code).zfill(6)]
+    if sub.empty:
+        return None
+    sub = sub.sort_values(["year", "quarter", "disclosed_at"], kind="stable")
+    return store._row_to_dict(sub.iloc[-1])
+
+
+def _reference_panel(store, codes, date):
+    sub = store._disclosed(date)
+    if codes is not None:
+        wanted = {str(c).zfill(6) for c in codes}
+        sub = sub[sub["code"].isin(wanted)]
+    if sub.empty:
+        return store.load().iloc[0:0].set_index("code")
+    sub = sub.sort_values(
+        ["code", "year", "quarter", "disclosed_at"], kind="stable"
+    ).drop_duplicates(subset="code", keep="last")
+    return sub.set_index("code").sort_index()
+
+
+@pytest.fixture
+def wide_store(tmp_path) -> tuple:
+    """정정공시·결측 공시일·중간 결측이 섞인 데이터. ``(store, codes, dates)``."""
+    import random
+    rng = random.Random(20260805)
+    codes = ["005930", "000660"] + [f"{300000 + i:06d}" for i in range(40)]
+    rows = realistic_rows(codes, [2022, 2023, 2024, 2025],
+                          loss_codes=set(codes[5:20]), financial_codes=set(codes[30:34]))
+    # 정정공시: 가장 최근 분기(2025-4)를 나중 날짜로 한 벌 더 낸다
+    for c in codes[2:8]:
+        rows.append(row(c, 2025, 4, "2026-06-01", 999 * EOK, 부채총계=111 * EOK))
+    # 중간 분기의 정정공시 (as_of 가 고르는 분기 자체는 바뀌지 않는다)
+    for c in codes[2:8]:
+        rows.append(row(c, 2023, 4, "2024-07-01", 999 * EOK, 부채총계=222 * EOK))
+    # 공시일을 모르는 행 (rcept_no 파싱 실패 흉내)
+    for c in codes[8:12]:
+        rows.append(row(c, 2021, 4, None, 50 * EOK))
+    store = write_store(tmp_path / "dart", rows)
+
+    dates = [dt.date(2022, 1, 1) + dt.timedelta(days=37 * i) for i in range(45)]
+    rng.shuffle(dates)                       # 날짜가 뒤로 갔다 앞으로 오는 순서
+    return store, codes, dates
+
+
+def test_색인과_참조구현의_as_of가_완전히_같다(wide_store):
+    store, codes, dates = wide_store
+    for date in dates:
+        for code in codes:
+            assert store.as_of(code, date) == _reference_as_of(store, code, date), \
+                f"{code} @ {date} 에서 색인과 참조 구현이 다르다"
+
+
+def test_색인과_참조구현의_as_of_panel이_완전히_같다(wide_store):
+    store, codes, dates = wide_store
+    for date in dates[:15]:
+        got = store.as_of_panel(codes, date)
+        want = _reference_panel(store, codes, date)
+        pd.testing.assert_frame_equal(got, want, check_like=False)
+
+        got_all = store.as_of_panel(None, date)
+        want_all = _reference_panel(store, None, date)
+        pd.testing.assert_frame_equal(got_all, want_all, check_like=False)
+
+
+def test_날짜가_뒤로_갔다_앞으로_와도_같다(wide_store):
+    """캐시가 상태를 들고 있으면 여기서 깨진다."""
+    store, codes, _ = wide_store
+    probe = [dt.date(2025, 6, 1), dt.date(2022, 5, 1), dt.date(2024, 9, 1),
+             dt.date(2022, 5, 1), dt.date(2026, 1, 1), dt.date(2023, 1, 1),
+             dt.date(2025, 6, 1)]
+    first = {}
+    for d in probe:
+        for code in codes[:12]:
+            got = store.as_of(code, d)
+            key = (code, d)
+            if key in first:
+                assert got == first[key], f"{code} @ {d} 재조회 결과가 달라졌다"
+            else:
+                first[key] = got
+            assert got == _reference_as_of(store, code, d)
+
+
+def test_연속흑자도_색인_전후가_같다(wide_store):
+    store, codes, dates = wide_store
+
+    def reference(code, date, limit=8):
+        sub = store._disclosed(date)
+        sub = sub[sub["code"] == str(code).zfill(6)]
+        if sub.empty:
+            return None
+        sub = sub.sort_values(["year", "quarter", "disclosed_at"], kind="stable")
+        by = {}
+        for y, q, v in zip(sub["year"], sub["quarter"], sub["op_income_quarter"]):
+            yi, qi = int(y), int(q)
+            by[(yi, qi)] = None if pd.isna(v) else int(v)
+        if not by:
+            return None
+        cur = max(by)
+        if by.get(cur) is None:
+            return None
+        count = 0
+        while count < limit:
+            v = by.get(cur)
+            if v is None or v <= 0:
+                break
+            count += 1
+            y, q = cur
+            cur = (y - 1, 4) if q == 1 else (y, q - 1)
+        return count
+
+    for date in dates[:20]:
+        for code in codes:
+            assert store.consecutive_profit_quarters(code, date) == reference(code, date), \
+                f"{code} @ {date}"
+
+
+def test_공시일이_없는_행은_영원히_안_보인다(wide_store):
+    """disclosed_at 이 NaT 인 행은 어떤 조회일에도 나오면 안 된다."""
+    store, codes, _ = wide_store
+    for code in codes[8:12]:
+        for d in (dt.date(2020, 1, 1), dt.date(2026, 12, 31)):
+            got = store.as_of(code, d)
+            if got is not None:
+                assert got["disclosed_at"] is not None
+                assert (got["year"], got["quarter"]) != (2021, 4)
+
+
+def test_정정공시는_정정일_이후에만_보인다(wide_store):
+    """2025-4 를 2026-06-01 에 정정 공시했다. 그 전에는 원래 숫자가 보여야 한다."""
+    store, codes, _ = wide_store
+    c = codes[2]
+    before = store.as_of(c, "2026-05-31")
+    after = store.as_of(c, "2026-06-01")
+    assert (before["year"], before["quarter"]) == (2025, 4)
+    assert before["disclosed_at"] == "2026-03-11"
+    assert before["부채총계"] != 111 * EOK, "정정 전에 정정 후 숫자가 보이면 룩어헤드다"
+    assert (after["year"], after["quarter"]) == (2025, 4)
+    assert after["disclosed_at"] == "2026-06-01"
+    assert after["부채총계"] == 111 * EOK
+
+
+def test_데이터_시작보다_이른_날짜는_None(wide_store):
+    store, codes, _ = wide_store
+    assert store.as_of(codes[0], "1999-01-01") is None
+    assert store.as_of_panel(codes, "1999-01-01").empty
+    assert store.consecutive_profit_quarters(codes[0], "1999-01-01") is None
+
+
+def test_모르는_종목은_None(wide_store):
+    store, _codes, _ = wide_store
+    assert store.as_of("999999", "2025-06-01") is None
+    assert store.as_of_panel(["999999"], "2025-06-01").empty
+    assert store.consecutive_profit_quarters("999999", "2025-06-01") is None
+
+
+def test_종목집합_캐시는_상한을_지킨다(wide_store):
+    import engine.dart as ed
+    store, codes, _ = wide_store
+    for i in range(ed._CIDS_CACHE_MAX * 3):
+        store.as_of_panel(codes[: 5 + i], "2025-06-01")
+        assert len(store._cids_cache) <= ed._CIDS_CACHE_MAX
+
+
+def test_unload하면_색인과_캐시가_비워진다(wide_store):
+    store, codes, _ = wide_store
+    store.as_of_panel(codes, "2025-06-01")
+    assert store._asof is not None and store._cids_cache
+    store.unload()
+    assert store._asof is None and not store._cids_cache
+    # 다시 써도 정상 동작
+    assert not store.as_of_panel(codes, "2025-06-01").empty
+
+
+def test_종목집합_캐시가_결과를_섞지_않는다(wide_store):
+    """서로 다른 종목 집합으로 번갈아 불러도 각자 제 결과가 나와야 한다."""
+    store, codes, _ = wide_store
+    a, b = codes[:6], codes[6:14]
+    for _ in range(3):
+        pa, pb = store.as_of_panel(a, "2025-06-01"), store.as_of_panel(b, "2025-06-01")
+        assert set(pa.index) <= set(a) and set(pb.index) <= set(b)
+        assert set(pa.index).isdisjoint(set(b))

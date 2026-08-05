@@ -43,6 +43,7 @@ const S = {
   chartAbort: null,      // 진행 중인 차트 요청 (종목 전환 시 실제로 끊는다)
   histExhausted: false,  // 더 받을 과거가 없다
   lastChartArgs: null,   // 재시도용
+  sortKey: '', sortDir: 'asc',   // 거래 내역 정렬 (그룹은 깨지 않는다)
   abort: null,             // 실행 중인 백테스트의 AbortController
   jobId: null,             // 진행률 SSE / 취소용
   cancelling: false,
@@ -1486,13 +1487,30 @@ async function cancelBacktest() {
   }
 }
 
+/** 현재 정렬을 적용해 거래 내역을 다시 그린다 */
+function renderTradeTable() {
+  const res = S.result;
+  if (!res || !res.trades) { P.renderTrades([], gotoTrade, { ran: S.ran, hints: emptyHints() }); return; }
+  const rows = P.sortTrades(res.trades, S.sortKey, S.sortDir);
+  P.renderTrades(rows, gotoTrade, { ran: true, hints: emptyHints() });
+  P.markSortHeader(S.sortKey, S.sortDir);
+  if (S.tradeNo) P.selectTradeRow(S.tradeNo);
+}
+
+/** 머리글 클릭 — 같은 열을 다시 누르면 방향을 뒤집는다 */
+function onSortTrades(key) {
+  if (S.sortKey === key) S.sortDir = S.sortDir === 'asc' ? 'desc' : 'asc';
+  else { S.sortKey = key; S.sortDir = key === 'no' || key === 'name' ? 'asc' : 'desc'; }
+  renderTradeTable();
+}
+
 function applyResult(res) {
   P.renderAssumptions(res.assumptions, res.metrics, S.draft && S.draft.params);
   P.renderKpis(res.metrics);
   S.eq.set(res.equity || null);
   S.mo.set(res.monthly || null);
   P.renderByStock(res.by_stock, { ran: true });
-  P.renderTrades(res.trades, gotoTrade, { ran: true, hints: emptyHints() });
+  renderTradeTable();
   const nameByCode = new Map((res.trades || []).map((t) => [t.code, t.name]));
   for (const b of (res.by_stock || [])) if (b.code) nameByCode.set(b.code, b.name);
   P.renderSignals(res.signals, { ran: true, nameOf: (c) => nameByCode.get(c) });
@@ -1626,6 +1644,12 @@ function wire() {
     cancelRun: cancelBacktest,
     retryChart,
   });
+
+  P.bindTradeSort(onSortTrades);
+  P.restorePanelSizes();
+  P.bindResizers();
+  // 패널 크기가 바뀌면 캔버스도 다시 그린다 (ResizeObserver 가 잡지만 미니차트는 명시 호출)
+  window.addEventListener('panelresize', () => { S.eq.schedule(); S.mo.schedule(); });
 
   P.bindTabs((name) => {
     if (name === 'pnJson' && S.draft) P.renderJson(S.draft);

@@ -19,11 +19,13 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .errors import DataUnavailable
 
-__all__ = ["MarcapStore", "MARCAP_COLUMNS", "NUMERIC_COLUMNS"]
+__all__ = ["MarcapStore", "MARCAP_COLUMNS", "NUMERIC_COLUMNS",
+           "halted_mask", "HALTED_COLUMN", "PRICE_LIMIT_PCT", "code_variants"]
 
 
 #: marcap parquet 의 컬럼 (``ChagesRatio`` 오타는 원본 그대로 유지한다)
@@ -49,6 +51,12 @@ FLOAT64_COLUMNS = ("Volume", "Amount", "Marcap", "Stocks")
 #: 반복 문자열이라 category 로 두면 메모리가 크게 준다.
 CATEGORY_COLUMNS = ("Code", "Name", "Market", "MarketId", "Dept", "ChangeCode")
 
+#: 거래정지 판정 결과가 담기는 파생 컬럼 (parquet 에는 없다)
+HALTED_COLUMN = "halted"
+
+#: KRX 일간 가격제한폭(%). 이걸 넘는 변동은 정지해제 갭이거나 권리락/액면분할이다.
+PRICE_LIMIT_PCT = 30.0
+
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
 #: ``bars()`` 기본 컬럼. 차트/UI 가 실제로 쓰는 것만 읽는다 (읽기 비용이 컬럼 수에 비례한다).
@@ -65,6 +73,30 @@ SYMBOL_CACHE_MAX_BYTES = 200 * 1024 * 1024
 
 #: 이 개수 이하의 연도만 바뀌었으면 그 연도만 다시 읽어 캐시를 이어붙인다(증분 갱신).
 SYMBOL_CACHE_INCREMENTAL_MAX_YEARS = 3
+
+
+def halted_mask(df: pd.DataFrame):
+    """**체결에 쓸 수 없는 봉**(거래정지일) 마스크. 컬럼이 없으면 ``None``.
+
+    KRX 는 거래정지일에 시가·고가·저가를 0 으로, 종가만 **기준가**로 발표한다.
+    이걸 그대로 두면 ``low <= 목표가`` 같은 조건이 **무조건 참**이 되어
+    아무도 거래할 수 없는 날에 체결된 것으로 계산된다.
+
+    판정: ``Volume == 0`` 이고 ``Open/High/Low`` 중 0 이 있으면 거래정지.
+    여기에 더해 **OHLC 중 하나라도 0 이하면 거래량과 무관하게 체결 불가**로 본다
+    (실제로 2026-05-08 라피치처럼 OHLC=0 인데 거래량이 찍힌 행이 존재한다).
+
+    종가는 기준가로 유효하므로 이동평균 등 지표 계산에는 그대로 쓴다.
+    """
+    need = ("Open", "High", "Low", "Close")
+    if not all(c in df.columns for c in need):
+        return None
+    o = pd.to_numeric(df["Open"], errors="coerce").to_numpy("float64")
+    h = pd.to_numeric(df["High"], errors="coerce").to_numpy("float64")
+    l = pd.to_numeric(df["Low"], errors="coerce").to_numpy("float64")
+    c = pd.to_numeric(df["Close"], errors="coerce").to_numpy("float64")
+    bad = ~(np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c))
+    return bad | (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
 
 
 def _is_zero_padded(pf) -> bool:
@@ -328,6 +360,10 @@ class MarcapStore:
             if c in df.columns:
                 df[c] = df[c].astype("category")
         beat(0.8)
+        halted = halted_mask(df)
+        if halted is not None:
+            df[HALTED_COLUMN] = halted
+        beat(0.9)
         # 이미 Date 오름차순이면 정렬을 건너뛴다 (7백만 행 정렬은 몇 초가 걸리고 중단할 수 없다)
         if not df["Date"].is_monotonic_increasing:
             df = df.sort_values(["Date", "Code"], kind="stable")

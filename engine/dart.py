@@ -159,6 +159,14 @@ def _opt_float(v) -> Optional[float]:
 #: 공시일은 1970-01-01 이후 일수(2015년 ≈ 16,400) 이므로 2^32 면 충분히 넉넉하다.
 _KEY_SCALE = 1 << 32
 
+#: ``as_of_panel`` 이 종목 집합 -> id 변환 결과를 캐시하는 최대 개수.
+#: 백테스트는 보통 유니버스 1~2개만 반복해 쓴다. 항목당 종목 수 x 8바이트라
+#: 2,700종목 기준 22KB 정도. 상한을 넘으면 통째로 버린다.
+_CIDS_CACHE_MAX = 4
+
+#: ``rank``(연도*4+분기, 최대 2026*4+4 = 8,108) 위에 종목 id 를 얹을 때 쓰는 자릿수.
+_RANK_SCALE = 1 << 16
+
 
 class _AsOfIndex:
     """as-of 조회를 ``searchsorted`` 한 번으로 끝내기 위한 색인.
@@ -190,15 +198,18 @@ class _AsOfIndex:
     """
 
     __slots__ = ("codes", "code_to_id", "keys", "row_pos", "best_pos",
-                 "seg_start", "seg_end", "day_min", "n")
+                 "seg_start", "seg_end", "day_min", "n", "all_cids")
 
     def __init__(self, df: pd.DataFrame):
         disc = df["disclosed_at"]
         # 공시일을 모르는 행은 어떤 시점에도 '공시된' 적이 없으므로 색인에서 뺀다.
         pos = np.flatnonzero(disc.notna().to_numpy())
-        code_arr = df["code"].to_numpy(dtype=object)[pos].astype(str)
-        self.codes, code_id = np.unique(code_arr, return_inverse=True)
+        # factorize(sort=True) 는 np.unique 와 결과가 같으면서 7배 빠르다
+        # (pandas string dtype 을 object 로 풀어헤치지 않는다).
+        code_id, uniques = pd.factorize(df["code"].iloc[pos], sort=True)
+        self.codes = np.asarray(uniques, dtype=object).astype(str)
         self.code_to_id = {c: i for i, c in enumerate(self.codes)}
+        self.all_cids = np.arange(len(self.codes), dtype=np.int64)
 
         day = (disc.to_numpy()[pos].astype("datetime64[D]").astype("int64"))
         year = pd.to_numeric(df["year"], errors="coerce").to_numpy(
@@ -222,16 +233,19 @@ class _AsOfIndex:
 
         # best_pos[i] = 구간 시작부터 i 까지 중 (연도,분기) 가 가장 큰 행의 위치.
         # 같은 (연도,분기) 가 여러 벌이면 뒤에 오는 것(= 나중에 공시된 정정)이 이긴다.
-        best_local = np.empty(self.n, dtype=np.int64)
-        for s, e in zip(self.seg_start, self.seg_end):
-            if e <= s:
-                continue
-            r = rank[s:e]
-            is_best = np.maximum.accumulate(r) == r
-            best_local[s:e] = np.maximum.accumulate(
-                np.where(is_best, np.arange(s, e, dtype=np.int64), -1)
+        #
+        # 종목마다 루프를 돌지 않고 한 번에 계산한다. rank 에 code_id * 2^16 을 얹으면
+        # 뒤 종목의 값이 앞 종목의 어떤 값보다도 크므로, 전역 누적 최대값이
+        # 종목 경계에서 저절로 초기화된다 (rank 최대값 2026*4+4 < 2^16).
+        if self.n:
+            keyed = code_id.astype(np.int64) * _RANK_SCALE + rank
+            is_best = np.maximum.accumulate(keyed) == keyed
+            best_local = np.maximum.accumulate(
+                np.where(is_best, np.arange(self.n, dtype=np.int64), -1)
             )
-        self.best_pos = self.row_pos[best_local] if self.n else np.empty(0, np.int64)
+            self.best_pos = self.row_pos[best_local]
+        else:
+            self.best_pos = np.empty(0, np.int64)
 
     # -- 조회 -------------------------------------------------------------------------
     def _offset(self, day_ordinal: int) -> int:
@@ -265,6 +279,7 @@ class DartStore:
         self._frame: Optional[pd.DataFrame] = None
         self._corp_map: Optional[pd.DataFrame] = None
         self._asof: Optional[_AsOfIndex] = None
+        self._cids_cache: Dict[tuple, np.ndarray] = {}
 
     # ---------------------------------------------------------------- 파일 탐색
     def _files(self) -> Dict[int, Path]:
@@ -354,6 +369,7 @@ class DartStore:
         self._frame = None
         self._corp_map = None
         self._asof = None
+        self._cids_cache.clear()
 
     def corp_map(self) -> pd.DataFrame:
         """``corp_map.parquet`` (corp_code ↔ 종목코드). 없으면 빈 DataFrame."""
@@ -424,6 +440,7 @@ class DartStore:
         """as-of 조회용 색인. 한 번만 만들고 재사용한다 (``unload()`` 로 버린다)."""
         if self._asof is None:
             self._asof = _AsOfIndex(self.load())
+            self._cids_cache.clear()      # 종목 id 매핑이 바뀌므로 반드시 함께 버린다
         return self._asof
 
     def _date_ordinal(self, date) -> int:
@@ -459,7 +476,7 @@ class DartStore:
         end = idx.end_of(cid, self._date_ordinal(date))
         if end <= idx.seg_start[cid]:
             return None
-        return self._row_to_dict(self._frame.iloc[int(idx.best_pos[end - 1])])
+        return self._row_to_dict(self.load().iloc[int(idx.best_pos[end - 1])])
 
     def as_of_panel(self, codes: Optional[Iterable[str]], date) -> pd.DataFrame:
         """백테스트 스캔용 벡터 조회.
@@ -470,14 +487,22 @@ class DartStore:
         """
         idx = self._index()
         if codes is None:
-            cids = np.arange(len(idx.codes), dtype=np.int64)
+            cids = idx.all_cids
         else:
-            lookup = idx.code_to_id
-            cids = np.fromiter(
-                (lookup[c] for c in {str(x).zfill(6) for x in codes} if c in lookup),
-                dtype=np.int64,
-            )
-            cids.sort()
+            # 백테스트는 같은 종목 집합으로 날짜만 바꿔 가며 부른다.
+            # 문자열 → id 변환(1,800종목에 0.7ms)이 매번 반복되지 않게 작게 캐시한다.
+            key = tuple(codes)
+            cids = self._cids_cache.get(key)
+            if cids is None:
+                lookup = idx.code_to_id
+                cids = np.fromiter(
+                    (lookup[c] for c in {str(x).zfill(6) for x in codes} if c in lookup),
+                    dtype=np.int64,
+                )
+                cids.sort()
+                if len(self._cids_cache) >= _CIDS_CACHE_MAX:
+                    self._cids_cache.clear()      # 상한을 넘으면 통째로 버린다
+                self._cids_cache[key] = cids
         if cids.size == 0:
             return self._empty_panel()
 
@@ -487,7 +512,7 @@ class DartStore:
             return self._empty_panel()
 
         rows = idx.best_pos[ends[ok] - 1]
-        out = self._frame.iloc[rows]
+        out = self.load().iloc[rows]
         return out.set_index("code").sort_index()
 
     def _empty_panel(self) -> pd.DataFrame:
@@ -542,7 +567,7 @@ class DartStore:
             return None
         # 이 종목의 '이미 공시된' 행들만 잘라낸다. 공시일 오름차순이라
         # 같은 (연도,분기) 가 여러 벌이면 뒤에 오는 정정공시가 앞을 덮는다.
-        sub = self._frame.iloc[idx.row_pos[start:end]]
+        sub = self.load().iloc[idx.row_pos[start:end]]
 
         by_period: Dict[tuple, Optional[int]] = {}
         for y, q, v in zip(sub["year"], sub["quarter"], sub["op_income_quarter"]):

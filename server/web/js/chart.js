@@ -546,11 +546,21 @@ export class CandleChart {
         if (v > pMax) pMax = v;
       }
     }
-    for (const lv of this.d.levels) {
-      const p = +lv.price;
-      if (!Number.isFinite(p)) continue;
-      if (p < pMin) pMin = p;
-      if (p > pMax) pMax = p;
+    // 레벨(기준일 시가선)은 **화면에 들어온 것만** 범위에 넣는다.
+    // 과거를 이어붙이면 레벨이 수십 개가 되는데, 전부 넣으면 세로 축이 터져
+    // 정작 보고 있는 캔들이 아래쪽에 납작하게 눌린다.
+    if (pMax > pMin) {
+      const span = pMax - pMin;
+      const loLimit = pMin - span * 0.5, hiLimit = pMax + span * 0.5;
+      for (const lv of this.d.levels) {
+        const p = +lv.price;
+        if (!Number.isFinite(p)) continue;
+        const from = lv.from | 0;
+        if (from >= this.i1) continue;             // 아직 시작되지 않은 레벨
+        if (p < loLimit || p > hiLimit) continue;  // 화면 가격대와 너무 동떨어진 레벨
+        if (p < pMin) pMin = p;
+        if (p > pMax) pMax = p;
+      }
     }
     if (!(pMax > pMin)) { pMax = pMin + 1; }
     const padP = (pMax - pMin) * 0.06;

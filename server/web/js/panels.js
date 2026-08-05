@@ -371,6 +371,88 @@ const EXIT_LABEL = {
 };
 
 /** 매수/매도는 색 외에 삼각형 + 라벨을 함께 쓴다 (색맹 대응) */
+/* ---------- 거래 내역 정렬 ----------
+   분할 청산(group_id 가 같은 여러 줄)은 한 거래이므로 정렬해도 반드시 붙어 있어야 한다.
+   그래서 행이 아니라 **그룹 단위**로 정렬하고, 그룹 안의 순서는 원래대로 둔다. */
+
+const SORT_VALUE = {
+  no: (t) => t.no,
+  name: (t) => String(t.name || t.code || ''),
+  ref_date: (t) => ymdNum(t.ref_date),
+  ref_amount_eok: (t) => num(t.ref_amount_eok),
+  b1_date: (t) => ymdNum(fillOfT(t, 'B1', 0) && fillOfT(t, 'B1', 0).date),
+  b1_price: (t) => num(fillOfT(t, 'B1', 0) && fillOfT(t, 'B1', 0).price),
+  b2_date: (t) => ymdNum(fillOfT(t, 'B2', 1) && fillOfT(t, 'B2', 1).date),
+  b2_price: (t) => num(fillOfT(t, 'B2', 1) && fillOfT(t, 'B2', 1).price),
+  avg_price: (t) => num(t.avg_price),
+  exit_date: (t) => ymdNum(t.exit_date),
+  exit_price: (t) => num(t.exit_price),
+  exit_rule: (t) => String(t.exit_rule || ''),
+  hold_days: (t) => num(t.hold_days),
+  return_pct: (t) => num(t.return_pct),
+  pnl: (t) => num(t.pnl),
+};
+
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY; }
+function ymdNum(s) { return Number(String(s || '').replace(/-/g, '')) || Number.NEGATIVE_INFINITY; }
+function fillOfT(t, rule, idx) {
+  return (t.fills || []).find((f) => f.rule === rule) || (t.fills || [])[idx] || null;
+}
+
+/**
+ * 그룹을 깨지 않는 정렬.
+ * 그룹 대표값은 손익만 합계를 쓰고(분할 매도의 실제 성과), 나머지는 첫 줄 값을 쓴다.
+ * @returns {Array} 새 배열 (원본 불변)
+ */
+export function sortTrades(trades, key, dir) {
+  if (!key || !SORT_VALUE[key]) return trades.slice();
+  const sign = dir === 'desc' ? -1 : 1;
+
+  const order = [];
+  const groups = new Map();
+  for (const t of trades) {
+    const gid = t.group_id || `#${t.no}`;
+    if (!groups.has(gid)) { groups.set(gid, []); order.push(gid); }
+    groups.get(gid).push(t);
+  }
+
+  const rep = (rows) => (key === 'pnl'
+    ? rows.reduce((a, r) => a + num(r.pnl), 0)
+    : SORT_VALUE[key](rows[0]));
+
+  const arr = order.map((gid, i) => ({ gid, rows: groups.get(gid), i, v: rep(groups.get(gid)) }));
+  arr.sort((a, b) => {
+    const x = a.v, y = b.v;
+    let c;
+    if (typeof x === 'string' || typeof y === 'string') c = String(x).localeCompare(String(y), 'ko');
+    else c = x < y ? -1 : x > y ? 1 : 0;
+    return c !== 0 ? c * sign : a.i - b.i;   // 동점이면 원래 순서 유지 (안정 정렬)
+  });
+  return arr.flatMap((g) => g.rows);
+}
+
+/** 표 머리글 클릭 → 정렬. aria-sort 로 스크린리더에도 알린다. */
+export function bindTradeSort(onSort) {
+  document.querySelectorAll('#pnTrades th[data-sort]').forEach((th) => {
+    th.tabIndex = 0;
+    th.classList.add('sortable');
+    const go = () => onSort(th.dataset.sort);
+    th.addEventListener('click', go);
+    th.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+  });
+}
+
+export function markSortHeader(key, dir) {
+  document.querySelectorAll('#pnTrades th[data-sort]').forEach((th) => {
+    const on = th.dataset.sort === key;
+    th.setAttribute('aria-sort', on ? (dir === 'desc' ? 'descending' : 'ascending') : 'none');
+    th.classList.toggle('sorted', on);
+    th.dataset.dir = on ? dir : '';
+  });
+}
+
 const TRI_UP = '<svg width="7" height="7" viewBox="0 0 10 10" fill="currentColor" aria-hidden="true"><path d="M5 1 9 8H1z"/></svg>';
 const TRI_DN = '<svg width="7" height="7" viewBox="0 0 10 10" fill="currentColor" aria-hidden="true"><path d="M5 9 1 2h8z"/></svg>';
 
@@ -406,8 +488,7 @@ export function renderTrades(trades, onRowClick, ctx = {}) {
     )}</td></tr>`;
     return;
   }
-  const fillOf = (t, rule, idx) =>
-    (t.fills || []).find((f) => f.rule === rule) || (t.fills || [])[idx] || null;
+  const fillOf = fillOfT;
 
   // 같은 진입에서 나온 분할 청산은 group_id 로 묶어 한 덩어리로 보이게 한다.
   // (묶지 않으면 같은 종목이 두 줄로 보여 중복 거래로 오해한다)
@@ -1481,5 +1562,138 @@ export function bindSymbolLinks(onPick) {
     e.preventDefault();
     e.stopPropagation();          // 거래 내역 행 클릭과 중복 실행되지 않게
     onPick(b.dataset.code, { name: b.dataset.name });
+  });
+}
+
+/* ============================================================
+   21. 패널 크기 조절
+   ------------------------------------------------------------
+   :root 인라인 변수로 폭/높이를 바꾼다 (미디어쿼리 기본값을 이긴다).
+   값은 localStorage 에 저장하고, 창이 좁아지면 자동으로 다시 가둔다.
+   ============================================================ */
+
+const RZ = {
+  rzLeft: { varName: '--pane-l-w', axis: 'x', sign: 1, min: 200, maxFrac: 0.42, key: 'paneL' },
+  rzRight: { varName: '--pane-r-w', axis: 'x', sign: -1, min: 200, maxFrac: 0.42, key: 'paneR' },
+  rzDock: { varName: '--dock-h', axis: 'y', sign: -1, min: 120, maxFrac: 0.68, key: 'dockH' },
+};
+
+/** 가운데 차트 영역이 최소한 이만큼은 남아야 한다 */
+const CENTER_MIN = 430;
+
+function rzLimit(cfg) {
+  const total = cfg.axis === 'x' ? window.innerWidth : window.innerHeight;
+  let max = Math.max(cfg.min, Math.round(total * cfg.maxFrac));
+  if (cfg.axis === 'x') {
+    // 좌우 패널을 합쳐도 가운데가 CENTER_MIN 아래로 내려가면 안 된다.
+    // (한쪽을 넓히면 다른 쪽이 아니라 자기 자신이 먼저 막힌다)
+    const otherVar = cfg.varName === '--pane-l-w' ? '--pane-r-w' : '--pane-l-w';
+    const other = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(otherVar)) || 0;
+    max = Math.min(max, Math.max(cfg.min, total - other - CENTER_MIN));
+  }
+  return { min: cfg.min, max: Math.max(cfg.min, max) };
+}
+
+/** 창이 좁아졌을 때 좌우 패널을 비율대로 줄여 가운데를 확보한다 */
+function rzSqueeze() {
+  const l = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--pane-l-w')) || 0;
+  const r = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--pane-r-w')) || 0;
+  const over = (l + r + CENTER_MIN) - window.innerWidth;
+  if (over <= 0) return;
+  const lMin = RZ.rzLeft.min, rMin = RZ.rzRight.min;
+  const slack = (l - lMin) + (r - rMin);
+  if (slack <= 0) return;
+  const cut = Math.min(over, slack);
+  const nl = Math.round(l - cut * ((l - lMin) / slack));
+  const nr = Math.round(r - cut * ((r - rMin) / slack));
+  document.documentElement.style.setProperty('--pane-l-w', Math.max(lMin, nl) + 'px');
+  document.documentElement.style.setProperty('--pane-r-w', Math.max(rMin, nr) + 'px');
+  window.dispatchEvent(new CustomEvent('panelresize'));
+}
+
+function rzApply(cfg, px, save = true) {
+  const { min, max } = rzLimit(cfg);
+  const v = Math.round(Math.min(max, Math.max(min, px)));
+  document.documentElement.style.setProperty(cfg.varName, v + 'px');
+  if (save) { try { localStorage.setItem('rz.' + cfg.key, String(v)); } catch { /* 저장 불가 */ } }
+  window.dispatchEvent(new CustomEvent('panelresize'));
+  return v;
+}
+
+function rzCurrent(cfg) {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(cfg.varName);
+  return parseFloat(raw) || cfg.min;
+}
+
+/** 저장된 크기를 복원한다 (창 크기에 맞게 다시 가둔다) */
+export function restorePanelSizes() {
+  for (const cfg of Object.values(RZ)) {
+    let saved = null;
+    try { saved = localStorage.getItem('rz.' + cfg.key); } catch { /* 접근 불가 */ }
+    if (saved === null) continue;
+    const n = parseFloat(saved);
+    if (Number.isFinite(n)) rzApply(cfg, n, false);
+  }
+  rzSqueeze();
+}
+
+export function bindResizers() {
+  for (const [id, cfg] of Object.entries(RZ)) {
+    const el = $(id);
+    if (!el) continue;
+
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const startPos = cfg.axis === 'x' ? e.clientX : e.clientY;
+      const startVal = rzCurrent(cfg);
+      el.setPointerCapture(e.pointerId);
+      el.classList.add('dragging');
+      document.body.classList.add('resizing');
+      if (cfg.axis === 'y') document.body.classList.add('row');
+
+      const move = (ev) => {
+        const now = cfg.axis === 'x' ? ev.clientX : ev.clientY;
+        rzApply(cfg, startVal + (now - startPos) * cfg.sign);
+      };
+      const up = (ev) => {
+        el.removeEventListener('pointermove', move);
+        el.removeEventListener('pointerup', up);
+        el.removeEventListener('pointercancel', up);
+        try { el.releasePointerCapture(ev.pointerId); } catch { /* 이미 해제됨 */ }
+        el.classList.remove('dragging');
+        document.body.classList.remove('resizing', 'row');
+      };
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', up);
+      el.addEventListener('pointercancel', up);
+    });
+
+    // 키보드로도 조절할 수 있어야 한다 (마우스를 정밀하게 못 쓰는 사용자)
+    el.addEventListener('keydown', (e) => {
+      const step = e.shiftKey ? 48 : 16;
+      const dec = cfg.axis === 'x' ? 'ArrowLeft' : 'ArrowUp';
+      const inc = cfg.axis === 'x' ? 'ArrowRight' : 'ArrowDown';
+      if (e.key !== dec && e.key !== inc) return;
+      e.preventDefault();
+      rzApply(cfg, rzCurrent(cfg) + (e.key === inc ? step : -step) * cfg.sign);
+    });
+
+    // 더블클릭 = 기본값으로
+    el.addEventListener('dblclick', () => {
+      try { localStorage.removeItem('rz.' + cfg.key); } catch { /* 접근 불가 */ }
+      document.documentElement.style.removeProperty(cfg.varName);
+      window.dispatchEvent(new CustomEvent('panelresize'));
+    });
+  }
+
+  // 창이 좁아지면 저장된 크기를 다시 가둔다 (가로 스크롤 방지)
+  window.addEventListener('resize', () => {
+    for (const cfg of Object.values(RZ)) {
+      const cur = rzCurrent(cfg);
+      const { min, max } = rzLimit(cfg);
+      if (cur > max || cur < min) rzApply(cfg, cur, false);
+    }
+    rzSqueeze();
   });
 }
