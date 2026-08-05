@@ -197,9 +197,7 @@ dart/
 "200% 미만" 을 그냥 통과해 버린다. 대신 `capital_impaired = True` 플래그로 따로 표시하니
 전략에서 이 컬럼으로 직접 걸러라.
 
-> `capital_impaired` 는 아직 `engine/dart.py` 의 `FUNDAMENTAL_COLUMNS` 에 없어
-> `DartStore.as_of()` 로는 나오지 않는다. parquet 에는 저장되어 있다.
-> 엔진 쪽에 이 컬럼을 추가해야 백테스트에서 쓸 수 있다.
+`capital_impaired` 를 전략에서 어떻게 쓰는지는 **5-1장**을 보라.
 
 이미 받아 둔 데이터에 새 규칙을 적용하려면 **다시 내려받을 필요 없이**:
 
@@ -264,6 +262,70 @@ ok = fund[(fund["debt_ratio_pct"] < 200) & (fund["current_ratio_pct"] > 100)]
 
 `< 200` 비교는 값이 `pd.NA` 인 행을 자동으로 떨어뜨린다. 즉 **모르는 종목은 통과하지 못한다.**
 의도한 동작이다.
+
+---
+
+## 5-1. 자본잠식 함정 - 부채비율 필터만 믿으면 안 된다
+
+**전략 입장에서 가장 걸러야 할 종목이, 필터를 그냥 통과한다.** 이 절은 그 이야기다.
+
+### 무엇이 문제인가
+
+자본총계가 0 이하면(자본잠식) 부채비율 = 부채총계 / 자본총계 는 음수나 무한대가 된다.
+숫자로서 의미가 없으므로 수집기는 `debt_ratio_pct` 를 **비워 둔다**(`pd.NA`).
+
+그런데 `universe.filters.on_missing` 의 현재 기본값은 `"include"` 다.
+재무를 모르는 종목은 그 조건을 **건너뛰고 통과**시킨다는 뜻이다. 결과는:
+
+```
+자본잠식 종목  ->  debt_ratio_pct = NA  ->  "부채비율 200% 미만" 조건을 건너뜀  ->  통과
+```
+
+부실 회사를 걸러내라고 넣은 필터가, 가장 부실한 회사를 통과시킨다.
+`on_missing: "exclude"` 로 바꾸면 이 종목은 빠지지만, 그때는 재무를 모르는 502개 종목이
+통째로 빠져 생존 편향이 생긴다(12장). 어느 쪽도 이 문제를 제대로 풀지 못한다.
+
+### 그래서 별도 플래그를 둔다
+
+| 값 | 뜻 |
+|---|---|
+| `True` | 자본총계 <= 0. **자본잠식** |
+| `False` | 자본총계 > 0. 정상 |
+| `pd.NA` | 자본총계를 모른다 (해당 분기 자료가 없거나 계정 매칭 실패) |
+
+`DartStore.as_of()` 는 이걸 `True` / `False` / `None` 으로,
+`as_of_panel()` 은 nullable `boolean` 컬럼으로 돌려준다.
+**"모름"을 `False` 로 뭉개지 않는다.** "자본잠식이 아니다" 와 "자본총계를 모른다" 는 다른 말이다.
+
+### 엔진 권고안
+
+재무 필터를 적용할 때 **부채비율과 별개로 `capital_impaired` 를 명시적으로 한 번 더 건다.**
+`pd.NA` 가 섞인 마스크를 그대로 인덱서에 넘기면 pandas 판마다 동작이 달라지므로,
+**항상 `fillna` 로 "모름"을 어떻게 볼지 명시**한다.
+
+```python
+fund = store.as_of_panel(candidate_codes, today)
+debt, imp = fund["debt_ratio_pct"], fund["capital_impaired"]
+
+if on_missing == "include":              # 모르는 종목은 통과시킨다
+    debt_ok      = debt.isna() | (debt < 200)
+    not_impaired = ~imp.fillna(False).astype(bool)
+else:                                    # "exclude" - 확인된 종목만 남긴다
+    debt_ok      = (debt < 200).fillna(False)
+    not_impaired = (imp == False).fillna(False).astype(bool)
+
+ok = debt_ok & not_impaired
+```
+
+핵심은 **`not_impaired` 가 `on_missing` 과 무관하게 항상 걸린다**는 것이다.
+`on_missing: "include"` 여도 자본잠식이 *확인된* 종목은 통과시키지 않는다.
+`pd.NA`(자본총계를 모름)만 `on_missing` 정책을 따른다. 이게 두 값을 구분해 둔 이유다.
+
+> `imp != True` 같은 축약은 쓰지 마라. `pd.NA != True` 는 `pd.NA` 라서
+> "모름"을 어느 쪽으로 처리할지가 pandas 구현에 맡겨진다.
+
+이 조건을 켰다는 사실은 `assumptions.notes` 에 한국어로 남기는 편이 좋다.
+예: `"자본잠식 종목 70개를 제외했습니다. 부채비율만으로는 걸러지지 않습니다."`
 
 ---
 

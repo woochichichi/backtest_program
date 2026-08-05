@@ -1881,9 +1881,13 @@ def _section_collection(r: _Report, df: pd.DataFrame, files: Dict[int, Path],
         if not_due:
             r.note(f"아직 공시 기간이 아닌 분기가 비어 있습니다: {', '.join(not_due)}")
         if no_coverage:
+            probe = no_coverage[min(1, len(no_coverage) - 1)]
             r.note(f"{', '.join(no_coverage)} 은 DART 재무정보 API 가 제공하지 않는 구간입니다. "
                    f"분기·반기보고서는 {DART_QUARTERLY_FROM_YEAR}년부터, "
                    f"{DART_QUARTERLY_FROM_YEAR - 1}년은 사업보고서만 있습니다. 정상입니다.")
+            r.p(f"             정말 없는지 직접 확인하려면 한 번만 돌려 보세요:")
+            r.p(f"               python -m tools.fetch_dart --only {probe}")
+            r.p(f"             0행이 나오면 확정입니다. 행이 나오면 --quarterly-from 을 낮추세요.")
         if no_data:
             r.issue(f"요청은 했는데 DART 가 데이터 없음(013)으로 답한 분기가 있습니다: "
                     f"{', '.join(no_data[:8])}{' …' if len(no_data) > 8 else ''} - "
