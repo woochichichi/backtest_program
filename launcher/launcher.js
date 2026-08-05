@@ -673,6 +673,10 @@ function step1() {
   setHead("프로그램을 확인하고 있습니다");
   setProg(6);
 
+  if (!S.force && S.cfg && !S.cfg.prog) {
+    finishStep(0, "skip", "설정에서 자동 업데이트를 꺼 두었습니다", step2);
+    return;
+  }
   if (!SYS.dirExists(P.root + "\\.git")) {
     finishStep(0, "skip", "git 으로 받은 폴더가 아니어서 건너뜁니다", step2);
     return;
@@ -814,6 +818,10 @@ function step2() {
 
   S.lastSync = readLastSync();
 
+  if (!S.force && S.cfg && !S.cfg.quote) {
+    finishStep(1, "skip", "설정에서 자동 갱신을 꺼 두었습니다", step3);
+    return;
+  }
   if (!SYS.exists(P.updMarcap)) {
     finishStep(1, "skip", "update_marcap.bat 이 없어 건너뜁니다", step3);
     return;
@@ -1142,7 +1150,7 @@ function step4() {
   setHead("화면을 여는 중입니다");
   setProg(88);
   later(function () {
-    SYS.open(BASE_URL);
+    SYS.open(baseUrl());
     S.openedBrowser = true;
     finishStep(3, "done", "브라우저를 열었습니다", showDone);
   }, 300);
@@ -1234,7 +1242,7 @@ function showToggle(body) {
   S.finished = true;
   var i;
   for (i = 0; i < 4; i++) { setStep(i, "skip", "확인하지 않았습니다"); }
-  setStep(2, "done", "이미 켜져 있습니다");
+  setStep(2, "done", "이미 켜져 있습니다 (" + S.port + "번 포트)");
   setProg(100);
   setHead("이미 실행 중입니다");
   setNote("");
@@ -1260,25 +1268,91 @@ function resetSteps() {
   S.tally = { prog: 0, progCommits: 0, quoteDays: 0, quoteCloned: false, server: false, fetched: false };
 }
 
+function restartFlow(force, note) {
+  clearTimers();
+  S.cancelled = false;
+  S.finished = false;
+  S.force = !!force;
+  hideOv("ovAsk");
+  hideOv("ovRun");
+  hideOv("ovDone");
+  hideOv("ovPort");
+  hideOv("ovCfg");
+  var b = el("btnCancel");
+  b.innerHTML = "취소";
+  b.className = "";
+  resetSteps();
+  setNote(note || "");
+  later(step1, 120);
+}
+
 function wire() {
   el("btnCancel").onclick = function () {
     if (S.finished) { SYS.quit(); } else { cancelAll(); }
     return false;
   };
   el("frecheck").onclick = function () {
-    clearTimers();
+    restartFlow(true, "신선도 판정을 무시하고 전부 다시 확인합니다");
+    return false;
+  };
+
+  /* ---- 설정 ---- */
+  el("fcfg").onclick = function () {
+    el("cfgPort").value = String(S.cfg ? S.cfg.port : DEF_PORT);
+    el("cfgProg").checked = !(S.cfg && !S.cfg.prog);
+    el("cfgQuote").checked = !(S.cfg && !S.cfg.quote);
+    el("cfgErr").innerHTML = "";
+    showOv("ovCfg");
+    return false;
+  };
+  el("cfgCancel").onclick = function () { hideOv("ovCfg"); return false; };
+  el("cfgSave").onclick = function () {
+    var v = parseInt(trim(el("cfgPort").value), 10);
+    if (isNaN(v) || v < 1024 || v > 65535) {
+      el("cfgErr").innerHTML = "포트는 1024 ~ 65535 사이 숫자로 적어 주세요";
+      return false;
+    }
+    if (!S.cfg) { S.cfg = defaultCfg(); }
+    S.cfg.port = v;
+    S.cfg.prog = !!el("cfgProg").checked;
+    S.cfg.quote = !!el("cfgQuote").checked;
+    saveConfig();
+    S.port = v;
+    restartFlow(false, "설정을 저장했습니다");
+    return false;
+  };
+
+  /* ---- 포트 겹침 ---- */
+  el("portUse").onclick = function () {
+    hideOv("ovPort");
     S.cancelled = false;
-    S.finished = false;
-    S.force = true;
-    hideOv("ovAsk");
-    hideOv("ovRun");
-    hideOv("ovDone");
-    var b = el("btnCancel");
-    b.innerHTML = "취소";
-    b.className = "";
-    resetSteps();
-    setNote("신선도 판정을 무시하고 전부 다시 확인합니다");
-    later(step1, 120);
+    setNote("이미 떠 있는 서버를 씁니다");
+    finishStep(2, "skip", "이미 쓰고 있는 서버에 붙었습니다", step4);
+    return false;
+  };
+  el("portKill").onclick = function () {
+    hideOv("ovPort");
+    S.cancelled = false;
+    var info = S.portInfo || {};
+    setStep(2, "run", "쓰고 있던 프로그램을 종료합니다");
+    setNote("");
+    if (info.pid) { SYS.kill(info.pid); }
+    cleanupZombie();
+    later(function () { launchOurServer(false); }, 1600);
+    return false;
+  };
+  el("portOther").onclick = function () {
+    var info = S.portInfo || {};
+    if (!info.free) { return false; }
+    hideOv("ovPort");
+    S.cancelled = false;
+    S.port = info.free;
+    if (!S.cfg) { S.cfg = defaultCfg(); }
+    S.cfg.port = info.free;
+    saveConfig();
+    setStep(2, "run", info.free + "번 포트로 켭니다 (설정에 저장했습니다)");
+    setNote("");
+    later(function () { launchOurServer(false); }, 250);
     return false;
   };
   el("askYes").onclick = function () {
@@ -1294,7 +1368,7 @@ function wire() {
     return false;
   };
   el("runOpen").onclick = function () {
-    SYS.open(BASE_URL);
+    SYS.open(baseUrl());
     SYS.quit();
     return false;
   };
@@ -1329,9 +1403,11 @@ function boot() {
     return;
   }
   buildPaths(root);
+  S.cfg = loadConfig();
+  S.port = S.cfg.port;
 
   setHead("서버가 켜져 있는지 확인합니다");
-  SYS.ping(function (ok, body) {
+  pingRobust(function (ok, body) {
     if (ok) { showToggle(body); return; }
     later(step1, 200);
   });

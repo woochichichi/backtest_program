@@ -10,6 +10,9 @@
 /dart
 /dart/
 
+# 런처 설정 (사용자별 값이라 커밋하지 않는다. launcher_config.default.json 이 기본값)
+/launcher_config.json
+
 # 서버 PID (KRX백테스터.vbs 가 생성)
 /.server.pid
 
