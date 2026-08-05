@@ -954,7 +954,7 @@ function readDartState() {
   t = String(t);
   var mu = /"updated_at"\s*:\s*"([^"]*)"/.exec(t);
   if (mu) { st.updatedAt = trim(mu[1]); }
-  /* "2024-4": { ... "complete": true } 형태만 인정한다 */
+  /* "2024-4": { 여러 항목, "complete": true } 형태만 인정한다 */
   var re = /"(\d{4})-([1-4])"\s*:\s*\{([^{}]*)\}/g, m;
   while ((m = re.exec(t)) !== null) {
     if (/"complete"\s*:\s*true/.test(m[3])) {

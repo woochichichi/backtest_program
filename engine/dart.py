@@ -22,6 +22,35 @@ as-of 규칙 — 이게 이 모듈의 존재 이유다
 필터링하는 코드는 이 보호를 우회하므로 쓰지 마라.
 
 이 프로젝트에는 같은 성격의 편향으로 전략 수익률이 +122% → -14% 로 뒤집힌 전례가 있다.
+
+자본잠식 함정 — 부채비율 필터만 믿으면 안 된다
+---------------------------------------------
+자본총계가 0 이하면 부채비율(부채총계/자본총계)은 음수나 무한대가 되어 의미가 없다.
+그래서 수집기는 이 경우 ``debt_ratio_pct`` 를 **비워 둔다**(``pd.NA``).
+
+문제는 여기서 생긴다. ``fund["debt_ratio_pct"] < 200`` 같은 비교는 ``pd.NA`` 를 떨어뜨리지만,
+``universe.filters.on_missing`` 이 ``"include"``(현재 기본값)면 **값이 없는 종목은 그냥 통과한다.**
+즉 **가장 위험한 자본잠식 종목이 "부채비율 200% 미만" 을 통과해 버린다.**
+
+그래서 ``capital_impaired`` 를 따로 실어 보낸다. 부채비율과 **별개로** 명시적으로 걸러라.
+
+``capital_impaired`` 는 ``True``(자본잠식) / ``False``(정상) / ``pd.NA``(자본총계를 모름)
+**3값**이다. ``pd.NA`` 가 섞인 마스크를 그대로 인덱서에 넣으면 pandas 판마다 동작이 달라지므로
+**항상 ``fillna`` 로 "모름" 을 어떻게 볼지 명시**해라::
+
+    fund = store.as_of_panel(codes, today)
+    imp = fund["capital_impaired"]
+
+    # on_missing == "include" — 모르는 종목은 통과시킨다 (자본잠식만 떨군다)
+    not_impaired = ~imp.fillna(False).astype(bool)
+
+    # on_missing == "exclude" — 정상이라고 확인된 종목만 남긴다 (모름도 제외)
+    not_impaired = (imp == False).fillna(False).astype(bool)   # noqa: E712
+
+    ok = (fund["debt_ratio_pct"] < 200) & not_impaired
+
+``imp != True`` 같은 축약은 쓰지 마라. ``pd.NA != True`` 는 ``pd.NA`` 라서
+"모름" 을 어느 쪽으로 처리할지가 pandas 구현에 맡겨진다.
 """
 
 from __future__ import annotations
@@ -345,6 +374,7 @@ class DartStore:
             out[c] = _opt_int(row[c])
         for c in ("debt_ratio_pct", "current_ratio_pct"):
             out[c] = _opt_float(row[c])
+        out["capital_impaired"] = _opt_bool(row["capital_impaired"])
         return out
 
     # ---------------------------------------------------------------- 연속 흑자

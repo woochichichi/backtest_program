@@ -1540,3 +1540,107 @@ def test_report_생존편향_합계를_보여준다(healthy, capsys):
     _rc, out = run_report(dart_root, marcap_root, capsys)
     assert "미커버" in out and "상장폐지 추정" in out
     assert "재무를 알 수 없는 종목 6개" in out
+
+
+# ======================================================================================
+# 19. capital_impaired 가 DartStore 로 나오는지 (엔진이 실제로 쓸 수 있어야 한다)
+# ======================================================================================
+
+
+@pytest.fixture
+def impair_store(tmp_path) -> DartStore:
+    """자본잠식 / 정상 / 모름 / 고부채 4종목."""
+    return write_store(tmp_path / "dart", [
+        row("100001", 2024, 4, "2025-03-11", 10 * EOK, 자본총계=350 * EOK),
+        row("100002", 2024, 4, "2025-03-11", 10 * EOK, 자본총계=-5 * EOK),
+        row("100003", 2024, 4, "2025-03-11", 10 * EOK, 자본총계=None),
+        row("100004", 2024, 4, "2025-03-11", 10 * EOK,
+            부채총계=900 * EOK, 자본총계=100 * EOK),
+    ])
+
+
+def test_capital_impaired가_엔진_스키마에_있다():
+    import engine.dart as ed
+    assert "capital_impaired" in ed.DERIVED_COLUMNS
+    assert "capital_impaired" in ed.FUNDAMENTAL_COLUMNS
+
+
+def test_as_of가_capital_impaired를_돌려준다(impair_store):
+    got = impair_store.as_of("100002", "2025-06-01")
+    assert got["capital_impaired"] is True
+    assert got["debt_ratio_pct"] is None, "자본잠식이면 부채비율은 비어 있다"
+
+    got = impair_store.as_of("100001", "2025-06-01")
+    assert got["capital_impaired"] is False
+    assert got["debt_ratio_pct"] == pytest.approx(42.86)
+
+
+def test_as_of는_모름을_False로_뭉개지_않는다(impair_store):
+    """'자본잠식이 아니다' 와 '자본총계를 모른다' 는 다른 이야기다."""
+    got = impair_store.as_of("100003", "2025-06-01")
+    assert got["capital_impaired"] is None
+    assert got["capital_impaired"] is not False
+
+
+def test_as_of_panel이_nullable_boolean으로_준다(impair_store):
+    panel = impair_store.as_of_panel(None, "2025-06-01")
+    imp = panel["capital_impaired"]
+    assert str(imp.dtype) == "boolean", "3값을 보존하려면 nullable boolean 이어야 한다"
+    assert imp.loc["100001"] is False or imp.loc["100001"] == False  # noqa: E712
+    assert imp.loc["100002"] == True                                 # noqa: E712
+    assert pd.isna(imp.loc["100003"])
+
+
+def test_부채비율만으로는_자본잠식을_못_거른다(impair_store):
+    """on_missing='include' 면 값이 없는 종목은 필터를 건너뛰고 통과한다 - 그게 함정이다."""
+    panel = impair_store.as_of_panel(None, "2025-06-01")
+    # 재무를 모르는 종목을 통과시키는 on_missing="include" 의 동작을 흉내낸다
+    passes = panel["debt_ratio_pct"].isna() | (panel["debt_ratio_pct"] < 200)
+    assert bool(passes.loc["100002"]), \
+        "자본잠식 종목이 '부채비율 200% 미만' 을 통과한다 - 이래서 별도 플래그가 필요하다"
+
+
+@pytest.mark.parametrize("policy,expected", [
+    # 100001 정상 42.9% / 100002 자본잠식 / 100003 재무 모름 / 100004 부채 900%
+    ("include", ["100001", "100003"]),   # 모르는 종목은 통과, 자본잠식은 떨어진다
+    ("exclude", ["100001"]),             # 모르는 종목도 제외
+])
+def test_권고_필터_관용구가_실제로_동작한다(impair_store, policy, expected):
+    """docs/DART.md 와 engine/dart.py 독스트링에 적어 둔 관용구를 그대로 돌려 본다."""
+    panel = impair_store.as_of_panel(None, "2025-06-01")
+    debt = panel["debt_ratio_pct"]
+    imp = panel["capital_impaired"]
+
+    if policy == "include":
+        debt_ok = debt.isna() | (debt < 200)                      # 모르면 통과
+        not_impaired = ~imp.fillna(False).astype(bool)
+    else:
+        debt_ok = (debt < 200).fillna(False)                      # 모르면 제외
+        not_impaired = (imp == False).fillna(False).astype(bool)  # noqa: E712
+
+    ok = debt_ok & not_impaired
+    assert list(panel.index[ok]) == expected
+    assert "100002" not in list(panel.index[ok]), \
+        "자본잠식은 어느 정책에서도 빠져야 한다 - 이게 capital_impaired 를 만든 이유다"
+    assert "100004" not in list(panel.index[ok]), "부채 900%%는 어느 쪽이든 탈락"
+
+
+def test_모름_취급이_정책에_따라_갈린다(impair_store):
+    """자본잠식 판정만 놓고 보면 include 는 '모름' 을 남기고 exclude 는 뺀다."""
+    imp = impair_store.as_of_panel(None, "2025-06-01")["capital_impaired"]
+    include = ~imp.fillna(False).astype(bool)
+    exclude = (imp == False).fillna(False).astype(bool)          # noqa: E712
+    assert bool(include.loc["100003"]) is True
+    assert bool(exclude.loc["100003"]) is False
+
+
+def test_예전_parquet에_컬럼이_없어도_모름으로_읽힌다(tmp_path):
+    """capital_impaired 이전에 받은 파일도 깨지지 않고 '모름' 이 된다."""
+    root = tmp_path / "dart"
+    write_store(root, [row("100001", 2024, 4, "2025-03-11", 10 * EOK)])
+    p = root / "fundamentals-2024.parquet"
+    pd.read_parquet(p).drop(columns=["capital_impaired"]).to_parquet(p, index=False)
+
+    store = DartStore(root=root)
+    assert store.as_of("100001", "2025-06-01")["capital_impaired"] is None
+    assert pd.isna(store.as_of_panel(None, "2025-06-01")["capital_impaired"].iloc[0])
