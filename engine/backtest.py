@@ -955,6 +955,7 @@ def run_backtest(
         "halted_reference_days_rejected": 0,
         "price_adjust_events": 0,
         "price_adjust_symbols": 0,
+        "price_adjust_skipped_not_split": 0,
         "extreme_moves_flagged": 0,
         "limit_price_fills": 0,
     }
@@ -1009,7 +1010,9 @@ def run_backtest(
                 "applied": bool(adjust_info.get("applied")),
                 "events": int(stats["price_adjust_events"]),
                 "symbols": int(stats["price_adjust_symbols"]),
-                "method": "stocks_ratio",
+                "method": "stocks_ratio+marcap_continuity",
+                "candidates": int(adjust_info.get("candidates") or 0),
+                "skipped_not_split": int(stats["price_adjust_skipped_not_split"]),
                 "limitations": list(ADJUST_LIMITATIONS),
             },
             "dart": {
@@ -1058,10 +1061,13 @@ def run_backtest(
     adjust_info = dict(getattr(store, "last_adjustment", None) or {})
     stats["price_adjust_events"] = int(adjust_info.get("events") or 0)
     stats["price_adjust_symbols"] = int(adjust_info.get("symbols") or 0)
+    stats["price_adjust_skipped_not_split"] = int(adjust_info.get("skipped_not_split") or 0)
     if adjust_info.get("applied"):
         warnings.append(
-            f"수정주가를 적용했습니다 (상장주식수 변화 기준, 이벤트 {stats['price_adjust_events']:,}건 / "
-            f"{stats['price_adjust_symbols']:,}종목). 유상증자·배당락은 반영되지 않습니다."
+            f"수정주가를 적용했습니다 (액면분할·무상증자 {stats['price_adjust_events']:,}건 / "
+            f"{stats['price_adjust_symbols']:,}종목). 주식수가 변했지만 가격이 그만큼 "
+            f"움직이지 않은 {stats['price_adjust_skipped_not_split']:,}건(유상증자·합병 신주 등)은 "
+            "조정하지 않았습니다 — 그 종목들은 결과가 여전히 왜곡돼 있을 수 있습니다."
         )
     report(17, "종목 목록 정리 중", PHASE_LOAD)
     # 연도 파일은 (Date, Code) 순으로 저장돼 있고 연도 순으로 이어붙였으므로 이미 Date 오름차순이다.

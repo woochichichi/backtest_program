@@ -62,12 +62,19 @@ PRICE_LIMIT_PCT = 30.0
 #: 수정주가 이벤트 판정 임계값. ``Stocks`` 가 이 배수 이상 늘거나 그 역수 이하로 줄면 이벤트로 본다.
 ADJUST_STOCKS_RATIO = 1.5
 
+#: 분할 교차검증 허용 범위. (가격비 x 주식수비) 가 이 안에 들어야 진짜 분할/병합으로 본다.
+#: 완전한 액면분할이면 1.0 이고, 남는 오차는 그날의 실제 등락(가격제한폭 ±30%) 뿐이다.
+#: 유상증자·합병 신주는 주식수만 늘고 가격은 그만큼 안 빠지므로 이 범위 밖으로 나간다.
+ADJUST_CONTINUITY_LO = 0.7
+ADJUST_CONTINUITY_HI = 1.3
+
 #: 수정주가로 잡히지 않는 것들 — 결과 페이로드에 그대로 실어 사용자에게 알린다
 ADJUST_LIMITATIONS = [
-    "액면분할·무상증자·액면병합은 상장주식수 변화로 정확히 반영됩니다.",
-    "유상증자는 반영되지 않습니다. 주식수 증가율과 가격 조정 비율이 다르기 때문입니다.",
-    "배당락은 반영되지 않습니다. 상장주식수가 변하지 않습니다.",
-    "합병·분할 등 주식수와 가격이 함께 바뀌는 사건은 근사치입니다.",
+    "액면분할·무상증자·액면병합은 상장주식수 변화로 반영됩니다.",
+    "주식수가 변한 날 중 가격이 그만큼 움직이지 않은 건은 조정하지 않습니다 "
+    "(유상증자·합병 신주·전환사채 전환 등). 실측상 주식수 급변의 약 60%가 여기 해당합니다.",
+    "배당락은 반영되지 않습니다. 상장주식수가 변하지 않기 때문입니다.",
+    "조정 기준 시점은 불러온 구간의 마지막 거래일입니다.",
 ]
 
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
@@ -112,50 +119,106 @@ def halted_mask(df: pd.DataFrame):
     return bad | (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
 
 
-def adjustment_factors(df: pd.DataFrame, threshold: float = ADJUST_STOCKS_RATIO):
+def adjustment_factors(df: pd.DataFrame, threshold: float = ADJUST_STOCKS_RATIO,
+                       beat: Optional[Callable[[], None]] = None):
     """상장주식수(``Stocks``) 변화로 수정주가 계수를 계산한다.
 
     marcap 은 **KRX 원본 시세**라 액면분할·무상증자가 반영돼 있지 않다.
     삼성전자 2018-05-04 50:1 분할이면 2,650,000원이 51,900원이 되는데,
     조정하지 않으면 백테스트가 이걸 **하루 -98% 폭락**으로 계산한다.
 
-    ``배율 = Stocks(당일) / Stocks(전일)`` 이 임계값을 넘으면 이벤트로 보고,
-    그 이전 모든 봉에 ``1/배율`` 을 **소급** 적용한다.
+    ``배율 = Stocks(당일)/Stocks(전일)`` 이 임계값을 넘고, **가격이 그만큼 반대로 움직였을 때만**
+    (시가총액 연속성 교차검증) 이벤트로 인정해 그 이전 봉에 ``1/배율`` 을 소급 적용한다.
 
-    Returns
-    -------
-    (factor, stats) : (np.ndarray | None, dict)
-        ``factor`` 는 각 행의 과거 가격에 곱할 계수 (마지막 시점 기준 = 1.0).
+    700만 행 패널에서 돌아가므로 큰 중간 배열을 만들지 않는다.
+    교차검증과 누적곱은 **후보 행·해당 종목에만** 돌린다.
     """
-    if "Stocks" not in df.columns or "Code" not in df.columns or len(df) == 0:
-        return None, {"events": 0, "symbols": 0}
-    stocks = pd.to_numeric(df["Stocks"], errors="coerce").astype("float64")
-    code = df["Code"]
-    prev = stocks.groupby(code, sort=False, observed=True).shift(1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = stocks / prev
-    lo = 1.0 / float(threshold)
-    ev = (
-        prev.notna() & (prev > 0) & stocks.notna() & (stocks > 0)
-        & np.isfinite(ratio)
-        & ((ratio >= float(threshold)) | (ratio <= lo))
-    )
-    n_ev = int(ev.sum())
-    if n_ev == 0:
-        return None, {"events": 0, "symbols": 0}
+    def _b():
+        if beat is not None:
+            beat()
 
-    r = ratio.where(ev, 1.0)
-    grp = r.groupby(code, sort=False, observed=True)
-    cum = grp.cumprod()
-    last = cum.groupby(code, sort=False, observed=True).transform("last")
+    empty = {"events": 0, "symbols": 0, "candidates": 0, "skipped_not_split": 0}
+    if "Stocks" not in df.columns or "Code" not in df.columns or len(df) == 0:
+        return None, empty
+
+    n = len(df)
+    code = df["Code"]
+    # 같은 종목의 '직전 행 위치'를 한 번만 구한다 (패널은 날짜순이라 i-1 이 같은 종목이 아니다)
+    groups = code.groupby(code, sort=False, observed=True).indices
+    _b()
+    prev_pos = np.full(n, -1, dtype=np.int64)
+    for _c, pos in groups.items():
+        if pos.size > 1:
+            prev_pos[pos[1:]] = pos[:-1]
+    _b()
+
+    stocks = pd.to_numeric(df["Stocks"], errors="coerce").to_numpy("float64")
+    have = prev_pos >= 0
+    ratio = np.ones(n, dtype="float64")
+    ps = stocks[prev_pos[have]]
+    cs = stocks[have]
     with np.errstate(divide="ignore", invalid="ignore"):
-        factor = np.array((cum / last).to_numpy("float64"), dtype="float64", copy=True)
-    factor[~np.isfinite(factor)] = 1.0
-    return factor, {"events": n_ev, "symbols": int(code[ev].nunique())}
+        ratio[have] = cs / ps
+    ok_prev = np.zeros(n, dtype=bool)
+    ok_prev[have] = np.isfinite(ps) & (ps > 0) & np.isfinite(cs) & (cs > 0)
+    del stocks, ps, cs
+
+    lo = 1.0 / float(threshold)
+    ev = ok_prev & np.isfinite(ratio) & ((ratio >= float(threshold)) | (ratio <= lo))
+    del ok_prev
+    cand = np.flatnonzero(ev)
+    n_candidates = int(cand.size)
+    _b()
+    if n_candidates == 0:
+        return None, {**empty, "candidates": 0}
+
+    # 교차 검증 — 후보 행에만 돌린다 (수천 건이라 사실상 공짜다)
+    skipped = 0
+    if "Close" in df.columns:
+        close = pd.to_numeric(df["Close"], errors="coerce").to_numpy("float64")
+        pc = close[prev_pos[cand]]
+        cc = close[cand]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            product = (cc / pc) * ratio[cand]
+        good = (
+            np.isfinite(product)
+            & (product >= ADJUST_CONTINUITY_LO) & (product <= ADJUST_CONTINUITY_HI)
+        )
+        skipped = int(np.count_nonzero(~good))
+        ev[cand[~good]] = False
+        cand = cand[good]
+        del close, pc, cc, product, good
+    del prev_pos
+    n_ev = int(cand.size)
+    _b()
+    if n_ev == 0:
+        return None, {**empty, "candidates": n_candidates, "skipped_not_split": skipped}
+
+    # 누적곱도 이벤트가 있는 종목에만 돌린다
+    codes_np = code.to_numpy()
+    hit_codes = pd.unique(codes_np[cand])
+    factor = np.ones(n, dtype="float64")
+    for c in hit_codes:
+        pos = groups.get(c)
+        if pos is None or pos.size == 0:
+            continue
+        r = np.where(ev[pos], ratio[pos], 1.0)
+        cum = np.cumprod(r)
+        tail = cum[-1]
+        if not np.isfinite(tail) or tail == 0:
+            continue
+        vals = cum / tail
+        factor[pos] = np.where(np.isfinite(vals), vals, 1.0)
+    _b()
+    return factor, {
+        "events": n_ev, "symbols": int(len(hit_codes)),
+        "candidates": n_candidates, "skipped_not_split": skipped,
+    }
 
 
 def apply_price_adjustment(df: pd.DataFrame,
-                           threshold: float = ADJUST_STOCKS_RATIO) -> dict:
+                           threshold: float = ADJUST_STOCKS_RATIO,
+                           beat: Optional[Callable[[], None]] = None) -> dict:
     """``df`` 의 OHLC 를 제자리에서 수정주가로 바꾼다.
 
     * OHLC × 계수 (과거를 현재 기준으로 끌어내린다)
@@ -163,15 +226,21 @@ def apply_price_adjustment(df: pd.DataFrame,
     * Amount·Marcap·Stocks 는 **건드리지 않는다** (이미 금액/원본 수치다)
     * 거래정지 봉의 0 은 0 × 계수 = 0 이라 그대로 남는다
     """
-    factor, stats = adjustment_factors(df, threshold)
-    stats = {"events": 0, "symbols": 0, **stats}
+    factor, stats = adjustment_factors(df, threshold, beat)
+    stats = {"events": 0, "symbols": 0, "candidates": 0, "skipped_not_split": 0, **stats}
     if factor is None:
         stats["applied"] = False
         return stats
+    touched = factor != 1.0
     for c in ("Open", "High", "Low", "Close"):
         if c in df.columns:
             dt_ = df[c].dtype
-            df[c] = (df[c].to_numpy("float64") * factor).astype(dt_, copy=False)
+            col = df[c].to_numpy("float64").copy()
+            col[touched] *= factor[touched]
+            df[c] = col.astype(dt_, copy=False)
+            del col
+            if beat is not None:
+                beat()
     if "Volume" in df.columns:
         with np.errstate(divide="ignore", invalid="ignore"):
             v = df["Volume"].to_numpy("float64") / factor
@@ -661,7 +730,8 @@ class MarcapStore:
 
         self.last_adjustment = {"applied": False, "events": 0, "symbols": 0}
         if adj:
-            self.last_adjustment = apply_price_adjustment(out, self.adjust_threshold)
+            self.last_adjustment = apply_price_adjustment(
+                out, self.adjust_threshold, beat=lambda: beat(0.32))
             if drop_stocks and "Stocks" in out.columns:
                 del out["Stocks"]
             beat(0.35)

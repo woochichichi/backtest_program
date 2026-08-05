@@ -31,13 +31,15 @@ ASSUMPTION_KEYS = {
     "slippage_pct", "fee_pct", "exit_priority", "notes", "stats",
     "ignored_filters", "dart", "price_adjustment",
 }
-PRICE_ADJ_KEYS = {"applied", "events", "symbols", "method", "limitations"}
+PRICE_ADJ_KEYS = {"applied", "events", "symbols", "method", "candidates",
+                  "skipped_not_split", "limitations"}
 DART_KEYS = {"available", "as_of", "coverage_pct", "on_missing", "last_fetch"}
 ASSUMPTION_STAT_KEYS = {
     "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
     "same_day_profit_exits_blocked", "missing_financials", "missing_financials_pct",
     "halted_bars_skipped", "halted_symbols", "halted_reference_days_rejected",
-    "price_adjust_events", "price_adjust_symbols", "extreme_moves_flagged",
+    "price_adjust_events", "price_adjust_symbols", "price_adjust_skipped_not_split",
+    "extreme_moves_flagged",
     "limit_price_fills",
 }
 METRIC_KEYS = {
@@ -209,7 +211,7 @@ def test_result_matches_api_schema(strategy1, tp_store):
     assert isinstance(a["notes"], list) and all(isinstance(n, str) and n for n in a["notes"])
     assert set(a["stats"]) == ASSUMPTION_STAT_KEYS
     assert set(a["price_adjustment"]) == PRICE_ADJ_KEYS
-    assert a["price_adjustment"]["method"] == "stocks_ratio"
+    assert a["price_adjustment"]["method"] == "stocks_ratio+marcap_continuity"
     assert a["price_adjustment"]["limitations"]
     assert set(a["dart"]) == DART_KEYS
     assert a["dart"]["available"] is False and a["dart"]["as_of"] is False
