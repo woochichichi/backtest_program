@@ -1612,3 +1612,161 @@ def test_symbol_cache_trim(multiyear_store):
     multiyear_store._trim_symbol_cache(max_bytes=1)
     left = list(multiyear_store.symbol_cache_dir.glob("*.parquet"))
     assert len(left) <= 1, "상한을 넘으면 오래된 것부터 지운다"
+
+
+# ======================================================================================
+# ★ 거래정지일 / 수정주가
+# ======================================================================================
+
+
+def test_halted_mask_rule():
+    from engine.data import halted_mask
+
+    df = pd.DataFrame({
+        "Open":  [100.0, 0.0,   100.0, 0.0],
+        "High":  [110.0, 0.0,   110.0, 0.0],
+        "Low":   [ 90.0, 0.0,    90.0, 0.0],
+        "Close": [105.0, 105.0, 105.0, 105.0],
+        "Volume":[1000.0, 0.0,  0.0,   11000.0],
+    })
+    m = halted_mask(df)
+    # 0: 정상 / 1: 전형적 거래정지 / 2: 거래량 0 이지만 가격은 있음 -> 체결 가능
+    # 3: OHLC=0 인데 거래량이 찍힌 이상 데이터 -> 가격을 못 쓰므로 정지로 본다
+    assert list(m) == [False, True, False, True]
+
+
+def test_halted_bars_never_fill(dates, strategy1):
+    """거래정지일에는 low==0 이라 어떤 목표가 조건도 무조건 성립한다. 체결되면 안 된다."""
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100010", "테스트에이", "tp", dates)
+    # B1 이 체결될 봉을 거래정지로 바꾼다 (OHLC=0, 종가는 기준가 유지)
+    f.loc[B1_BAR, ["Open", "High", "Low", "Volume", "Amount"]] = [0.0, 0.0, 0.0, 0.0, 0.0]
+    store = FakeStore([f])
+
+    res = run_backtest(strategy1, store)
+    fills = [x for t in res["trades"] for x in t["fills"]]
+    assert all(x["date"] != dates[B1_BAR].isoformat() for x in fills), "정지일에 체결됐다"
+    assert res["assumptions"]["stats"]["halted_bars_skipped"] >= 1
+    assert res["assumptions"]["stats"]["halted_symbols"] >= 1
+    assert any("거래정지일" in n for n in res["assumptions"]["notes"])
+
+
+def test_halted_day_cannot_be_reference_day(dates, strategy1):
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100010", "테스트에이", "tp", dates)
+    f.loc[REF_BAR, ["Open", "High", "Low"]] = [0.0, 0.0, 0.0]   # 기준일이 정지일
+    f.loc[REF_BAR, "Volume"] = 0.0
+    res = run_backtest(strategy1, FakeStore([f]))
+    assert res["trades"] == []
+
+
+def test_position_kept_through_halt(dates, strategy1):
+    """정지 중에는 팔 수 없으니 포지션을 그대로 들고 가야 한다."""
+    from conftest import FakeStore, make_frame
+
+    f = make_frame("100010", "테스트에이", "tp", dates)
+    for b in range(B2_BAR + 1, TP_BAR):        # B2 체결 후 ~ TP 직전까지 정지
+        f.loc[b, ["Open", "High", "Low", "Volume", "Amount"]] = [0.0, 0.0, 0.0, 0.0, 0.0]
+    res = run_backtest(strategy1, FakeStore([f]))
+    assert res["trades"], "정지가 풀린 뒤 청산됐어야 한다"
+    t = res["trades"][0]
+    assert t["exit_date"] >= dates[TP_BAR].isoformat()
+    assert res["assumptions"]["stats"]["halted_bars_skipped"] > 0
+
+
+def test_price_adjustment_split():
+    """액면분할 50:1 — 과거 가격이 1/50 로 소급 조정되고 거래량은 50배가 된다."""
+    from engine.data import apply_price_adjustment
+
+    df = pd.DataFrame({
+        "Date": pd.to_datetime(["2018-05-02", "2018-05-03", "2018-05-04", "2018-05-08"]),
+        "Code": ["005930"] * 4,
+        "Open":  [2600000.0, 0.0, 53000.0, 52600.0],
+        "High":  [2660000.0, 0.0, 53900.0, 53000.0],
+        "Low":   [2600000.0, 0.0, 51800.0, 51900.0],
+        "Close": [2650000.0, 2650000.0, 51900.0, 52600.0],
+        "Volume":[100.0, 0.0, 39565391.0, 23104720.0],
+        "Stocks":[128386494, 128386494, 6419324700, 6419324700],
+    })
+    st = apply_price_adjustment(df)
+    assert st["applied"] and st["events"] == 1 and st["symbols"] == 1
+    assert df.loc[1, "Close"] == pytest.approx(53000.0)     # 2,650,000 / 50
+    assert df.loc[0, "Close"] == pytest.approx(53000.0)
+    assert df.loc[2, "Close"] == pytest.approx(51900.0)     # 분할 이후는 그대로
+    assert df.loc[0, "Volume"] == pytest.approx(5000.0)     # 100 x 50
+    assert df.loc[1, "Open"] == 0.0, "거래정지 봉의 0 은 그대로 0"
+
+
+def test_price_adjustment_skips_non_split():
+    """주식수는 늘었는데 가격이 그만큼 안 빠졌다 = 유상증자. 조정하면 안 된다."""
+    from engine.data import apply_price_adjustment
+
+    df = pd.DataFrame({
+        "Date": pd.to_datetime(["2020-01-02", "2020-01-03"]),
+        "Code": ["123456"] * 2,
+        "Open": [10000.0, 9800.0], "High": [10100.0, 9900.0],
+        "Low": [9900.0, 9700.0], "Close": [10000.0, 9800.0],
+        "Volume": [1000.0, 1000.0],
+        "Stocks": [1_000_000, 2_000_000],       # 2배 증자인데 가격은 -2% 뿐
+    })
+    st = apply_price_adjustment(df)
+    assert st["applied"] is False
+    assert st["candidates"] == 1 and st["skipped_not_split"] == 1
+    assert df.loc[0, "Close"] == 10000.0, "조정하면 없던 -50% 급락을 만들어낸다"
+
+
+def test_adjusted_flag_changes_prices(multiyear_store):
+    a = multiyear_store.bars("005930")
+    b = MarcapStore(root=multiyear_store.root, cache_dir=multiyear_store.cache_dir,
+                    adjusted=False).bars("005930")
+    assert len(a) == len(b)
+    assert set(multiyear_store.symbol_cache_dir.glob("005930.parquet"))
+    assert set(multiyear_store.symbol_cache_dir.glob("005930.raw.parquet")), \
+        "조정/미조정 캐시는 파일이 분리돼야 한다"
+
+
+def test_store_is_thread_safe(multiyear_store):
+    """같은 종목을 여러 스레드가 동시에 처음 조회해도 캐시가 깨지지 않아야 한다."""
+    import threading
+
+    errors = []
+    lens = []
+
+    def work():
+        try:
+            for _ in range(6):
+                lens.append(len(multiyear_store.bars("005930")))
+                lens.append(len(multiyear_store.bars("005930", "2025-01-01", None)))
+        except Exception as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    ts = [threading.Thread(target=work) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, errors[:3]
+    assert len(set(lens)) <= 2, "같은 요청이 스레드마다 다른 길이를 주면 캐시가 깨진 것"
+
+
+def test_symbol_cache_write_is_atomic(multiyear_store):
+    """캐시 쓰기가 임시파일 + os.replace 인지 — 쓰는 도중 파일이 보이면 안 된다."""
+    import engine.data as ed
+
+    seen = []
+    orig = ed._atomic_write_parquet
+
+    def spy(df, path):
+        seen.append(str(path))
+        return orig(df, path)
+
+    ed._atomic_write_parquet = spy
+    try:
+        multiyear_store.bars("005930")
+    finally:
+        ed._atomic_write_parquet = orig
+    assert seen and seen[0].endswith("005930.parquet")
+    leftovers = list(multiyear_store.symbol_cache_dir.glob(".*tmp"))
+    assert not leftovers, "임시 파일이 남았다"

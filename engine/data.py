@@ -15,6 +15,8 @@ import gc
 import json
 import os
 import re
+import tempfile
+import threading
 import subprocess
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
@@ -121,17 +123,17 @@ def halted_mask(df: pd.DataFrame):
 
 def adjustment_factors(df: pd.DataFrame, threshold: float = ADJUST_STOCKS_RATIO,
                        beat: Optional[Callable[[], None]] = None):
-    """상장주식수(``Stocks``) 변화로 수정주가 계수를 계산한다.
+    """수정주가 계수를 ``{시작위치배열: 계수배열}`` 목록으로 계산한다.
 
     marcap 은 **KRX 원본 시세**라 액면분할·무상증자가 반영돼 있지 않다.
     삼성전자 2018-05-04 50:1 분할이면 2,650,000원이 51,900원이 되는데,
     조정하지 않으면 백테스트가 이걸 **하루 -98% 폭락**으로 계산한다.
 
-    ``배율 = Stocks(당일)/Stocks(전일)`` 이 임계값을 넘고, **가격이 그만큼 반대로 움직였을 때만**
-    (시가총액 연속성 교차검증) 이벤트로 인정해 그 이전 봉에 ``1/배율`` 을 소급 적용한다.
+    ``배율 = Stocks(당일)/Stocks(전일)`` 이 임계값을 넘고 **가격이 그만큼 반대로 움직였을 때만**
+    (시가총액 연속성 교차검증) 이벤트로 인정해, 그 이전 봉에 ``1/배율`` 을 소급 적용한다.
 
-    700만 행 패널에서 돌아가므로 큰 중간 배열을 만들지 않는다.
-    교차검증과 누적곱은 **후보 행·해당 종목에만** 돌린다.
+    700만 행 패널에서 돌아가므로 전체 길이 중간 배열을 만들지 않는다.
+    종목별 슬라이스에서만 계산하고, **실제로 이벤트가 있는 종목의 위치만** 돌려준다.
     """
     def _b():
         if beat is not None:
@@ -141,77 +143,63 @@ def adjustment_factors(df: pd.DataFrame, threshold: float = ADJUST_STOCKS_RATIO,
     if "Stocks" not in df.columns or "Code" not in df.columns or len(df) == 0:
         return None, empty
 
-    n = len(df)
     code = df["Code"]
-    # 같은 종목의 '직전 행 위치'를 한 번만 구한다 (패널은 날짜순이라 i-1 이 같은 종목이 아니다)
     groups = code.groupby(code, sort=False, observed=True).indices
     _b()
-    prev_pos = np.full(n, -1, dtype=np.int64)
-    for _c, pos in groups.items():
-        if pos.size > 1:
-            prev_pos[pos[1:]] = pos[:-1]
-    _b()
-
     stocks = pd.to_numeric(df["Stocks"], errors="coerce").to_numpy("float64")
-    have = prev_pos >= 0
-    ratio = np.ones(n, dtype="float64")
-    ps = stocks[prev_pos[have]]
-    cs = stocks[have]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio[have] = cs / ps
-    ok_prev = np.zeros(n, dtype=bool)
-    ok_prev[have] = np.isfinite(ps) & (ps > 0) & np.isfinite(cs) & (cs > 0)
-    del stocks, ps, cs
+    close = df["Close"].to_numpy() if "Close" in df.columns else None
 
     lo = 1.0 / float(threshold)
-    ev = ok_prev & np.isfinite(ratio) & ((ratio >= float(threshold)) | (ratio <= lo))
-    del ok_prev
-    cand = np.flatnonzero(ev)
-    n_candidates = int(cand.size)
-    _b()
-    if n_candidates == 0:
-        return None, {**empty, "candidates": 0}
-
-    # 교차 검증 — 후보 행에만 돌린다 (수천 건이라 사실상 공짜다)
+    parts: List[tuple] = []
+    n_candidates = 0
     skipped = 0
-    if "Close" in df.columns:
-        close = pd.to_numeric(df["Close"], errors="coerce").to_numpy("float64")
-        pc = close[prev_pos[cand]]
-        cc = close[cand]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            product = (cc / pc) * ratio[cand]
-        good = (
-            np.isfinite(product)
-            & (product >= ADJUST_CONTINUITY_LO) & (product <= ADJUST_CONTINUITY_HI)
-        )
-        skipped = int(np.count_nonzero(~good))
-        ev[cand[~good]] = False
-        cand = cand[good]
-        del close, pc, cc, product, good
-    del prev_pos
-    n_ev = int(cand.size)
-    _b()
-    if n_ev == 0:
-        return None, {**empty, "candidates": n_candidates, "skipped_not_split": skipped}
-
-    # 누적곱도 이벤트가 있는 종목에만 돌린다
-    codes_np = code.to_numpy()
-    hit_codes = pd.unique(codes_np[cand])
-    factor = np.ones(n, dtype="float64")
-    for c in hit_codes:
-        pos = groups.get(c)
-        if pos is None or pos.size == 0:
+    checked = 0
+    for _c, pos in groups.items():
+        if pos.size < 2:
             continue
-        r = np.where(ev[pos], ratio[pos], 1.0)
-        cum = np.cumprod(r)
+        checked += 1
+        if (checked & 511) == 0:
+            _b()
+        st = stocks[pos]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = st[1:] / st[:-1]
+        hit = (
+            np.isfinite(r) & (st[:-1] > 0) & (st[1:] > 0)
+            & ((r >= float(threshold)) | (r <= lo))
+        )
+        if not hit.any():
+            continue
+        n_candidates += int(hit.sum())
+
+        if close is not None:
+            cl = close[pos].astype("float64")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                product = (cl[1:] / cl[:-1]) * r
+            good = (
+                np.isfinite(product)
+                & (product >= ADJUST_CONTINUITY_LO) & (product <= ADJUST_CONTINUITY_HI)
+            )
+            skipped += int(np.count_nonzero(hit & ~good))
+            hit = hit & good
+            if not hit.any():
+                continue
+
+        full = np.ones(pos.size, dtype="float64")
+        full[1:] = np.where(hit, r, 1.0)
+        cum = np.cumprod(full)
         tail = cum[-1]
-        if not np.isfinite(tail) or tail == 0:
+        if not np.isfinite(tail) or tail <= 0:
             continue
         vals = cum / tail
-        factor[pos] = np.where(np.isfinite(vals), vals, 1.0)
+        if not np.isfinite(vals).all():
+            vals = np.where(np.isfinite(vals), vals, 1.0)
+        parts.append((pos, vals, int(hit.sum())))
     _b()
-    return factor, {
-        "events": n_ev, "symbols": int(len(hit_codes)),
+
+    if not parts:
+        return None, {**empty, "candidates": n_candidates, "skipped_not_split": skipped}
+    return parts, {
+        "events": sum(p[2] for p in parts), "symbols": len(parts),
         "candidates": n_candidates, "skipped_not_split": skipped,
     }
 
@@ -226,28 +214,62 @@ def apply_price_adjustment(df: pd.DataFrame,
     * Amount·Marcap·Stocks 는 **건드리지 않는다** (이미 금액/원본 수치다)
     * 거래정지 봉의 0 은 0 × 계수 = 0 이라 그대로 남는다
     """
-    factor, stats = adjustment_factors(df, threshold, beat)
+    parts, stats = adjustment_factors(df, threshold, beat)
     stats = {"events": 0, "symbols": 0, "candidates": 0, "skipped_not_split": 0, **stats}
-    if factor is None:
+    if not parts:
         stats["applied"] = False
         return stats
-    touched = factor != 1.0
-    for c in ("Open", "High", "Low", "Close"):
-        if c in df.columns:
-            dt_ = df[c].dtype
-            col = df[c].to_numpy("float64").copy()
-            col[touched] *= factor[touched]
-            df[c] = col.astype(dt_, copy=False)
-            del col
-            if beat is not None:
-                beat()
-    if "Volume" in df.columns:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            v = df["Volume"].to_numpy("float64") / factor
-        v[~np.isfinite(v)] = 0.0
-        df["Volume"] = v
+
+    for col, invert in (("Open", False), ("High", False), ("Low", False),
+                        ("Close", False), ("Volume", True)):
+        if col not in df.columns:
+            continue
+        arr = np.array(df[col].to_numpy(), copy=True)
+        for pos, vals, _n in parts:
+            cur = arr[pos].astype("float64")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                new = cur / vals if invert else cur * vals
+            new[~np.isfinite(new)] = 0.0
+            arr[pos] = new.astype(arr.dtype, copy=False)
+        df[col] = arr
+        del arr
+        if beat is not None:
+            beat()
     stats["applied"] = True
     return stats
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """임시 파일에 쓰고 ``os.replace`` 로 교체한다 (같은 파일시스템이라 원자적이다)."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        os.close(fd)
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _is_zero_padded(pf) -> bool:
@@ -356,9 +378,15 @@ class MarcapStore:
             if status_file is not None
             else self.root.parent / "data_status.json"
         )
-        self._years: Dict[int, pd.DataFrame] = {}
+        self._years: Dict[tuple, pd.DataFrame] = {}
         self._names: Optional[Dict[str, str]] = None
         self._bounds: Optional[tuple] = None
+        # 서버는 이 인스턴스를 **여러 스레드가 공유한다** (백테스트 워커 + 차트 요청).
+        # 캐시 dict 를 보호하지 않으면 한쪽이 evict 하는 중에 다른 쪽이 참조해 깨진다.
+        self._lock = threading.RLock()
+        #: 종목 캐시 파일 생성 경쟁을 막는 종목별 락
+        self._sym_locks: Dict[str, threading.Lock] = {}
+        self._sym_locks_guard = threading.Lock()
 
     # ---------------------------------------------------------------- 파일 탐색
     def _files(self) -> Dict[int, Path]:
@@ -421,12 +449,13 @@ class MarcapStore:
         if path is None:
             raise DataUnavailable(f"{year}년 marcap 파일이 없습니다: {self.data_dir}")
         ckey = (int(year), tuple(sorted(columns)) if columns else None)
-        cached = self._years.get(ckey)
-        if cached is None and columns:
-            full = self._years.get((int(year), None))
-            if full is not None:
-                keep = [c for c in full.columns if c in set(columns) | {"Date", "Code"}]
-                cached = full[keep]
+        with self._lock:
+            cached = self._years.get(ckey)
+            if cached is None and columns:
+                full = self._years.get((int(year), None))
+                if full is not None:
+                    keep = [c for c in full.columns if c in set(columns) | {"Date", "Code"}]
+                    cached = full[keep]
         if cached is not None:
             if on_chunk is not None:
                 on_chunk(1.0)
@@ -441,9 +470,12 @@ class MarcapStore:
             raise DataUnavailable(f"{path} 를 읽을 수 없습니다: {e}") from e
         df = self._normalize(df, on_chunk)
         if cache:
-            self._years[ckey] = df
-            while len(self._years) > self.MAX_CACHED_YEARS:
-                self._years.pop(next(iter(self._years)))
+            with self._lock:
+                self._years[ckey] = df
+                while len(self._years) > self.MAX_CACHED_YEARS:
+                    # 다른 스레드가 참조 중일 수 있으니 dict 에서 빼기만 한다.
+                    # 참조가 남아 있으면 GC 가 알아서 살려 둔다.
+                    self._years.pop(next(iter(self._years)))
         return df
 
     def _read_parquet(self, path: Path,
@@ -481,11 +513,10 @@ class MarcapStore:
             return pd.read_parquet(path, columns=cols)
         tbl = pa.Table.from_batches(batches)
         batches.clear()
-        # self_destruct: 변환하면서 arrow 버퍼를 바로 반납한다 (같은 데이터를 두 벌 들지 않는다)
-        try:
-            return tbl.to_pandas(self_destruct=True)
-        except TypeError:  # pragma: no cover - 구버전 pyarrow
-            return tbl.to_pandas()
+        # self_destruct=True 는 변환 도중 arrow 버퍼를 반납해 메모리를 아끼지만,
+        # 그 테이블을 다른 곳에서 참조하고 있으면 use-after-free = 세그폴트다.
+        # 이 스토어는 여러 스레드가 공유하므로 **안전을 택한다** (메모리 이득은 5% 미만이었다).
+        return tbl.to_pandas()
 
     @staticmethod
     def _normalize(df: pd.DataFrame,
@@ -531,8 +562,9 @@ class MarcapStore:
 
     def unload(self) -> None:
         """메모리 캐시 비우기."""
-        self._years.clear()
-        self._names = None
+        with self._lock:
+            self._years.clear()
+            self._names = None
 
     # ---------------------------------------------------------------- 날짜 정보
     def _year_bounds(self) -> tuple:
@@ -783,11 +815,18 @@ class MarcapStore:
         if use_cache:
             frame = self._symbol_cache_get(code, cols, years, adj)
         if frame is None:
-            frame = self._read_symbol(code, cols, years)
-            if frame is not None and len(frame) and adj:
-                self.last_adjustment = apply_price_adjustment(frame, self.adjust_threshold)
-            if use_cache and frame is not None and len(frame):
-                self._symbol_cache_put(code, frame, cols, years, adj)
+            # 같은 종목을 여러 스레드가 동시에 처음 조회하면 캐시 파일을 동시에 만들게 된다.
+            # 종목별로 직렬화하고, 락을 잡은 뒤 한 번 더 캐시를 확인한다(이중 검사).
+            with self._symbol_lock(code, adj):
+                if use_cache:
+                    frame = self._symbol_cache_get(code, cols, years, adj)
+                if frame is None:
+                    frame = self._read_symbol(code, cols, years)
+                    if frame is not None and len(frame) and adj:
+                        self.last_adjustment = apply_price_adjustment(
+                            frame, self.adjust_threshold)
+                    if use_cache and frame is not None and len(frame):
+                        self._symbol_cache_put(code, frame, cols, years, adj)
 
         if frame is None or not len(frame):
             raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
@@ -804,7 +843,9 @@ class MarcapStore:
     def _year_from_memory(self, year: int, cols: Sequence[str] | None) -> Optional[pd.DataFrame]:
         """이미 메모리에 올라온 연도 프레임 중 필요한 컬럼을 다 가진 것."""
         need = set(cols or ())
-        for (y, _ck), df in self._years.items():
+        with self._lock:
+            snapshot = list(self._years.items())     # 순회 중 evict 되면 터진다
+        for (y, _ck), df in snapshot:
             if y != int(year):
                 continue
             if not need or need <= set(df.columns):
@@ -855,7 +896,10 @@ class MarcapStore:
             # 앞자리 0 을 떼고 저장한 옛 파일에서만 변형 목록을 쓴다.
             key = variants[0] if _is_zero_padded(pf) else list(variants)
             flt = [("Code", "==", key)] if isinstance(key, str) else [("Code", "in", key)]
-            tb = pq.read_table(path, columns=use, filters=flt)
+            # use_threads: arrow 내부 스레드. 서버 워커 스레드와 중첩되지만 arrow 스레드풀은
+            # 멀티스레드 호출을 지원한다. 끄면 차트 첫 조회가 1.2초 -> 3.1초로 느려진다.
+            # 크래시가 재발하면 여기를 False 로 바꾸는 게 다음 수단이다.
+            tb = pq.read_table(path, columns=use, filters=flt, use_threads=ARROW_USE_THREADS)
         except Exception:  # pragma: no cover - 구버전 pyarrow / 이상한 파일은 통째로 읽는다
             df = pd.read_parquet(path, columns=list(cols) if cols else None)
             return df[df["Code"].astype(str).isin(list(variants))]
@@ -867,6 +911,16 @@ class MarcapStore:
     @property
     def symbol_cache_dir(self) -> Path:
         return self.cache_dir / SYMBOL_CACHE_DIRNAME
+
+    def _symbol_lock(self, code: str, adjusted: bool) -> threading.Lock:
+        """같은 종목 캐시를 두 스레드가 동시에 만들지 못하게 한다."""
+        key = f"{code}:{int(bool(adjusted))}"
+        with self._sym_locks_guard:
+            lk = self._sym_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._sym_locks[key] = lk
+            return lk
 
     def _symbol_cache_paths(self, code: str, adjusted: bool = True) -> tuple:
         """조정/미조정 캐시는 **절대 섞이면 안 된다.** 파일명으로 분리한다."""
@@ -938,7 +992,8 @@ class MarcapStore:
         if not parts:
             return None
         merged = self._normalize(pd.concat(parts, ignore_index=True))
-        self._symbol_cache_put(code, merged, cols, sorted(covered | set(refresh)), adjusted)
+        with self._symbol_lock(code, adjusted):
+            self._symbol_cache_put(code, merged, cols, sorted(covered | set(refresh)), adjusted)
         return merged
 
     def _symbol_cache_put(self, code: str, df: pd.DataFrame,
@@ -948,8 +1003,12 @@ class MarcapStore:
         pq_path, meta_path = self._symbol_cache_paths(code, adjusted)
         try:
             self.symbol_cache_dir.mkdir(parents=True, exist_ok=True)
-            df.reset_index(drop=True).to_parquet(pq_path, index=False)
-            meta_path.write_text(
+            # **원자적 쓰기.** 쓰는 도중의 파일을 다른 스레드가 읽으면 parquet 파서가
+            # 깨진 바이트를 만나 C 레이어에서 죽는다(트레이스백 없는 세그폴트).
+            # 임시 파일에 다 쓴 뒤 os.replace 로 갈아끼운다.
+            _atomic_write_parquet(df.reset_index(drop=True), pq_path)
+            _atomic_write_text(
+                meta_path,
                 json.dumps(
                     {
                         "code": code,
@@ -964,7 +1023,6 @@ class MarcapStore:
                     },
                     ensure_ascii=False,
                 ),
-                encoding="utf-8",
             )
         except Exception:  # pragma: no cover - 캐시 실패는 치명적이지 않다
             return
@@ -973,7 +1031,8 @@ class MarcapStore:
     def _trim_symbol_cache(self, max_bytes: int = SYMBOL_CACHE_MAX_BYTES) -> None:
         """폴더 크기 상한을 넘으면 오래된 것부터 지운다."""
         d = self.symbol_cache_dir
-        try:
+        with self._lock:
+          try:
             items = []
             total = 0
             for p in d.glob("*.parquet"):
@@ -984,12 +1043,11 @@ class MarcapStore:
                 return
             for _mt, size, p in sorted(items):
                 p.unlink(missing_ok=True)
-                p.with_suffix("").with_suffix(".meta.json").unlink(missing_ok=True)
                 (d / f"{p.stem}.meta.json").unlink(missing_ok=True)
                 total -= size
                 if total <= max_bytes:
                     break
-        except OSError:  # pragma: no cover
+          except OSError:  # pragma: no cover
             return
 
     def clear_symbol_cache(self) -> int:

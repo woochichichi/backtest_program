@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from engine.dart import DartStore  # noqa: E402
+from engine.data import HALTED_COLUMN, halted_mask  # noqa: E402
 from engine.errors import DataUnavailable  # noqa: E402
 
 EOK = 100_000_000.0
@@ -179,6 +180,10 @@ class FakeStore:
     def __init__(self, frames: Sequence[pd.DataFrame]):
         df = pd.concat(list(frames), ignore_index=True)
         df["Date"] = pd.to_datetime(df["Date"])
+        # 실제 MarcapStore 처럼 거래정지 파생 컬럼을 만들어 둔다
+        m = halted_mask(df)
+        if m is not None:
+            df[HALTED_COLUMN] = m
         self._df = df.sort_values(["Date", "Code"], kind="stable").reset_index(drop=True)
         self.panel_calls: List[tuple] = []
 
@@ -215,6 +220,8 @@ class FakeStore:
             raise DataUnavailable(f"{start} ~ {end} 구간에 데이터가 없습니다")
         if columns is not None:
             keep = list(dict.fromkeys(["Date", "Code", *columns]))
+            if HALTED_COLUMN in out.columns and HALTED_COLUMN not in keep:
+                keep.append(HALTED_COLUMN)
             out = out[[c for c in keep if c in out.columns]]
         return out.reset_index(drop=True)
 
