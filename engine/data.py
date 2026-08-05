@@ -54,7 +54,7 @@ _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 #: ``bars()`` 기본 컬럼. 차트/UI 가 실제로 쓰는 것만 읽는다 (읽기 비용이 컬럼 수에 비례한다).
 #: 더 필요하면 ``columns=`` 로 지정하거나 ``columns="all"`` 을 쓴다.
 BARS_DEFAULT_COLUMNS = [
-    "Date", "Code", "Name", "Open", "High", "Low", "Close", "Volume", "Amount", "Marcap",
+    "Date", "Code", "Name", "Open", "High", "Low", "Close", "Volume", "Amount",
 ]
 
 #: 종목별 캐시 폴더 (``cache/sym/<code>.parquet``)
@@ -65,6 +65,24 @@ SYMBOL_CACHE_MAX_BYTES = 200 * 1024 * 1024
 
 #: 이 개수 이하의 연도만 바뀌었으면 그 연도만 다시 읽어 캐시를 이어붙인다(증분 갱신).
 SYMBOL_CACHE_INCREMENTAL_MAX_YEARS = 3
+
+
+def _is_zero_padded(pf) -> bool:
+    """이 parquet 의 ``Code`` 가 6자리로 0 채워 저장돼 있는가 (푸터 통계만 본다)."""
+    try:
+        rg = pf.metadata.row_group(0)
+        for i in range(rg.num_columns):
+            col = rg.column(i)
+            if col.path_in_schema != "Code":
+                continue
+            st = col.statistics
+            if st is None or not st.has_min_max:
+                return False
+            lo, hi = str(st.min), str(st.max)
+            return len(lo) == 6 and len(hi) == 6
+    except Exception:  # pragma: no cover - 통계가 없으면 안전한 쪽으로
+        return False
+    return False
 
 
 def code_variants(code: str) -> List[str]:
@@ -537,12 +555,11 @@ class MarcapStore:
 
         frame = None
         if use_cache:
-            frame = self._symbol_cache_get(code, cols)
+            frame = self._symbol_cache_get(code, cols, years)
         if frame is None:
             frame = self._read_symbol(code, cols, years)
-            # 전체 히스토리를 읽은 경우에만 캐시한다 (부분 구간을 캐시하면 다음 조회가 틀린다)
-            if use_cache and whole and frame is not None and len(frame):
-                self._symbol_cache_put(code, frame, cols)
+            if use_cache and frame is not None and len(frame):
+                self._symbol_cache_put(code, frame, cols, years)
 
         if frame is None or not len(frame):
             raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
@@ -602,7 +619,11 @@ class MarcapStore:
             pf = pq.ParquetFile(path)
             have = set(pf.schema_arrow.names)
             use = [c for c in cols if c in have] if cols else None
-            tb = pq.read_table(path, columns=use, filters=[("Code", "in", list(variants))])
+            # 그 파일이 6자리로 저장돼 있으면 == 하나로 끝난다 (in 보다 눈에 띄게 빠르다).
+            # 앞자리 0 을 떼고 저장한 옛 파일에서만 변형 목록을 쓴다.
+            key = variants[0] if _is_zero_padded(pf) else list(variants)
+            flt = [("Code", "==", key)] if isinstance(key, str) else [("Code", "in", key)]
+            tb = pq.read_table(path, columns=use, filters=flt)
         except Exception:  # pragma: no cover - 구버전 pyarrow / 이상한 파일은 통째로 읽는다
             df = pd.read_parquet(path, columns=list(cols) if cols else None)
             return df[df["Code"].astype(str).isin(list(variants))]
@@ -629,8 +650,13 @@ class MarcapStore:
                 continue
         return out
 
-    def _symbol_cache_get(self, code: str, cols: Sequence[str] | None) -> Optional[pd.DataFrame]:
-        """유효한 종목 캐시를 돌려준다. 일부 연도만 바뀌었으면 그 연도만 다시 읽어 잇는다."""
+    def _symbol_cache_get(self, code: str, cols: Sequence[str] | None,
+                          want_years: Sequence[int]) -> Optional[pd.DataFrame]:
+        """유효한 종목 캐시를 돌려준다.
+
+        * 요청 연도가 캐시가 담고 있는 연도에 **없으면 그 연도만** 읽어 이어붙인다(점진 로딩)
+        * 원본 파일이 갱신된 연도는 그 연도만 다시 읽는다(증분 갱신)
+        """
         pq_path, meta_path = self._symbol_cache_paths(code)
         if not (pq_path.is_file() and meta_path.is_file()):
             return None
@@ -658,23 +684,28 @@ class MarcapStore:
         except Exception:  # pragma: no cover - 깨진 캐시
             return None
 
-        if not stale:
+        covered = {int(y) for y in (meta.get("years") or [])}
+        missing = sorted({int(y) for y in want_years} - covered)
+        refresh = sorted(set(stale) | set(missing))
+        if not refresh:
             return df
-        if len(stale) > SYMBOL_CACHE_INCREMENTAL_MAX_YEARS:
-            return None                       # 너무 많이 바뀌었다 → 전체 재생성
+        if len(refresh) > SYMBOL_CACHE_INCREMENTAL_MAX_YEARS and len(missing) == 0:
+            return None                       # 원본이 많이 바뀌었다 → 전체 재생성
 
-        # 증분 갱신: 바뀐 연도의 행만 버리고 그 연도만 다시 읽어 붙인다
-        keep = df[~df["Date"].dt.year.isin(stale)]
-        fresh = self._read_symbol(code, cols, [y for y in stale if y in {int(k) for k in cur}])
+        # 바뀐 연도의 행은 버리고, 부족한/바뀐 연도만 읽어 이어붙인다
+        keep = df[~df["Date"].dt.year.isin(refresh)]
+        known = {int(k) for k in cur}
+        fresh = self._read_symbol(code, cols, [y for y in refresh if y in known])
         parts = [x for x in (keep, fresh) if x is not None and len(x)]
         if not parts:
             return None
         merged = self._normalize(pd.concat(parts, ignore_index=True))
-        self._symbol_cache_put(code, merged, cols)
+        self._symbol_cache_put(code, merged, cols, sorted(covered | set(refresh)))
         return merged
 
     def _symbol_cache_put(self, code: str, df: pd.DataFrame,
-                          cols: Sequence[str] | None) -> None:
+                          cols: Sequence[str] | None,
+                          years: Sequence[int] = ()) -> None:
         pq_path, meta_path = self._symbol_cache_paths(code)
         try:
             self.symbol_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -684,6 +715,7 @@ class MarcapStore:
                     {
                         "code": code,
                         "columns": list(cols) if cols is not None else None,
+                        "years": sorted(int(y) for y in years),
                         "rows": int(len(df)),
                         "first": str(df["Date"].min().date()) if len(df) else None,
                         "last": str(df["Date"].max().date()) if len(df) else None,
