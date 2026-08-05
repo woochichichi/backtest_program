@@ -513,6 +513,107 @@ def _cheap_prefilter(when: Any, panel: pd.DataFrame, params: Mapping):
     return m.fillna(False)
 
 
+def _isna(v) -> bool:
+    if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):  # pragma: no cover
+        return False
+
+
+def _judge_financials(code: str, date, row, dart, filters: Mapping,
+                      prof_cache: dict) -> str:
+    """한 종목의 재무 조건 판정. ``"pass"`` / ``"fail"`` / ``"unknown"``.
+
+    * 값을 알고 있는데 조건을 못 맞추면 **fail** (모름보다 우선한다)
+    * 필요한 값을 모르면 **unknown** — 처리 방법은 ``on_missing`` 이 정한다
+    """
+    unknown = row is None
+
+    debt_max = filters.get("debt_ratio_max_pct")
+    if debt_max is not None:
+        v = None if row is None else row.get("debt_ratio_pct")
+        if _isna(v):
+            unknown = True
+        elif not (float(v) < float(debt_max)):
+            return "fail"
+
+    cur_min = filters.get("current_ratio_min_pct")
+    if cur_min is not None:
+        v = None if row is None else row.get("current_ratio_pct")
+        if _isna(v):
+            unknown = True
+        elif not (float(v) > float(cur_min)):
+            return "fail"
+
+    prof_min = filters.get("profitable_quarters_min")
+    if prof_min is not None:
+        key = (code, date)
+        if key in prof_cache:
+            n = prof_cache[key]
+        else:
+            try:
+                n = dart.consecutive_profit_quarters(code, date)
+            except Exception:  # pragma: no cover
+                n = None
+            prof_cache[key] = n
+        if n is None:
+            unknown = True
+        elif int(n) < int(prof_min):
+            return "fail"
+
+    return "unknown" if unknown else "pass"
+
+
+def _apply_financial_filters(events: pd.DataFrame, dart, filters: Mapping,
+                             on_missing: str, stats: dict, rep) -> pd.DataFrame:
+    """기준일 시점의 재무로 종목을 거른다 (ARCHITECTURE-v2 후속 · DART 연동).
+
+    **판정일은 그 이벤트의 날짜다.** ``dart.as_of_panel(codes, date)`` 만 쓰므로
+    그날 이미 공시된 재무만 본다 — 룩어헤드가 원천적으로 불가능하다.
+    날짜마다 패널을 한 번씩만 뽑아 그날의 모든 종목이 재사용한다.
+    """
+    if events.empty or not filters:
+        return events
+
+    prof_cache: dict = {}
+    keep_idx: List = []
+    evaluated: set = set()
+    missing: set = set()
+
+    groups = list(events.groupby("Date", sort=True, observed=True))
+    total = max(len(groups), 1)
+    for j, (date, grp) in enumerate(groups):
+        if (j & 7) == 0:
+            rep.tick(19 + 1.0 * j / total,
+                     f"재무 조건 확인 중 ({j:,}/{total:,}일)", PHASE_SCAN)
+        codes_here = [str(c) for c in dict.fromkeys(grp["Code"])]
+        try:
+            fund = dart.as_of_panel(codes_here, date)
+        except Exception:  # pragma: no cover - 재무 조회 실패는 '모름' 으로 본다
+            fund = None
+        lookup = {}
+        if fund is not None and len(fund):
+            lookup = {str(k): v for k, v in fund.to_dict("index").items()}
+
+        for idx, code in zip(grp.index, grp["Code"]):
+            code = str(code)
+            evaluated.add(code)
+            verdict = _judge_financials(code, date, lookup.get(code), dart, filters, prof_cache)
+            if verdict == "pass":
+                keep_idx.append(idx)
+            elif verdict == "unknown":
+                missing.add(code)
+                if on_missing == "include":
+                    keep_idx.append(idx)
+
+    n_eval = len(evaluated)
+    stats["missing_financials"] = len(missing)
+    stats["missing_financials_pct"] = _r(len(missing) / n_eval * 100.0) if n_eval else 0.0
+    return events.loc[keep_idx]
+
+
 def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
                    aliases: Mapping | None, rep) -> pd.DataFrame:
     """``reference_day.rule = "custom"`` — when 조건식으로 기준일을 찾는다."""
@@ -756,6 +857,10 @@ def run_backtest(
     should_cancel : callable | None
         ``True`` 를 돌려주면 ``BacktestCancelled`` 를 던진다. 최소 1초에 한 번 확인한다.
     """
+    # 하위 호환: 예전 시그니처 run_backtest(strategy, store, progress) 로 위치 인자를 넘긴 경우
+    if dart is not None and progress is None and callable(dart) and not hasattr(dart, "available"):
+        dart, progress = None, dart
+
     t0 = time.perf_counter()
     run_id = "r_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     rep = _Reporter(progress, should_cancel)
@@ -864,6 +969,7 @@ def run_backtest(
             "notes": _assumption_notes(
                 requested_resolution, fill_model, same_day_exit, slippage, fee,
                 ordered_exits, stats, ignored_filters,
+                bool(dart_ok and financial_filters), on_missing,
             ),
             "stats": dict(stats),
             "ignored_filters": [
@@ -971,11 +1077,28 @@ def run_backtest(
     if eligible is not None and not events.empty:
         events = events[events["Code"].isin(eligible)]
         rep.check(force=True)
-        if events.empty:
-            return _empty_result(
-                run_id, t0, warnings, sig, calendar, initial_capital, start, end,
-                "기준일 조건을 만족하는 종목이 없습니다.", make_assumptions(),
+
+    if dart_ok and financial_filters and not events.empty:
+        before = int(events["Code"].nunique())
+        events = _apply_financial_filters(
+            events, dart, financial_filters, on_missing, stats, rep
+        )
+        after = int(events["Code"].nunique()) if not events.empty else 0
+        sig.add(calendar[0], "SCAN", None,
+                f"재무 조건 적용: {before:,}종목 → {after:,}종목 "
+                f"(재무 모름 {stats['missing_financials']:,}종목, on_missing={on_missing})")
+        if on_missing == "exclude" and stats["missing_financials"]:
+            warnings.append(
+                f"재무를 알 수 없는 {stats['missing_financials']:,}개 종목을 제외했습니다. "
+                "상장폐지 종목이 여기 포함되어 결과가 실제보다 좋게 나올 수 있습니다."
             )
+        rep.check(force=True)
+
+    if events.empty:
+        return _empty_result(
+            run_id, t0, warnings, sig, calendar, initial_capital, start, end,
+            "기준일 조건을 만족하는 종목이 없습니다.", make_assumptions(),
+        )
     cand_codes = pd.Index(events["Code"].unique())
     report(20, f"후보 {len(cand_codes):,}종목")
 
@@ -1388,7 +1511,8 @@ _SAME_DAY_NOTES = {
 
 def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit: str,
                       slippage: float, fee: float, ordered_exits: Sequence[Mapping],
-                      stats: Mapping, ignored_filters: Sequence[Mapping] = ()) -> List[str]:
+                      stats: Mapping, ignored_filters: Sequence[Mapping] = (),
+                      dart_active: bool = False, on_missing: str = DEFAULT_ON_MISSING) -> List[str]:
     """사용자에게 그대로 보여줄 실행 가정 문장들."""
     notes = [
         "일봉 데이터만 사용했습니다. 하루 안에서 저가와 고가 중 무엇이 먼저였는지는 알 수 없습니다.",
@@ -1422,6 +1546,27 @@ def _assumption_notes(requested_resolution: str, fill_model: str, same_day_exit:
             "이 규칙에 막혀 다음 거래일로 넘어갔습니다. "
             "same_day_exit=always 로 두면 이 {0:,}건이 그대로 수익에 잡힙니다.".format(blocked)
         )
+    if dart_active:
+        notes.append(
+            "재무 조건은 **그 시점에 이미 공시된 재무제표만** 사용했습니다 "
+            "(기준일 당일 기준 as-of 조회). 분기 재무는 분기 종료 후 45~90일 뒤에 공시되므로, "
+            "공시 전에는 직전 분기 값을 씁니다."
+        )
+        miss = int(stats.get("missing_financials") or 0)
+        pct = stats.get("missing_financials_pct") or 0.0
+        if on_missing == "exclude":
+            if miss:
+                notes.append(
+                    f"재무를 알 수 없는 {miss:,}개 종목({pct}%)을 제외했습니다. "
+                    "DART 기업목록은 현재 상장사만 담고 있어 상장폐지 종목이 여기 포함됩니다. "
+                    "즉 망한 회사만 골라 빠지므로 결과가 실제보다 좋게 나올 수 있습니다(생존 편향)."
+                )
+        else:
+            notes.append(
+                f"재무를 알 수 없는 종목은 {miss:,}개({pct}%)였고, 이 종목들은 "
+                "재무 조건을 적용하지 않고 통과시켰습니다 (on_missing=include). "
+                "상장폐지 종목을 골라서 빼면 생존 편향이 생기기 때문입니다."
+            )
     for ig in ignored_filters:
         notes.append(ig["message"])
     notes.append("미청산 포지션은 백테스트 종료일 종가로 강제 청산했습니다 (exit_reason=기간종료).")

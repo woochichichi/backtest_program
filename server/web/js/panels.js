@@ -337,7 +337,7 @@ export function renderByStock(rows, ctx = {}) {
   }
   tb.innerHTML = rows.slice().sort((a, b) => b.pnl - a.pnl).slice(0, 12).map((r) => `
     <tr data-code="${esc(r.code)}">
-      <td class="l">${esc(r.name || r.code)}</td>
+      <td class="l">${symLink(r.code, r.name || r.code)}</td>
       <td>${r.trades}</td>
       <td>${Number.isFinite(r.win_rate) ? Math.round(r.win_rate) + '%' : '—'}</td>
       <td class="${r.pnl >= 0 ? 'pos' : 'neg'}">${r.pnl >= 0 ? '+' : ''}${fmt(r.pnl)}</td>
@@ -484,8 +484,9 @@ export function renderSignals(signals, ctx = {}) {
   host.innerHTML = signals.map((s) => {
     const lv = String(s.level || 'INFO').toUpperCase();
     const cls = ['MATCH', 'FILL', 'WARN', 'ERROR'].includes(lv) ? ` lv-${lv}` : '';
+    const body = linkifyCodes(esc(s.message || ''), ctx.nameOf);
     return `<span class="c">${esc(s.ts || '')}</span>  <span class="k${cls}">[${esc(lv.padEnd(5))}]</span>  ` +
-      (s.code ? `<span class="n">${esc(s.code)}</span> ` : '') + esc(s.message || '');
+      (s.code ? symLink(s.code, s.code, { cls: 'mono' }) + ' ' : '') + body;
   }).join('\n');
 }
 
@@ -1396,4 +1397,50 @@ export function renderRunProgress(st) {
      </div>
      <div class="run-bar"><i class="${pct === null ? 'indet' : ''}" style="${pct === null ? '' : `width:${pct}%`}"></i></div>
      ${msg ? `<div class="run-msg">${esc(msg)}</div>` : ''}`;
+}
+
+
+/* ============================================================
+   21. 종목 링크 — 화면 어디서든 종목을 누르면 차트가 따라온다
+   ============================================================ */
+
+/**
+ * 클릭 가능한 종목 이름.
+ * 모든 진입점이 같은 마크업을 쓰고, main.js 가 위임 처리로 selectSymbol 을 부른다.
+ */
+export function symLink(code, name, opts = {}) {
+  if (!code) return esc(name || '');
+  const label = name || code;
+  return `<button type="button" class="symlink${opts.cls ? ' ' + opts.cls : ''}" data-symlink data-code="${esc(code)}"` +
+    ` data-name="${esc(name || '')}" title="${esc(label)} (${esc(code)}) 차트 보기">${esc(label)}` +
+    (opts.showCode ? `<span class="symlink-cd">${esc(code)}</span>` : '') + '</button>';
+}
+
+/** 로그 문자열 안의 6자리 종목코드를 링크로 바꾼다 (이미 escape 된 문자열에 적용) */
+export function linkifyCodes(escaped, nameOf) {
+  return String(escaped).replace(/(^|[^0-9A-Za-z])(\d{6})(?![0-9])/g, (m, pre, code) => {
+    const nm = nameOf ? (nameOf(code) || '') : '';
+    return pre + `<button type="button" class="symlink mono" data-symlink data-code="${code}" data-name="${esc(nm)}" title="${esc(nm || code)} 차트 보기">${code}</button>`;
+  });
+}
+
+/** 현재 차트에 떠 있는 종목을 화면 전체에서 강조한다 */
+export function highlightSymbol(code) {
+  for (const el of document.querySelectorAll('[data-symlink]')) {
+    el.classList.toggle('sym-on', !!code && el.dataset.code === code);
+  }
+  for (const tr of document.querySelectorAll('#byStock tr[data-code]')) {
+    tr.classList.toggle('sel', !!code && tr.dataset.code === code);
+  }
+}
+
+/** 종목 링크 클릭/키보드를 한 곳에서 위임 처리 */
+export function bindSymbolLinks(onPick) {
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-symlink]');
+    if (!b) return;
+    e.preventDefault();
+    e.stopPropagation();          // 거래 내역 행 클릭과 중복 실행되지 않게
+    onPick(b.dataset.code, { name: b.dataset.name });
+  });
 }

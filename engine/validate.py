@@ -50,6 +50,17 @@ SUPPORTED_FILTERS = {
     "price_min", "price_max",
     "amount_min_eok", "volume_min",
 }
+
+#: DART 재무 데이터가 연결됐을 때만 판정되는 키
+FINANCIAL_FILTERS = {
+    "debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min",
+}
+
+#: universe.filters.on_missing — 재무를 알 수 없는 종목 처리
+_ON_MISSING = {"include", "exclude"}
+
+#: params[].requires — 이 파라미터가 동작하려면 필요한 외부 데이터
+_PARAM_REQUIRES = {"dart"}
 _POS_FIELDS = {
     "avg_price", "qty", "pnl_pct", "pnl", "hold_days", "cost", "peak_price", "entry_price",
 }
@@ -355,8 +366,18 @@ def _check_universe(obj: Mapping, err: _Errors):
                                  allow_position=False, allow_entry=False)
 
     filters = u.get("filters")
-    if filters is not None and not isinstance(filters, Mapping):
-        err.add("universe.filters", "객체여야 합니다")
+    if filters is not None:
+        if not isinstance(filters, Mapping):
+            err.add("universe.filters", "객체여야 합니다")
+        else:
+            if "on_missing" in filters:
+                _enum(filters["on_missing"], _ON_MISSING,
+                      "universe.filters.on_missing", err, "on_missing")
+            for k, v in filters.items():
+                if k in ("on_missing", "comment") or str(k).startswith("_"):
+                    continue
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                    err.add(f"universe.filters.{k}", f"숫자여야 합니다 (현재 {type(v).__name__})")
 
     cond = u.get("condition", "none")
     _enum(cond, _CONDITIONS, "universe.condition", err, "condition")
@@ -571,6 +592,8 @@ def _check_params(obj: Mapping, err: _Errors):
             err.add(f"{path}.default", "필수 항목이 없습니다 (초기화 버튼이 되돌릴 값)")
         if "available" in p and not isinstance(p["available"], bool):
             err.add(f"{path}.available", "불리언이어야 합니다")
+        if "requires" in p and p["requires"] is not None:
+            _enum(p["requires"], _PARAM_REQUIRES, f"{path}.requires", err, "requires")
         if p.get("available") is False and not p.get("unavailable_reason"):
             err.add(f"{path}.unavailable_reason",
                     "available:false 항목은 사용자에게 보여줄 이유가 필요합니다")

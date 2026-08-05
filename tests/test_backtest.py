@@ -27,11 +27,12 @@ RESULT_KEYS = {
 ASSUMPTION_KEYS = {
     "resolution", "requested_resolution", "fill_model", "same_day_exit",
     "slippage_pct", "fee_pct", "exit_priority", "notes", "stats",
-    "ignored_filters",
+    "ignored_filters", "dart",
 }
+DART_KEYS = {"available", "as_of", "coverage_pct", "on_missing", "last_fetch"}
 ASSUMPTION_STAT_KEYS = {
     "same_day_entry_exit", "same_day_entry_exit_pct", "ambiguous_bars",
-    "same_day_profit_exits_blocked",
+    "same_day_profit_exits_blocked", "missing_financials", "missing_financials_pct",
 }
 METRIC_KEYS = {
     "total_return_pct", "cagr_pct", "mdd_pct", "sharpe", "win_rate_pct",
@@ -201,6 +202,10 @@ def test_result_matches_api_schema(strategy1, tp_store):
     assert a["exit_priority"] == ["SL", "TP"]
     assert isinstance(a["notes"], list) and all(isinstance(n, str) and n for n in a["notes"])
     assert set(a["stats"]) == ASSUMPTION_STAT_KEYS
+    assert set(a["dart"]) == DART_KEYS
+    assert a["dart"]["available"] is False and a["dart"]["as_of"] is False
+    assert a["dart"]["coverage_pct"] is None
+    assert a["dart"]["on_missing"] == "include"
     assert all(isinstance(v, (int, float)) for v in a["stats"].values())
     assert set(res["metrics"]) == METRIC_KEYS
     assert set(res["metrics"]["period"]) == {"start", "end", "years"}
@@ -1124,3 +1129,285 @@ def test_close_entry_block_is_independent_of_same_day_exit(strategy1, tp_store):
                    if not p["path"].startswith("exits[") and not p["path"].startswith("entries[1]")]
     t = run_backtest(s, tp_store)["trades"][0]
     assert t["exit_date"] > t["fills"][0]["date"]
+
+
+# ======================================================================================
+# ★ DART 재무 필터 연동
+# ======================================================================================
+
+DART_KEYS_SET = {"available", "as_of", "coverage_pct", "on_missing", "last_fetch"}
+
+FIN_FILTERS = {
+    "debt_ratio_max_pct": 200,
+    "current_ratio_min_pct": 100,
+    "profitable_quarters_min": 4,
+}
+
+
+def _with_filters(strategy1, **filters):
+    s = json.loads(json.dumps(strategy1))
+    s.setdefault("universe", {})["filters"] = dict(filters)
+    return s
+
+
+def _good(code):
+    from conftest import dart_history
+
+    return dart_history(code, debt_ratio_pct=50.0, current_ratio_pct=250.0,
+                        op_income_quarter=1000)
+
+
+def _bad_debt(code):
+    from conftest import dart_history
+
+    return dart_history(code, debt_ratio_pct=500.0, current_ratio_pct=250.0,
+                        op_income_quarter=1000)
+
+
+# ---------------------------------------------------------------- dart 없음 = 기존 동작
+
+
+def test_dart_none_preserves_existing_behaviour(strategy1, tp_store):
+    """dart 를 안 넘기면 결과가 예전과 완전히 같아야 한다."""
+    a = run_backtest(strategy1, tp_store)
+    b = run_backtest(strategy1, tp_store, dart=None)
+    assert a["trades"] == b["trades"]
+    assert a["metrics"] == b["metrics"]
+    assert a["assumptions"]["dart"] == {
+        "available": False, "as_of": False, "coverage_pct": None,
+        "on_missing": "include", "last_fetch": None,
+    }
+
+
+def test_unavailable_dart_is_same_as_none(strategy1, tp_store, make_dart):
+    s = _with_filters(strategy1, **FIN_FILTERS)
+    off = make_dart([], available=False)
+    res = run_backtest(s, tp_store, dart=off)
+    base = run_backtest(s, tp_store, dart=None)
+    assert res["trades"] == base["trades"]
+    assert res["assumptions"]["dart"]["available"] is False
+    assert {x["key"] for x in res["assumptions"]["ignored_filters"]} == set(FIN_FILTERS)
+    assert any("DART 재무 데이터가 연결되지 않아" in x["reason"]
+               for x in res["assumptions"]["ignored_filters"])
+
+
+def test_old_positional_progress_call_still_works(strategy1, tp_store):
+    """예전 시그니처 run_backtest(s, store, progress) 로 부르던 코드가 깨지면 안 된다."""
+    seen = []
+    res = run_backtest(strategy1, tp_store, lambda d, t, m: seen.append(d))
+    assert seen and res["trades"]
+    assert res["assumptions"]["dart"]["available"] is False
+
+
+# ---------------------------------------------------------------- 필터가 실제로 걸러낸다
+
+
+def test_financial_filter_screens_out(strategy1, tp_store, make_dart):
+    """부채비율이 기준을 넘는 종목은 후보에서 빠진다."""
+    base = run_backtest(strategy1, tp_store)
+    assert {t["code"] for t in base["trades"]} == {"100010"}
+
+    s = _with_filters(strategy1, **FIN_FILTERS)
+    good = run_backtest(s, tp_store, dart=make_dart(_good("100010")))
+    assert {t["code"] for t in good["trades"]} == {"100010"}
+    assert good["trades"] == base["trades"], "조건을 통과하면 결과가 그대로여야 한다"
+
+    bad = run_backtest(s, tp_store, dart=make_dart(_bad_debt("100010")))
+    assert bad["trades"] == []
+    assert bad["assumptions"]["dart"]["available"] is True
+    assert bad["assumptions"]["dart"]["as_of"] is True
+
+
+def test_each_financial_filter_alone(strategy1, tp_store, make_dart):
+    from conftest import dart_history
+
+    cases = [
+        ("debt_ratio_max_pct", dict(debt_ratio_pct=500.0, current_ratio_pct=250.0, op_income_quarter=1000)),
+        ("current_ratio_min_pct", dict(debt_ratio_pct=50.0, current_ratio_pct=10.0, op_income_quarter=1000)),
+        ("profitable_quarters_min", dict(debt_ratio_pct=50.0, current_ratio_pct=250.0, op_income_quarter=-5)),
+    ]
+    for key, fin in cases:
+        s = _with_filters(strategy1, **{key: FIN_FILTERS[key]})
+        dart = make_dart(dart_history("100010", **fin))
+        assert run_backtest(s, tp_store, dart=dart)["trades"] == [], key
+
+
+def test_financial_filters_removed_from_ignored_when_dart_on(strategy1, tp_store, make_dart):
+    s = _with_filters(strategy1, **FIN_FILTERS)
+    res = run_backtest(s, tp_store, dart=make_dart(_good("100010")))
+    assert res["assumptions"]["ignored_filters"] == []
+    assert not any("부채비율" in w for w in res["warnings"])
+    assert any("이미 공시된 재무제표만" in n for n in res["assumptions"]["notes"])
+
+
+def test_dart_block_contents(strategy1, tp_store, make_dart):
+    s = _with_filters(strategy1, **FIN_FILTERS)
+    d = run_backtest(s, tp_store, dart=make_dart(_good("100010")))["assumptions"]["dart"]
+    assert set(d) == DART_KEYS_SET
+    assert d == {"available": True, "as_of": True, "coverage_pct": 100.0,
+                 "on_missing": "include", "last_fetch": "2026-08-05 14:20:00"}
+
+
+# ---------------------------------------------------------------- ★ 룩어헤드 차단
+
+
+def test_no_lookahead_future_disclosure_is_invisible(strategy1, tp_store, dates, make_dart):
+    """공시 전 분기의 재무가 쓰이면 이 테스트가 깨진다.
+
+    기준일은 2024-10-21. 그 시점에 공시된 재무는 전부 '탈락' 값이고,
+    '통과' 값은 기준일 **이후**에 공시된다. 룩어헤드가 있으면 종목이 통과해 버린다.
+    """
+    from conftest import dart_row
+
+    ref = dates[REF_BAR]
+    assert ref.isoformat() == "2024-10-21"
+
+    rows = [
+        # 기준일 전에 공시된 것 — 부채비율 500% (탈락)
+        dart_row("100010", 2024, 2, "2024-08-14",
+                 debt_ratio_pct=500.0, current_ratio_pct=250.0, op_income_quarter=1000),
+        # 기준일 **다음날** 공시 — 부채비율 50% (통과). 기준일에는 보이면 안 된다
+        dart_row("100010", 2024, 3, "2024-10-22",
+                 debt_ratio_pct=50.0, current_ratio_pct=250.0, op_income_quarter=1000),
+    ]
+    s = _with_filters(strategy1, debt_ratio_max_pct=200)
+    res = run_backtest(s, tp_store, dart=make_dart(rows))
+    assert res["trades"] == [], "기준일 이후에 공시된 재무를 미리 본 것이다 (룩어헤드)"
+
+
+def test_same_data_disclosed_earlier_does_pass(strategy1, tp_store, dates, make_dart):
+    """위와 완전히 같은 값인데 공시일만 기준일 **전**으로 당기면 통과해야 한다.
+
+    (그래야 위 테스트가 '항상 탈락' 때문에 통과하는 게 아님이 보장된다)
+    """
+    from conftest import dart_row
+
+    rows = [
+        dart_row("100010", 2024, 2, "2024-08-14",
+                 debt_ratio_pct=500.0, current_ratio_pct=250.0, op_income_quarter=1000),
+        dart_row("100010", 2024, 3, "2024-10-20",     # 기준일 하루 전 공시
+                 debt_ratio_pct=50.0, current_ratio_pct=250.0, op_income_quarter=1000),
+    ]
+    s = _with_filters(strategy1, debt_ratio_max_pct=200)
+    res = run_backtest(s, tp_store, dart=make_dart(rows))
+    assert [t["code"] for t in res["trades"]] == ["100010"]
+
+
+def test_lookahead_guard_on_profit_quarters(strategy1, tp_store, make_dart):
+    """연속 흑자 판정도 공시 시점을 지킨다."""
+    from conftest import dart_row
+
+    rows = [
+        dart_row("100010", 2024, 1, "2024-05-15", debt_ratio_pct=50.0,
+                 current_ratio_pct=250.0, op_income_quarter=100),
+        dart_row("100010", 2024, 2, "2024-08-14", debt_ratio_pct=50.0,
+                 current_ratio_pct=250.0, op_income_quarter=100),
+        # 4분기 연속을 채워주는 값들이 기준일 뒤에 공시된다
+        dart_row("100010", 2024, 3, "2024-11-14", debt_ratio_pct=50.0,
+                 current_ratio_pct=250.0, op_income_quarter=100),
+        dart_row("100010", 2024, 4, "2025-03-20", debt_ratio_pct=50.0,
+                 current_ratio_pct=250.0, op_income_quarter=100),
+    ]
+    s = _with_filters(strategy1, profitable_quarters_min=4)
+    # 기준일(2024-10-21)에는 2024Q1·Q2 두 분기만 보인다 → 4분기 미달로 탈락
+    assert run_backtest(s, tp_store, dart=make_dart(rows))["trades"] == []
+
+
+# ---------------------------------------------------------------- on_missing
+
+
+def test_on_missing_defaults_to_include(strategy1, tp_store, make_dart):
+    """재무를 모르는 종목은 기본적으로 통과시킨다 (생존 편향 방지)."""
+    s = _with_filters(strategy1, **FIN_FILTERS)
+    assert s["universe"]["filters"].get("on_missing") is None
+    dart = make_dart(_good("999999"))          # 100010 재무가 아예 없다
+    res = run_backtest(s, tp_store, dart=dart)
+    assert [t["code"] for t in res["trades"]] == ["100010"]
+    assert res["assumptions"]["dart"]["on_missing"] == "include"
+    assert res["assumptions"]["stats"]["missing_financials"] == 1
+    assert res["assumptions"]["stats"]["missing_financials_pct"] == 100.0
+    assert res["assumptions"]["dart"]["coverage_pct"] == 0.0
+    assert any("재무를 알 수 없는 종목은" in n and "통과시켰습니다" in n
+               for n in res["assumptions"]["notes"])
+
+
+def test_on_missing_exclude_drops_and_warns(strategy1, tp_store, make_dart):
+    s = _with_filters(strategy1, on_missing="exclude", **FIN_FILTERS)
+    res = run_backtest(s, tp_store, dart=make_dart(_good("999999")))
+    assert res["trades"] == []
+    assert res["assumptions"]["dart"]["on_missing"] == "exclude"
+    assert res["assumptions"]["stats"]["missing_financials"] == 1
+    assert any("재무를 알 수 없는" in w and "생존 편향" not in w and "좋게 나올 수 있습니다" in w
+               for w in res["warnings"])
+    assert any("생존 편향" in n for n in res["assumptions"]["notes"])
+
+
+def test_definite_failure_beats_unknown(strategy1, tp_store, make_dart):
+    """값을 아는 조건에서 이미 탈락이면 on_missing=include 여도 통과시키지 않는다."""
+    from conftest import dart_history
+
+    rows = dart_history("100010", debt_ratio_pct=500.0, current_ratio_pct=None,
+                        op_income_quarter=1000)
+    s = _with_filters(strategy1, debt_ratio_max_pct=200, current_ratio_min_pct=100)
+    res = run_backtest(s, tp_store, dart=make_dart(rows))
+    assert res["trades"] == []
+
+
+def test_partial_unknown_is_missing(strategy1, tp_store, make_dart):
+    """일부 지표만 결측이어도 '재무 모름' 으로 집계된다."""
+    from conftest import dart_history
+
+    rows = dart_history("100010", debt_ratio_pct=50.0, current_ratio_pct=None,
+                        op_income_quarter=1000)
+    s = _with_filters(strategy1, debt_ratio_max_pct=200, current_ratio_min_pct=100)
+    res = run_backtest(s, tp_store, dart=make_dart(rows))
+    assert [t["code"] for t in res["trades"]] == ["100010"]      # include 라 통과
+    assert res["assumptions"]["stats"]["missing_financials"] == 1
+
+
+def test_missing_financials_count_across_codes(strategy1, dates, make_dart):
+    """여러 종목 중 몇 개가 '재무 모름' 인지 정확히 센다."""
+    from conftest import FakeStore, make_frame
+
+    frames = [make_frame("100010", "에이", "tp", dates), make_frame("100050", "비", "tp", dates)]
+    store = FakeStore(frames)
+    s = _with_filters(strategy1, debt_ratio_max_pct=200)
+    res = run_backtest(s, store, dart=make_dart(_good("100010")))   # 100050 만 모름
+    st = res["assumptions"]["stats"]
+    assert st["missing_financials"] == 1
+    assert st["missing_financials_pct"] == 50.0
+    assert res["assumptions"]["dart"]["coverage_pct"] == 50.0
+
+
+def test_on_missing_validation(strategy1):
+    s = _with_filters(strategy1, on_missing="maybe", debt_ratio_max_pct=200)
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "universe.filters.on_missing" for e in errors)
+
+
+def test_filters_must_be_numeric(strategy1):
+    s = _with_filters(strategy1, debt_ratio_max_pct="많이")
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "universe.filters.debt_ratio_max_pct" for e in errors)
+
+
+def test_params_requires_dart_validation(strategy1):
+    s = json.loads(json.dumps(strategy1))
+    s["params"][0] = dict(s["params"][0], requires="quandl")
+    ok, errors = validate_strategy(s)
+    assert not ok
+    assert any(e["path"] == "params[0].requires" for e in errors)
+
+
+def test_strategy3_declares_requires_dart():
+    doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
+    fin = {"debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min"}
+    got = {p["key"] for p in doc["params"] if p.get("requires") == "dart"}
+    assert got == fin
+    for p in doc["params"]:
+        if p["key"] in fin:
+            assert p.get("available") is not False, "파일에 available:false 를 박아두지 않는다"
+            assert p.get("unavailable_reason")
+    assert doc["universe"]["filters"]["on_missing"] == "include"

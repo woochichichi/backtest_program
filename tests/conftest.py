@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from engine.dart import DartStore  # noqa: E402
 from engine.errors import DataUnavailable  # noqa: E402
 
 EOK = 100_000_000.0
@@ -306,3 +307,80 @@ def rng_ohlcv() -> pd.DataFrame:
         },
         index=idx,
     )
+
+
+# ======================================================================================
+# FakeDartStore — 실제 DartStore 를 그대로 쓰되 데이터만 메모리로 바꾼다
+# ======================================================================================
+
+
+class FakeDartStore(DartStore):
+    """파일 대신 메모리 프레임을 쓰는 ``DartStore``.
+
+    **as-of 로직은 진짜 ``DartStore`` 것을 그대로 쓴다.** 이 클래스는 ``_files`` / ``load`` /
+    ``_last_fetch`` 만 갈아끼운다. 그래야 룩어헤드 테스트가 실제 구현을 검증한다.
+    """
+
+    def __init__(self, rows, last_fetch="2026-08-05 14:20:00", available=True):
+        super().__init__(root="__fake_dart__")
+        self._available = bool(available)
+        self._last = last_fetch
+        df = pd.DataFrame(list(rows)) if rows else pd.DataFrame(columns=["code"])
+        self._fake = DartStore._normalize(df) if len(df) else None
+        if self._fake is None:
+            self._fake = DartStore._normalize(
+                pd.DataFrame([{"code": "000000", "year": 2000, "quarter": 4}])
+            ).iloc[0:0]
+
+    # -- 데이터 소스만 교체 -------------------------------------------------------
+    def _files(self):
+        return {2025: Path("__fake__/fundamentals-2025.parquet")} if self._available else {}
+
+    def load(self):
+        if not self._available:
+            raise DataUnavailable("가짜 DART 저장소에 데이터가 없습니다")
+        return self._fake
+
+    def _last_fetch(self, files):
+        return self._last
+
+
+def dart_row(code, year, quarter, disclosed_at, *,
+             debt_ratio_pct=None, current_ratio_pct=None, op_income_quarter=None,
+             부채총계=None, 자본총계=None, 유동자산=None, 유동부채=None):
+    """``fundamentals-YYYY.parquet`` 한 줄."""
+    return {
+        "code": str(code), "corp_code": f"C{code}", "year": int(year), "quarter": int(quarter),
+        "disclosed_at": pd.Timestamp(disclosed_at), "fs_div": "CFS", "currency": "KRW",
+        "유동자산": 유동자산, "유동부채": 유동부채, "자산총계": None,
+        "부채총계": 부채총계, "자본총계": 자본총계,
+        "매출액": None, "영업이익": None, "당기순이익": None,
+        "debt_ratio_pct": debt_ratio_pct, "current_ratio_pct": current_ratio_pct,
+        "op_income_quarter": op_income_quarter,
+    }
+
+
+def dart_history(code, *, debt_ratio_pct, current_ratio_pct, op_income_quarter,
+                 years=(2024, 2025, 2026), disclose_month_day=(("Q1", 5, 15), ("Q2", 8, 14),
+                                                                ("Q3", 11, 14), ("Q4", 3, 20))):
+    """한 종목의 여러 분기 재무를 한 번에 만든다 (합성 시나리오 기간을 덮도록)."""
+    rows = []
+    for y in years:
+        for q, (label, mm, dd) in enumerate(disclose_month_day, start=1):
+            disclosed = dt.date(y + 1, mm, dd) if label == "Q4" else dt.date(y, mm, dd)
+            rows.append(dart_row(
+                code, y, q, disclosed,
+                debt_ratio_pct=debt_ratio_pct, current_ratio_pct=current_ratio_pct,
+                op_income_quarter=op_income_quarter,
+            ))
+    return rows
+
+
+@pytest.fixture
+def dart_rows():
+    return dart_row
+
+
+@pytest.fixture
+def make_dart():
+    return FakeDartStore

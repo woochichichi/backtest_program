@@ -62,7 +62,8 @@ __all__ = [
     "BatchFetcher", "fetch_quarter", "CallBudget",
     "quarterly_from_cumulative", "add_quarter_columns", "to_frame",
     "FetchState", "plan_quarters", "quarter_end", "disclosure_due_date",
-    "run_fetch", "selftest", "main",
+    "run_fetch", "selftest", "run_report", "main",
+    "REPORT_OK", "REPORT_ISSUES", "REPORT_NO_DATA",
     "REPRT_CODE_BY_QUARTER", "QUARTER_BY_REPRT_CODE",
     "AMOUNT_COLUMNS", "OUTPUT_COLUMNS", "DAILY_CALL_LIMIT",
 ]

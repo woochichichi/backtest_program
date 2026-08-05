@@ -892,3 +892,365 @@ def test_금액_단위는_원(tmp_path):
     assert got is not None
     assert got["부채총계"] == 150 * EOK
     assert got["debt_ratio_pct"] == pytest.approx(42.86)
+
+
+# ======================================================================================
+# 13. 진단 리포트 (--report)
+# ======================================================================================
+
+DISCLOSE_DAY = {1: (0, 5, 15), 2: (0, 8, 14), 3: (0, 11, 14), 4: (1, 3, 11)}
+
+
+def _disclosed_for(year: int, quarter: int) -> str:
+    add, m, d = DISCLOSE_DAY[quarter]
+    return f"{year + add:04d}-{m:02d}-{d:02d}"
+
+
+def realistic_rows(codes, years, *, loss_codes=(), financial_codes=(), seed=7):
+    """사람이 봐도 그럴듯한 재무 행들. 영업이익은 **누적**으로 넣는다."""
+    import random
+
+    rng = random.Random(seed)
+    loss_codes = set(loss_codes)
+    financial_codes = set(financial_codes)
+    rows = []
+    for code in codes:
+        if code == "005930":                      # 삼성전자: 부채비율 27%, 유동비율 250%
+            equity, liab, ca, cl = 3600, 970, 2180, 870
+        elif code == "000660":
+            equity, liab, ca, cl = 800, 460, 320, 200
+        else:
+            equity = rng.randint(200, 5000)
+            liab = int(equity * rng.uniform(0.3, 1.6))
+            cl = rng.randint(50, 900)
+            ca = int(cl * rng.uniform(1.1, 3.0))
+        base = rng.randint(20, 400)
+        for year in years:
+            sign = -1 if code in loss_codes and year % 2 == 0 else 1
+            cum = 0
+            for q in (1, 2, 3, 4):
+                cum += sign * int(base * rng.uniform(0.7, 1.3))
+                kw = dict(
+                    자산총계=(equity + liab) * EOK,
+                    부채총계=liab * EOK,
+                    자본총계=equity * EOK,
+                    매출액=base * 12 * EOK,
+                    당기순이익=int(cum * 0.8) * EOK,
+                )
+                if code in financial_codes:       # 금융업: 유동/비유동 구분 없음
+                    kw["유동자산"] = None
+                    kw["유동부채"] = None
+                else:
+                    kw["유동자산"] = ca * EOK
+                    kw["유동부채"] = cl * EOK
+                rows.append(
+                    row(code, year, q, _disclosed_for(year, q), cum * EOK,
+                        corp_code=f"{abs(hash(code)) % 10**8:08d}", **kw)
+                )
+    return rows
+
+
+def make_marcap(root: Path, years, codes_by_year, last_date="2026-08-04"):
+    """``Date`` / ``Code`` 만 있는 최소 marcap parquet."""
+    data = root / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    for y in years:
+        codes = sorted(codes_by_year[y])
+        end = f"{y}-12-01" if y != max(years) else last_date
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime([f"{y}-01-02"] * len(codes) + [end] * len(codes)),
+                "Code": codes + codes,
+            }
+        )
+        df.to_parquet(data / f"marcap-{y}.parquet", index=False)
+    return root
+
+
+@pytest.fixture
+def healthy(tmp_path):
+    """정상 데이터 + marcap. ``(store_root, marcap_root, codes)``."""
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(40)]
+    years = [2023, 2024, 2025]
+    rows = realistic_rows(
+        codes, years,
+        loss_codes={codes[5], codes[6], codes[7], codes[8], codes[9], codes[10],
+                    codes[11], codes[12], codes[13], codes[14]},
+        financial_codes={codes[20], codes[21]},
+    )
+    write_store(tmp_path / "dart", rows)
+
+    dead = [f"{900000 + i:06d}" for i in range(6)]      # 상장폐지 종목
+    by_year = {y: set(codes) | set(dead) for y in years}
+    by_year[max(years)] = set(codes)                     # 마지막 해에는 사라짐
+    make_marcap(tmp_path / "marcap", years, by_year)
+    return tmp_path / "dart", tmp_path / "marcap", codes
+
+
+def run_report(dart_root, marcap_root, capsys):
+    rc = fd.run_report(dart_root, marcap_root)
+    return rc, capsys.readouterr().out
+
+
+def test_report_전항목이_출력된다(healthy, capsys):
+    dart_root, marcap_root, _codes = healthy
+    rc, out = run_report(dart_root, marcap_root, capsys)
+
+    for header in ("[가] 수집 현황", "[나] 파싱 점검", "[다] 대표 종목 샘플",
+                   "[라] as-of 동작 확인", "[마] 생존 편향 규모"):
+        assert header in out, f"{header} 절이 없다"
+    # (가)
+    assert "총 행 수" in out and "분기별 행 수" in out and "마지막 수집 시각" in out
+    # (나)
+    for c in fd.AMOUNT_COLUMNS:
+        assert c in out
+    assert "debt_ratio_pct" in out and "current_ratio_pct" in out
+    assert "op_income_quarter" in out
+    assert "음수 표기 파싱 확인" in out and "연결/별도 분포" in out
+    # (다)
+    assert "005930" in out and "000660" in out
+    # (라)
+    assert "전 종목 전수 확인" in out
+    # (마)
+    assert "DART 재무가 한 건도 없는 종목" in out
+    assert "판정:" in out
+    assert rc == fd.REPORT_OK, f"정상 데이터인데 이슈가 잡혔다:\n{out}"
+
+
+def test_report_정상데이터는_판정이_정상(healthy, capsys):
+    dart_root, marcap_root, _ = healthy
+    rc, out = run_report(dart_root, marcap_root, capsys)
+    assert rc == fd.REPORT_OK
+    assert " 판정: 정상" in out
+    assert "as-of 규칙이 지켜지고 있습니다" in out
+
+
+def test_report_데이터_없으면_안내(tmp_path, capsys):
+    rc, out = run_report(tmp_path / "없음", tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_NO_DATA
+    assert "update_dart.bat" in out
+    assert "test_dart.bat" in out
+    assert "판정: 확인 필요" in out
+
+
+# --- 일부러 망가뜨린 데이터를 잡아내는지 ------------------------------------------------
+
+
+def _break_store(tmp_path, mutate, *, codes=None, years=(2023, 2024, 2025), **kw):
+    """정상 데이터를 만든 뒤 ``mutate(df)`` 로 망가뜨려 다시 저장한다."""
+    codes = codes or (["005930", "000660"] + [f"{200000 + i:06d}" for i in range(20)])
+    rows = realistic_rows(codes, list(years), **kw)
+    root = tmp_path / "dart"
+    write_store(root, rows)
+
+    frames = {}
+    for p in sorted(root.glob("fundamentals-*.parquet")):
+        frames[p] = pd.read_parquet(p)
+    for p, df in frames.items():
+        mutate(df).to_parquet(p, index=False)
+    return root
+
+
+def test_report_영업이익_전량결측을_잡아낸다(tmp_path, capsys):
+    """계정명 매칭이 어긋나 '영업이익' 이 통째로 안 잡힌 상황."""
+    def kill_op(df):
+        df["영업이익"] = pd.array([None] * len(df), dtype="Int64")
+        df["op_income_quarter"] = pd.array([None] * len(df), dtype="Int64")
+        return df
+
+    root = _break_store(tmp_path, kill_op)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "'영업이익' 가 100% 결측입니다" in out
+    assert "account_nm" in out, "계정명 매칭 실패를 의심하라고 알려야 한다"
+
+
+def test_report_유동자산_전량결측을_잡아낸다(tmp_path, capsys):
+    def kill(df):
+        df["유동자산"] = pd.array([None] * len(df), dtype="Int64")
+        df["current_ratio_pct"] = pd.Series([None] * len(df), dtype="float64")
+        return df
+
+    root = _break_store(tmp_path, kill)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "'유동자산' 가 100% 결측입니다" in out
+    assert "유동비율을 계산할 수 없는 종목이" in out
+
+
+def test_report_부채비율_이상치를_잡아낸다(tmp_path, capsys):
+    """단위/부호 파싱이 어긋나 부채비율이 터무니없이 큰 상황."""
+    def blow_up(df):
+        df["debt_ratio_pct"] = df["debt_ratio_pct"] * 100_000.0
+        return df
+
+    root = _break_store(tmp_path, blow_up)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "부채비율 중앙값이" in out
+    assert "단위나 부호 파싱을 의심하세요" in out
+    assert "10,000% 를 넘는 행이" in out
+
+
+def test_report_음수가_하나도_없으면_잡아낸다(tmp_path, capsys):
+    """'△' / '(1,000)' 음수 표기 파싱이 실패해 적자가 전부 사라진 상황."""
+    def all_positive(df):
+        for c in ("영업이익", "op_income_quarter", "당기순이익"):
+            df[c] = df[c].abs()
+        return df
+
+    root = _break_store(tmp_path, all_positive, loss_codes=())
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "영업이익 음수가 한 건도 없습니다" in out
+    assert "음수 표기 파싱이 실패했을 가능성" in out
+
+
+def test_report_삼성전자_숫자가_이상하면_잡아낸다(tmp_path, capsys):
+    def wreck_samsung(df):
+        m = df["code"].astype(str) == "005930"
+        df.loc[m, "debt_ratio_pct"] = 4200.0
+        return df
+
+    root = _break_store(tmp_path, wreck_samsung)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "삼성전자 부채비율 중앙값이" in out
+    assert "파싱 오류를 의심하세요" in out
+
+
+def test_report_삼성전자가_아예_없으면_잡아낸다(tmp_path, capsys):
+    root = _break_store(tmp_path, lambda df: df[df["code"].astype(str) != "005930"])
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "005930" in out and "재무가 하나도 없습니다" in out
+
+
+def test_report_빠진_분기를_잡아낸다(tmp_path, capsys):
+    """중간 분기를 통째로 못 받은 상황."""
+    def drop_q2_2024(df):
+        bad = (df["year"].astype("int64") == 2024) & (df["quarter"].astype("int64") == 2)
+        return df[~bad]
+
+    root = _break_store(tmp_path, drop_q2_2024)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "과거 분기가 비어 있습니다" in out
+    assert "2024-2" in out
+
+
+def test_report_행이_유난히_적은_분기를_잡아낸다(tmp_path, capsys):
+    def thin_q3_2024(df):
+        bad = ((df["year"].astype("int64") == 2024)
+               & (df["quarter"].astype("int64") == 3)
+               & (df.groupby(["year", "quarter"]).cumcount() > 2))
+        return df[~bad]
+
+    root = _break_store(tmp_path, thin_q3_2024)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "행 수가 유난히 적은 분기가 있습니다" in out
+
+
+def test_report_공시일이_전부_비면_잡아낸다(tmp_path, capsys):
+    """rcept_no 파싱이 실패해 disclosed_at 이 통째로 빈 상황."""
+    def kill_disclosed(df):
+        df["disclosed_at"] = pd.to_datetime(pd.Series([None] * len(df)))
+        return df
+
+    root = _break_store(tmp_path, kill_disclosed)
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "공시일" in out and "rcept_no" in out
+
+
+def test_report_룩어헤드를_잡아낸다(tmp_path, capsys, monkeypatch):
+    """as-of 필터가 깨져 공시 전 재무를 돌려주는 상황을 리포트가 잡아내는지.
+
+    ``DartStore`` 를 일부러 망가뜨려 ``disclosed_at`` 을 무시하게 만든다.
+    이 테스트가 잡아내지 못하면 진단 도구로서 의미가 없다.
+    """
+    import engine.dart as ed
+
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(5)]
+    root = tmp_path / "dart"
+    write_store(root, realistic_rows(codes, [2023, 2024, 2025]))
+
+    def broken_disclosed(self, date):
+        return self.load()          # 공시일 필터를 통째로 무시한다
+
+    monkeypatch.setattr(ed.DartStore, "_disclosed", broken_disclosed)
+
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "룩어헤드" in out
+    assert "!!!!!" in out, "눈에 띄게 경고해야 한다"
+    assert "수익률이 실제보다 좋게 나옵니다" in out
+
+
+def test_report_생존편향_규모를_센다(healthy, capsys):
+    dart_root, marcap_root, codes = healthy
+    _rc, out = run_report(dart_root, marcap_root, capsys)
+    assert "상장폐지 추정" in out
+    # dead 6개는 marcap 에만 있고 DART 에는 없다
+    assert "DART 재무가 한 건도 없는 종목        : 6개" in out
+    assert "지금은 없음 (상장폐지 추정)      : 6개" in out
+
+
+def test_report_marcap이_없으면_그_절만_건너뛴다(tmp_path, capsys):
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(10)]
+    root = tmp_path / "dart"
+    write_store(root, realistic_rows(codes, [2023, 2024, 2025]))
+    rc, out = run_report(root, tmp_path / "없는marcap", capsys)
+    assert "marcap 데이터가 없어 생존 편향 규모를 재지 못했습니다" in out
+    assert rc == fd.REPORT_OK
+
+
+def test_report는_네트워크를_쓰지_않는다(healthy, monkeypatch, capsys):
+    def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("--report 는 네트워크를 쓰면 안 된다")
+
+    monkeypatch.setattr(fd, "http_get", boom)
+    monkeypatch.setattr(fd, "_default_fetch", boom)
+    dart_root, marcap_root, _ = healthy
+    assert run_report(dart_root, marcap_root, capsys)[0] == fd.REPORT_OK
+
+
+def test_report_CLI_플래그(healthy, monkeypatch, capsys):
+    dart_root, marcap_root, _ = healthy
+    # --report 는 인증키가 없어도 동작해야 한다
+    monkeypatch.setattr(fd, "read_api_key", lambda *a, **k: None)
+    rc = fd.main(["--report", "--out", str(dart_root), "--marcap", str(marcap_root)])
+    out = capsys.readouterr().out
+    assert rc == fd.REPORT_OK
+    assert "DART 재무 데이터 진단 리포트" in out
+
+
+# ======================================================================================
+# 14. dart_report.bat
+# ======================================================================================
+
+
+def test_dart_report_bat_인코딩():
+    p = ROOT / "dart_report.bat"
+    assert p.is_file(), "dart_report.bat 이 없다"
+    data = p.read_bytes()
+    assert data.count(b"\n") - data.count(b"\r\n") == 0, "홀로 있는 LF 가 있다"
+    text = data.decode("cp949")                 # 디코드 실패하면 여기서 터진다
+    assert text.encode("cp949") == data, "cp949 왕복이 되지 않는다"
+    assert "::" not in text, "블록 안에서 위험한 :: 를 쓰면 안 된다"
+    assert "setlocal enabledelayedexpansion" in text
+    assert "%%~sd" in text, "%~dp0 8.3 단축이름 변환이 없다"
+    assert text.rstrip().endswith("endlocal") or "\npause" in text
+    assert "pause" in text
+    assert not set(text) & set("→←↑↓"), "유니코드 화살표 금지"
+    assert "logs\\dart_report.txt" in text
+    assert "--report" in text
+
+
+def test_dart_report_bat_출력파일_인코딩_지정():
+    """메모장에서 한글이 깨지지 않도록 UTF-8 BOM 또는 CP949 로 저장해야 한다."""
+    text = (ROOT / "dart_report.bat").read_bytes().decode("cp949")
+    assert "PYTHONIOENCODING" in text or "chcp" in text.lower(), \
+        "파이썬 출력 인코딩을 고정해야 한글이 안 깨진다"
+    assert "BOM" in text or "utf8" in text.lower() or "cp949" in text.lower()
