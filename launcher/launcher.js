@@ -29,6 +29,8 @@ var S = {
   port: 8000,
   cfg: null,
   portInfo: null,
+  dartLast: null,
+  dartBefore: 0,
   logMark: 0,
   force: false,
   cancelled: false,
@@ -40,7 +42,8 @@ var S = {
   lastSync: "",
   apiLatestTradeDate: "",
   logShown: ["", "", ""],
-  tally: { prog: 0, progCommits: 0, quoteDays: 0, quoteCloned: false, server: false, fetched: false }
+  tally: { prog: 0, progCommits: 0, quoteDays: 0, quoteCloned: false,
+           dart: 0, dartFail: false, dartNokey: false, server: false, fetched: false }
 };
 
 var P = {};
@@ -193,6 +196,14 @@ function makeRealSys() {
           if (ep === target) { try { p.Terminate(); } catch (e2) {} }
         }
       } catch (e3) {}
+    },
+
+    /* 환경변수. 없으면 "%NAME%" 이 그대로 돌아오므로 그건 빈 값으로 본다. */
+    env: function (name) {
+      try {
+        var v = sh.ExpandEnvironmentStrings("%" + name + "%");
+        return (v === "%" + name + "%") ? "" : String(v);
+      } catch (e) { return ""; }
     },
 
     open: function (url) { try { sh.Run(url, 1, false); } catch (e) {} },
@@ -364,6 +375,9 @@ function setLogs(lines) {
   }
 }
 
+/* 해시, 포트, PID, 일수 같은 것은 등폭으로 찍어야 신뢰감이 생긴다 */
+function mono(v) { return '<span class="mono">' + esc(v) + '</span>'; }
+
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -439,6 +453,13 @@ function buildPaths(root) {
   P.s2bat = P.work + "\\s2.bat";
   P.s2log = P.work + "\\s2.log";
   P.s3bat = P.work + "\\s3.bat";
+  P.s3log = P.work + "\\s3.log";
+  P.s4bat = P.work + "\\s4.bat";
+  P.dartDir = root + "\\dart";
+  P.dartState = root + "\\dart\\.fetch_state.json";
+  P.dartKey = root + "\\dart_key.txt";
+  P.dartRecheck = root + "\\logs\\dart_recheck.txt";
+  P.fetchDart = root + "\\tools\\fetch_dart.py";
   P.pbBat = P.work + "\\probe.bat";
   P.pbLog = P.work + "\\probe.log";
   P.cfgFile = root + "\\launcher_config.json";
@@ -527,10 +548,10 @@ function decideQuotes() {
 
 function quoteSkipMsg(dec) {
   var d = fmtDate(dec.ltd.date);
-  if (dec.why === "api") { return "이미 최신입니다 (" + esc(dec.have) + " 데이터)"; }
-  if (dec.why === "weekend") { return "주말이라 새 데이터가 없습니다 (마지막 거래일 " + d + ")"; }
+  if (dec.why === "api") { return "이미 최신입니다 (" + mono(dec.have) + " 데이터)"; }
+  if (dec.why === "weekend") { return "주말이라 새 데이터가 없습니다 (마지막 거래일 " + mono(d) + ")"; }
   if (dec.why === "preclose") { return "장 마감 전이라 오늘 데이터는 아직 없습니다"; }
-  return "이미 최신입니다 (" + d + " 데이터)";
+  return "이미 최신입니다 (" + mono(d) + " 데이터)";
 }
 
 /* ============================================================
@@ -720,17 +741,17 @@ function step1() {
       } else if (st === "noremote") {
         finishStep(0, "skip", "받아올 곳을 찾지 못해 건너뜁니다", step2);
       } else if (st === "fresh") {
-        finishStep(0, "skip", "이미 최신입니다 (" + shortOld + ") — 받지 않았습니다", step2);
+        finishStep(0, "skip", "이미 최신입니다 (" + mono(shortOld) + ") — 받지 않았습니다", step2);
       } else if (st === "same") {
-        finishStep(0, "skip", "이미 최신입니다 (" + shortOld + ")", step2);
+        finishStep(0, "skip", "이미 최신입니다 (" + mono(shortOld) + ")", step2);
       } else if (st === "pullfail") {
         finishStep(0, "fail", "받기에 실패했습니다. 인터넷 연결을 확인하세요", step2);
       } else if (st === "updated" || st === "updated_pip") {
         S.tally.prog = 1;
         S.tally.progCommits = lines.length;
         S.tally.fetched = true;
-        var msg = shortOld + " → " + shortNew;
-        if (lines.length) { msg += " (" + lines.length + "건)"; }
+        var msg = mono(shortOld) + " → " + mono(shortNew);
+        if (lines.length) { msg += " (" + mono(lines.length) + "건)"; }
         if (st === "updated_pip") { msg += " · 필요한 패키지도 맞췄습니다"; }
         if (lines.length) {
           var tail = [];
@@ -878,11 +899,208 @@ function runQuoteSync(firstTime) {
       } else if (st === "updated") {
         S.tally.quoteDays = cnt;
         S.tally.fetched = true;
-        finishStep(1, "done", cnt > 0 ? ("새 시세 " + cnt + "일치를 받았습니다") : "시세를 갱신했습니다", step3);
+        finishStep(1, "done",
+          cnt > 0 ? ("새 시세 " + mono(cnt) + "일치를 받았습니다") : "시세를 갱신했습니다", step3);
       } else if (st === "syncfail") {
         finishStep(1, "fail", "시세 받기에 실패했습니다. logs 폴더를 확인하세요", step3);
       } else {
         finishStep(1, "skip", "확인만 하고 넘어갑니다", step3);
+      }
+    });
+}
+
+/* ============================================================
+   8. 3단계 - 재무 데이터 (DART)
+
+   분기 데이터라 매일 받을 이유가 거의 없다.
+   아래 다섯 가지 중 하나라도 걸리면 네트워크에 아예 나가지 않는다.
+     1) 인증키 없음        -> 건너뜀 (실패가 아니다. 안 쓰는 사용자도 있다)
+     2) dart 폴더 없음     -> 첫 수집은 2,400여 건 호출이라 확인을 받는다
+     3) 오늘 이미 받음     -> 건너뜀
+     4) 새로 받을 분기 없음 -> 건너뜀
+     5) 최근 분기 재확인은 주 1회로 제한
+   ============================================================ */
+
+var DART_LAG = 45;          /* 분기 종료 후 공시까지 (tools/fetch_dart.py 와 같은 값) */
+var DART_LAG_ANNUAL = 90;   /* 4분기(사업보고서) */
+var DART_YEAR_FROM = 2015;
+var DART_RECHECK_DAYS = 7;  /* 최근 분기 재확인 주기 */
+
+function qEnd(y, q) {
+  if (q === 1) { return new Date(y, 2, 31); }
+  if (q === 2) { return new Date(y, 5, 30); }
+  if (q === 3) { return new Date(y, 8, 30); }
+  return new Date(y, 11, 31);
+}
+
+function qDue(y, q) {
+  var d = qEnd(y, q);
+  d.setDate(d.getDate() + (q === 4 ? DART_LAG_ANNUAL : DART_LAG));
+  return d;
+}
+
+function dartKeyPresent() {
+  var v = SYS.env("DART_API_KEY");
+  if (trim(v)) { return true; }
+  if (!SYS.exists(P.dartKey)) { return false; }
+  return trim(SYS.read(P.dartKey)).length >= 10;
+}
+
+/* dart/.fetch_state.json 에서 완료된 분기 목록과 마지막 저장 시각을 읽는다 */
+function readDartState() {
+  var st = { have: {}, count: 0, updatedAt: "" };
+  var t = SYS.read(P.dartState);
+  if (!t) { return st; }
+  t = String(t);
+  var mu = /"updated_at"\s*:\s*"([^"]*)"/.exec(t);
+  if (mu) { st.updatedAt = trim(mu[1]); }
+  /* "2024-4": { ... "complete": true } 형태만 인정한다 */
+  var re = /"(\d{4})-([1-4])"\s*:\s*\{([^{}]*)\}/g, m;
+  while ((m = re.exec(t)) !== null) {
+    if (/"complete"\s*:\s*true/.test(m[3])) {
+      st.have[m[1] + "-" + m[2]] = true;
+      st.count++;
+    }
+  }
+  return st;
+}
+
+/* 공시일이 지났는데 아직 못 받은 분기가 있는가 */
+function missingQuarter(st, now) {
+  var y, q, key, last = null;
+  for (y = DART_YEAR_FROM; y <= now.getFullYear(); y++) {
+    for (q = 1; q <= 4; q++) {
+      if (now.getTime() < qDue(y, q).getTime()) { continue; }
+      key = y + "-" + q;
+      if (!st.have[key]) { return { y: y, q: q }; }
+      last = { y: y, q: q };
+    }
+  }
+  S.dartLast = last;
+  return null;
+}
+
+function dartHaveLabel() {
+  var l = S.dartLast;
+  return l ? (l.y + "-" + l.q + "분기까지") : "받은 분기 없음";
+}
+
+function readRecheck() {
+  var t = trim(SYS.read(P.dartRecheck));
+  return /^\d{4}-\d{2}-\d{2}/.test(t) ? t.substring(0, 10) : "";
+}
+
+function decideDart() {
+  var now = nowDate();
+
+  if (!dartKeyPresent()) { return { skip: true, why: "nokey" }; }
+  if (!SYS.exists(P.fetchDart)) { return { skip: true, why: "notool" }; }
+  if (!SYS.dirExists(P.dartDir)) { return { ask: true }; }
+
+  var st = readDartState();
+  if (S.force) { return { skip: false, why: "force", st: st }; }
+
+  if (st.updatedAt && st.updatedAt.substring(0, 10) === fmtDate(now)) {
+    return { skip: true, why: "today", st: st };
+  }
+  var miss = missingQuarter(st, now);
+  if (miss) { return { skip: false, why: "newq", q: miss, st: st }; }
+
+  /* 정정공시 대비 재확인 - 매일 할 필요는 없다 */
+  var last = readRecheck();
+  if (last) {
+    var ld = parseStamp(last);
+    if (ld && (now.getTime() - ld.getTime()) < DART_RECHECK_DAYS * 86400000) {
+      return { skip: true, why: "fresh", st: st };
+    }
+  }
+  return { skip: false, why: "recheck", st: st };
+}
+
+function s3Bat() {
+  return [
+    "@echo off",
+    "setlocal enabledelayedexpansion",
+    "cd /d \"" + P.root + "\"",
+    "rem  파이썬 출력을 UTF-8 로 고정하고 버퍼를 끈다 (진행률을 실시간으로 읽기 위해)",
+    "set \"PYTHONIOENCODING=utf-8\"",
+    "set \"PYTHONUNBUFFERED=1\"",
+    "rem  update_dart.bat 을 부르지 않는다. 그 안의 pause 때문에 멈춘다.",
+    "\"" + P.venvPy + "\" -m tools.fetch_dart --resume >> \"" + P.s3log + "\" 2>&1",
+    "set \"RC=!errorlevel!\"",
+    "> \"" + P.work + "\\s3_rc.txt\" echo.!RC!",
+    "> \"" + P.work + "\\s3.done\" echo done",
+    "endlocal"
+  ];
+}
+
+function step3() {
+  setStep(2, "run", "재무 데이터를 확인합니다");
+  setHead("재무 데이터를 확인하고 있습니다");
+  setProg(46);
+
+  var dec = decideDart();
+
+  if (dec.ask) {
+    setSub(2, "재무 데이터가 아직 없습니다");
+    setNote("확인을 기다리고 있습니다");
+    showOv("ovDart");
+    return;
+  }
+  if (dec.skip) {
+    if (dec.why === "nokey") {
+      S.tally.dartNokey = true;
+      finishStep(2, "skip", "재무 데이터 없이 실행합니다 (DART 키 미설정)", step4);
+    } else if (dec.why === "notool") {
+      finishStep(2, "skip", "수집기가 없어 건너뜁니다", step4);
+    } else if (dec.why === "today") {
+      finishStep(2, "skip", "오늘 이미 받았습니다", step4);
+    } else {
+      finishStep(2, "skip", "이미 최신입니다 (" + mono(dartHaveLabel()) + ")", step4);
+    }
+    return;
+  }
+  runDartSync(false, dec);
+}
+
+function runDartSync(firstTime, dec) {
+  var before = (dec && dec.st) ? dec.st.count : readDartState().count;
+  S.dartBefore = before;
+
+  setStep(2, "run", firstTime
+    ? "처음 받는 중입니다. 2,400여 건을 부릅니다"
+    : (dec && dec.why === "newq"
+        ? ("새 분기를 받습니다 (" + mono(dec.q.y + "-" + dec.q.q + "분기") + ")")
+        : "최근 분기를 다시 확인합니다"));
+
+  runBat(P.s3bat, s3Bat(), P.work + "\\s3.done", P.s3log,
+    firstTime ? 5400000 : 1800000,
+    function () { tailLog(P.s3log); },
+    function (how) {
+      if (S.cancelled) { return; }
+      /* 재무는 없어도 백테스트가 돌아간다. 무슨 일이 있어도 4단계로 넘어간다. */
+      if (how !== "ok") {
+        S.tally.dartFail = true;
+        finishStep(2, "fail", "재무 데이터를 받지 못했습니다 (시간 초과)", step4);
+        return;
+      }
+      var rc = parseInt(readOne("s3_rc.txt"), 10);
+      var after = readDartState();
+      var gained = after.count - before;
+      SYS.write(P.dartRecheck, fmtDate(nowDate()) + "\r\n", true);
+
+      if (isNaN(rc) || rc !== 0) {
+        S.tally.dartFail = true;
+        S.tally.dart = gained > 0 ? gained : 0;
+        finishStep(2, "fail", "재무 데이터를 받지 못했습니다. logs 폴더를 확인하세요", step4);
+        return;
+      }
+      if (gained > 0) {
+        S.tally.dart = gained;
+        S.tally.fetched = true;
+        finishStep(2, "done", "재무 " + mono(gained) + "개 분기를 받았습니다", step4);
+      } else {
+        finishStep(2, "done", "재무 데이터가 최신입니다", step4);
       }
     });
 }
@@ -995,10 +1213,10 @@ function cleanupZombie() {
 }
 
 /* ============================================================
-   9. 3단계 - 서버 시작
+   10. 4단계 - 서버 시작
    ============================================================ */
 
-function s3Bat() {
+function s4Bat() {
   return [
     "@echo off",
     "cd /d \"" + P.root + "\"",
@@ -1007,26 +1225,26 @@ function s3Bat() {
   ];
 }
 
-function step3() {
-  setStep(2, "run", "서버가 켜져 있는지 확인합니다");
+function step4() {
+  setStep(3, "run", "서버가 켜져 있는지 확인합니다");
   setHead("백테스트 엔진을 켜고 있습니다");
-  setProg(56);
+  setProg(66);
 
   pingRobust(function (ok, body) {
     if (S.cancelled) { return; }
     if (ok) {
       S.apiLatestTradeDate = pickTradeDate(body) || S.apiLatestTradeDate;
-      finishStep(2, "skip", "이미 켜져 있습니다 (" + S.port + "번 포트)", step4);
+      finishStep(3, "skip", "이미 켜져 있습니다 (" + mono(S.port) + "번 포트)", step5);
       return;
     }
     /* 응답이 없다고 서버가 없다고 단정하지 않는다 */
-    setSub(2, S.port + "번 포트를 누가 쓰고 있는지 확인합니다");
+    setSub(3, mono(S.port) + "번 포트를 누가 쓰고 있는지 확인합니다");
     probePort(function (info) {
       if (S.cancelled) { return; }
       if (!info.busy) { launchOurServer(true); return; }
       if (info.mine) {
-        finishStep(2, "skip",
-          "이미 실행 중인 서버를 그대로 씁니다 (PID " + info.pid + ")", step4);
+        finishStep(3, "skip",
+          "이미 실행 중인 서버를 그대로 씁니다 (PID " + mono(info.pid) + ")", step5);
         return;
       }
       showPortConflict(info, "");
@@ -1036,7 +1254,7 @@ function step3() {
 
 function launchOurServer(cleanFirst) {
   if (!SYS.exists(P.venvPy)) {
-    setStep(2, "fail", "설치가 아직 안 됐습니다");
+    setStep(3, "fail", "설치가 아직 안 됐습니다");
     halt("install.bat 을 먼저 실행해 주세요");
     return;
   }
@@ -1045,7 +1263,7 @@ function launchOurServer(cleanFirst) {
 }
 
 function startServer() {
-  setSub(2, S.port + "번 포트로 서버를 켜는 중입니다");
+  setSub(3, mono(S.port) + "번 포트로 서버를 켜는 중입니다");
   SYS.mkdir(P.logs);
   SYS.mkdir(P.work);
 
@@ -1053,12 +1271,12 @@ function startServer() {
   var pre = SYS.read(P.serverLog);
   S.logMark = pre ? String(pre).length : 0;
 
-  if (!SYS.write(P.s3bat, s3Bat().join("\r\n") + "\r\n", true)) {
-    setStep(2, "fail", "임시 파일을 만들 수 없습니다");
+  if (!SYS.write(P.s4bat, s4Bat().join("\r\n") + "\r\n", true)) {
+    setStep(3, "fail", "임시 파일을 만들 수 없습니다");
     halt("run_web.bat 을 직접 실행해 보세요");
     return;
   }
-  S.serverPid = SYS.spawn("cmd.exe /c call \"" + P.s3bat + "\"", P.root);
+  S.serverPid = SYS.spawn("cmd.exe /c call \"" + P.s4bat + "\"", P.root);
   if (S.serverPid) {
     SYS.write(P.pidFile, S.serverPid + "\r\n", true);
   }
@@ -1075,32 +1293,32 @@ function startServer() {
 
     /* 10048 = 포트 중복 바인딩. 60초를 다 기다릴 필요 없이 바로 원인을 짚어 준다. */
     if (fresh.indexOf("10048") >= 0) {
-      setStep(2, "fail", S.port + "번 포트가 이미 쓰이고 있습니다");
-      setSub(2, "누가 쓰고 있는지 확인합니다");
+      setStep(3, "fail", mono(S.port) + "번 포트가 이미 쓰이고 있습니다");
+      setSub(3, "누가 쓰고 있는지 확인합니다");
       probePort(function (info) { showPortConflict(info, "10048"); });
       return;
     }
 
-    setProg(56 + Math.round(18 * (el2 / LIMIT)));
-    setSub(2, "서버가 켜지기를 기다립니다 (" + Math.round(el2 / 1000) + "초)");
+    setProg(66 + Math.round(14 * (el2 / LIMIT)));
+    setSub(3, "서버가 켜지기를 기다립니다 (" + mono(Math.round(el2 / 1000)) + "초)");
 
     SYS.ping(function (ok, body) {
       if (S.cancelled) { return; }
       if (ok) {
         S.tally.server = true;
         S.apiLatestTradeDate = pickTradeDate(body) || S.apiLatestTradeDate;
-        finishStep(2, "done", "서버를 켰습니다 (" + S.port + "번 포트)", step4);
+        finishStep(3, "done", "서버를 켰습니다 (" + mono(S.port) + "번 포트)", step5);
         return;
       }
       if ((new Date()).getTime() - t0 > LIMIT) {
         /* 시간이 다 됐어도 포트부터 다시 본다 */
         probePort(function (info) {
           if (info.busy && info.mine) {
-            finishStep(2, "skip", "서버가 떠 있는 것으로 보입니다 (PID " + info.pid + ")", step4);
+            finishStep(3, "skip", "서버가 떠 있는 것으로 보입니다 (PID " + mono(info.pid) + ")", step5);
           } else if (info.busy) {
             showPortConflict(info, "10048");
           } else {
-            setStep(2, "fail", "서버가 켜지지 않았습니다");
+            setStep(3, "fail", "서버가 켜지지 않았습니다");
             halt("logs\\server.log 에 이유가 적혀 있습니다");
           }
         });
@@ -1117,21 +1335,21 @@ function showPortConflict(info, why) {
   clearTimers();
   S.portInfo = info;
   setState(2, "fail");
-  setSub(2, why === "10048"
-    ? (S.port + "번 포트가 이미 쓰여 서버를 켜지 못했습니다")
-    : (S.port + "번 포트를 다른 프로그램이 쓰고 있습니다"));
+  setSub(3, why === "10048"
+    ? (mono(S.port) + "번 포트가 이미 쓰여 서버를 켜지 못했습니다")
+    : (mono(S.port) + "번 포트를 다른 프로그램이 쓰고 있습니다"));
   setHead("포트가 겹칩니다");
   setNote("어떻게 할지 골라 주세요");
 
   var who = info.name ? ("<b>" + esc(info.name) + "</b>") : "<b>알 수 없는 프로그램</b>";
-  var body = S.port + "번 포트를 이미 " + who;
-  if (info.pid) { body += " <b>(PID " + info.pid + ")</b>"; }
+  var body = mono(S.port) + "번 포트를 이미 " + who;
+  if (info.pid) { body += " (PID " + mono(info.pid) + ")"; }
   body += " 가 쓰고 있습니다.";
   if (info.path) { body += "<br><span class=\"pth\">" + esc(clipLine(info.path, 56)) + "</span>"; }
   if (why === "10048") { body += "<br>그래서 서버가 켜지지 못했습니다 (오류 10048)."; }
   body += "<br>KRX 백테스터의 이전 서버일 수도 있습니다.";
   body += info.free
-    ? ("<br>비어 있는 포트: <b>" + info.free + "</b>")
+    ? ("<br>비어 있는 포트: " + mono(info.free))
     : "<br>주변에 비어 있는 포트를 찾지 못했습니다.";
 
   var m = el("portMsg");
@@ -1145,17 +1363,17 @@ function showPortConflict(info, why) {
 }
 
 /* ============================================================
-   10. 4단계 - 브라우저
+   11. 5단계 - 브라우저
    ============================================================ */
 
-function step4() {
-  setStep(3, "run", "기본 브라우저를 엽니다");
+function step5() {
+  setStep(4, "run", "기본 브라우저를 엽니다");
   setHead("화면을 여는 중입니다");
-  setProg(88);
+  setProg(90);
   later(function () {
     SYS.open(baseUrl());
     S.openedBrowser = true;
-    finishStep(3, "done", "브라우저를 열었습니다", showDone);
+    finishStep(4, "done", "브라우저를 열었습니다", showDone);
   }, 300);
 }
 
@@ -1165,25 +1383,32 @@ function step4() {
 
 function finishStep(i, state, sub, next) {
   setStep(i, state, sub);
-  setProg(Math.round((i + 1) * 24.5));
+  setProg(Math.round((i + 1) * 19.6));
   if (next) { later(next, STEP_MIN); }
 }
 
 function summaryText() {
   var parts = [];
   if (S.tally.prog) {
-    parts[parts.length] = "프로그램 업데이트 " +
-      (S.tally.progCommits > 0 ? (S.tally.progCommits + "건") : "1건");
+    parts[parts.length] = "프로그램 업데이트 <b>" +
+      (S.tally.progCommits > 0 ? S.tally.progCommits : 1) + "건</b>";
   }
   if (S.tally.quoteCloned) {
-    parts[parts.length] = "시세 데이터 전체";
+    parts[parts.length] = "시세 데이터 <b>전체</b>";
   } else if (S.tally.quoteDays > 0) {
-    parts[parts.length] = "시세 " + S.tally.quoteDays + "일치";
+    parts[parts.length] = "시세 <b>" + S.tally.quoteDays + "일치</b>";
+  }
+  if (S.tally.dart > 0) {
+    parts[parts.length] = "재무 <b>" + S.tally.dart + "개 분기</b>";
+  }
+  if (S.tally.dartFail) {
+    return "재무 데이터를 받지 못했습니다 — 재무 조건 없이 실행됩니다";
   }
   if (!parts.length) {
-    return S.tally.server
-      ? "모두 최신입니다 — 바로 시작합니다"
-      : "모두 최신입니다 — 바로 시작합니다";
+    if (S.tally.dartNokey) {
+      return "재무 데이터 없이 실행합니다 (DART 키 미설정)";
+    }
+    return "모두 최신입니다 — 바로 시작합니다";
   }
   return parts.join(", ") + "를 받았습니다";
 }
@@ -1204,7 +1429,7 @@ function halt(note) {
   clearTimers();
   S.finished = true;
   var i;
-  for (i = 0; i < 4; i++) {
+  for (i = 0; i < 5; i++) {
     var box = el("s" + i);
     if (box && box.className.indexOf("is-wait") >= 0) {
       setStep(i, "skip", "진행하지 못했습니다");
@@ -1244,15 +1469,15 @@ function showToggle(body) {
   clearTimers();
   S.finished = true;
   var i;
-  for (i = 0; i < 4; i++) { setStep(i, "skip", "확인하지 않았습니다"); }
-  setStep(2, "done", "이미 켜져 있습니다 (" + S.port + "번 포트)");
+  for (i = 0; i < 5; i++) { setStep(i, "skip", "확인하지 않았습니다"); }
+  setStep(3, "done", "이미 켜져 있습니다 (" + mono(S.port) + "번 포트)");
   setProg(100);
   setHead("이미 실행 중입니다");
   setNote("");
   var m = el("runMsg");
   var extra = "";
   var d = pickTradeDate(body);
-  if (d) { extra = "<br>가지고 있는 시세: <b>" + esc(d) + "</b> 까지"; }
+  if (d) { extra = "<br>가지고 있는 시세: " + mono(d) + " 까지"; }
   if (m) {
     m.innerHTML = "KRX 백테스터가 이미 켜져 있습니다." + extra + "<br>무엇을 할까요?";
   }
@@ -1265,10 +1490,11 @@ function showToggle(body) {
 
 function resetSteps() {
   var i;
-  for (i = 0; i < 4; i++) { setStep(i, "wait", "대기 중"); }
+  for (i = 0; i < 5; i++) { setStep(i, "wait", "대기 중"); }
   setProg(0);
   setLogs(["", "", ""]);
-  S.tally = { prog: 0, progCommits: 0, quoteDays: 0, quoteCloned: false, server: false, fetched: false };
+  S.tally = { prog: 0, progCommits: 0, quoteDays: 0, quoteCloned: false,
+              dart: 0, dartFail: false, dartNokey: false, server: false, fetched: false };
 }
 
 function restartFlow(force, note) {
@@ -1337,7 +1563,7 @@ function wire() {
     hideOv("ovPort");
     S.cancelled = false;
     var info = S.portInfo || {};
-    setStep(2, "run", "쓰고 있던 프로그램을 종료합니다");
+    setStep(3, "run", "쓰고 있던 프로그램을 종료합니다");
     setNote("");
     if (info.pid) { SYS.kill(info.pid); }
     cleanupZombie();
@@ -1353,7 +1579,7 @@ function wire() {
     if (!S.cfg) { S.cfg = defaultCfg(); }
     S.cfg.port = info.free;
     saveConfig();
-    setStep(2, "run", info.free + "번 포트로 켭니다 (설정에 저장했습니다)");
+    setStep(3, "run", mono(info.free) + "번 포트로 켭니다 (설정에 저장했습니다)");
     setNote("");
     later(function () { launchOurServer(false); }, 250);
     return false;
@@ -1368,6 +1594,18 @@ function wire() {
     hideOv("ovAsk");
     setNote("");
     finishStep(1, "skip", "나중에 받기로 했습니다", step3);
+    return false;
+  };
+  el("dartYes").onclick = function () {
+    hideOv("ovDart");
+    setNote("처음 한 번만 오래 걸립니다");
+    runDartSync(true, null);
+    return false;
+  };
+  el("dartNo").onclick = function () {
+    hideOv("ovDart");
+    setNote("");
+    finishStep(2, "skip", "나중에 받기로 했습니다 (재무 조건 없이 실행)", step4);
     return false;
   };
   el("runOpen").onclick = function () {

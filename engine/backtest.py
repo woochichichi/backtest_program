@@ -549,6 +549,11 @@ def _judge_financials(code: str, date, row, dart, filters: Mapping,
 
     prof_min = filters.get("profitable_quarters_min")
     if prof_min is not None:
+        if row is None:
+            # 그 시점에 공시가 하나도 없는 종목이다.
+            # consecutive_profit_quarters 도 같은 as-of 필터를 거치므로 반드시 None 이다.
+            # 127,000 행을 다시 훑을 필요가 없다.
+            return "unknown"
         key = (code, date)
         if key in prof_cache:
             n = prof_cache[key]

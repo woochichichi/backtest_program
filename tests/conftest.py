@@ -361,7 +361,7 @@ def dart_row(code, year, quarter, disclosed_at, *,
 
 
 def dart_history(code, *, debt_ratio_pct, current_ratio_pct, op_income_quarter,
-                 years=(2024, 2025, 2026), disclose_month_day=(("Q1", 5, 15), ("Q2", 8, 14),
+                 years=(2022, 2023, 2024, 2025, 2026), disclose_month_day=(("Q1", 5, 15), ("Q2", 8, 14),
                                                                 ("Q3", 11, 14), ("Q4", 3, 20))):
     """한 종목의 여러 분기 재무를 한 번에 만든다 (합성 시나리오 기간을 덮도록)."""
     rows = []

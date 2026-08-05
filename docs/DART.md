@@ -12,6 +12,7 @@ marcap 에는 시세만 있고 재무제표가 없다. 전략3의 종목 스크�
 |---|---|---|---|
 | 1 | `test_dart.bat` | 인증키·연결 확인 + 삼성전자 1건 실제 조회 | 5초 |
 | 2 | `update_dart.bat` | 2015년부터 올해까지 전 종목 재무 수집 | 처음 20~40분 / 이후 1~3분 |
+| 3 | `dart_report.bat` | 받은 데이터가 제대로인지 진단 (인터넷 안 씀) | 10~60초 |
 
 **반드시 `test_dart.bat` 을 먼저 실행하라.** 키가 틀렸거나 네트워크가 막혀 있으면
 `update_dart.bat` 은 40분을 헛돌지 않고 바로 알려준다.
@@ -35,6 +36,9 @@ backtest_program/
 ```bash
 python -m tools.fetch_dart --selftest              # test_dart.bat 이 부르는 것
 python -m tools.fetch_dart --from 2015             # update_dart.bat 이 부르는 것
+python -m tools.fetch_dart --report                # dart_report.bat 이 부르는 것
+python -m tools.fetch_dart --rebuild               # 안 받고 파생 지표만 다시 계산
+python -m tools.fetch_dart --only 2015-1,2015-2    # 이 분기만 콕 집어 다시
 python -m tools.fetch_dart --from 2015 --force     # 받은 것 무시하고 전부 다시
 python -m tools.fetch_dart --from 2020 --to 2022 --batch 100
 ```
@@ -49,8 +53,12 @@ python -m tools.fetch_dart --from 2020 --to 2022 --batch 100
 | `--refresh-corp-map` | 꺼짐 | 기업 고유번호 매핑만 새로 받는다 |
 | `--disclosure-lag-days` | 45 | 분기 종료 후 이 일수가 지나야 요청한다 |
 | `--annual-lag-days` | 90 | 사업보고서(4분기) 기준 일수 |
+| `--only` | 없음 | 이 분기만 받는다. `2015-1,2015-2` 또는 `2015Q1`. **이미 받았든 제공 구간 밖이든 무조건 요청** |
+| `--rebuild` | 꺼짐 | 받아 둔 `.parts` 로 연도 파일만 다시 만든다. **네트워크를 쓰지 않는다** |
+| `--report` | 꺼짐 | 진단 리포트를 낸다. 인증키도 네트워크도 필요 없다 |
+| `--quarterly-from` | 2016 | DART 가 분기·반기보고서를 주는 첫 연도. 그 이전 1~3분기는 요청하지 않는다 |
 | `--sleep` | 0 | 호출 사이 대기 초. DART 가 버거워하면 `0.1` 정도 |
-| `--resume` | — | 구버전 호환용. **기본 동작이라 아무 효과 없다** |
+| `--resume` | - | 구버전 호환용. **기본 동작이라 아무 효과 없다** |
 
 ---
 

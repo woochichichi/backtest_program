@@ -38,6 +38,8 @@ const S = {
   syncing: false,
   syncFailed: false,
   noAutoSymbol: false,   // 서버가 code 없는 /api/chart 를 거절했는가
+  hiddenInd: new Set(),  // 차트에서만 숨긴 지표 키 (전략 파일은 건드리지 않는다)
+  chartSeq: 0,           // 차트 요청 순번 — 늦게 도착한 예전 응답을 버린다
   abort: null,             // 실행 중인 백테스트의 AbortController
   jobId: null,             // 진행률 SSE / 취소용
   cancelling: false,
@@ -296,47 +298,107 @@ function specOf(type) {
   return S.specs.find((s) => s.key === type) || { key: type, label: type, params: [], overlay: true };
 }
 
+/** 저장된 전략에 정의된 지표 키 집합 (화면에서 임시로 추가한 것과 구분) */
+function strategyIndKeys() {
+  const out = new Set();
+  const list = (S.strategy && Array.isArray(S.strategy.indicators)) ? S.strategy.indicators : [];
+  for (const e of list) {
+    const spec = specOf(e.type || e.key);
+    const params = {};
+    for (const p of spec.params || []) params[p.name] = (e[p.name] ?? p.default);
+    out.add(P.indKey(spec, params));
+  }
+  return out;
+}
+
 function rebuildActive() {
   const list = (S.draft && Array.isArray(S.draft.indicators)) ? S.draft.indicators : [];
+  const fromStrat = strategyIndKeys();
   S.active = list
     .filter((e) => e && e.plot !== false)
-    .map((e, i) => {
+    .map((e) => {
       const spec = specOf(e.type || e.key);
       const params = {};
       for (const p of spec.params || []) params[p.name] = (e[p.name] ?? p.default);
+      const key = P.indKey(spec, params);
       return {
-        key: P.indKey(spec, params),
+        key,
         type: spec.key,
         params,
-        label: e.key || P.indLabel(spec, params),
+        // 라벨은 전략 정의든 화면 추가든 같은 짧은 형식으로 통일한다
+        label: P.indLabel(spec, params),
+        longLabel: P.indLongLabel(spec, params),
         overlay: spec.overlay !== false,
-        slot: i,
+        fromStrategy: fromStrat.has(key),
       };
-    });
+    })
+    .filter((a) => !S.hiddenInd.has(a.key))
+    .map((a, i) => ({ ...a, slot: i }));
+}
+
+/** 이미 같은 종류·같은 파라미터의 지표가 있는가 */
+function indExists(key) {
+  return S.active.some((a) => a.key === key) || S.hiddenInd.has(key);
+}
+
+/** 지표를 draft 에서 완전히 제거한다 */
+function removeIndicatorFromDraft(key) {
+  S.draft.indicators = (S.draft.indicators || []).filter((e) => {
+    const spec = specOf(e.type || e.key);
+    const params = {};
+    for (const p of spec.params || []) params[p.name] = (e[p.name] ?? p.default);
+    return P.indKey(spec, params) !== key;
+  });
+}
+
+/**
+ * 지표 제거 요청.
+ * 전략에 정의된 지표는 조용히 전략 파일을 바꾸지 않는다 — 무엇을 할지 물어본다.
+ */
+function requestRemoveIndicator(key) {
+  const a = S.active.find((x) => x.key === key);
+  if (!a) return;
+  if (!a.fromStrategy) {
+    removeIndicatorFromDraft(key);
+    afterIndicatorChange(`${a.label} 제거됨`);
+    return;
+  }
+  P.modal('전략에 정의된 지표입니다',
+    `<p><b>${P.esc(a.label)}</b> 는 이 전략(<b>${P.esc((S.draft && S.draft.name) || '')}</b>)에 정의된 지표입니다.</p>
+     <p>차트에서만 감출지, 전략에서도 지울지 골라 주세요.
+     전략에서 지우면 <b>저장</b>할 때 전략 파일이 실제로 바뀝니다.</p>`,
+    [
+      { label: '취소' },
+      {
+        label: '차트에서만 숨기기', onClick: () => {
+          S.hiddenInd.add(key);
+          afterIndicatorChange(`${a.label} 숨김 (전략은 그대로)`);
+        },
+      },
+      {
+        label: '전략에서도 제거', primary: true, onClick: () => {
+          removeIndicatorFromDraft(key);
+          afterIndicatorChange(`${a.label} 전략에서 제거됨 — 저장해야 반영됩니다`);
+        },
+      },
+    ]);
 }
 
 function drawChips() {
   P.renderChips(S.specs, S.active, {
-    onToggleActive: (key) => {
-      const a = S.active.find((x) => x.key === key);
-      if (!a) return;
-      S.draft.indicators = (S.draft.indicators || []).filter((e) => {
-        const spec = specOf(e.type || e.key);
-        const params = {};
-        for (const p of spec.params || []) params[p.name] = (e[p.name] ?? p.default);
-        return P.indKey(spec, params) !== a.key;
-      });
-      afterIndicatorChange(`${a.label} 숨김`);
-    },
+    onToggleActive: (key) => requestRemoveIndicator(key),
     onAddDefault: (type) => {
       const spec = specOf(type);
       const entry = { key: '', type: spec.key, plot: true };
       for (const p of spec.params || []) entry[p.name] = p.default;
       entry.key = P.indLabel(spec, entry);
+      const key = P.indKey(spec, entry);
+      if (S.hiddenInd.has(key)) { S.hiddenInd.delete(key); afterIndicatorChange(`${entry.key} 다시 표시`); return; }
+      if (indExists(key)) { P.toast(`${entry.key} 은 이미 추가되어 있습니다.`, 'err', 2600); return; }
       (S.draft.indicators ||= []).push(entry);
       afterIndicatorChange(`${entry.key} 표시`);
     },
-    onAdd: openIndicatorDialog,
+    onAdd: openIndicatorManager,
   }, (slot) => (S.chart ? S.chart.slotColor(slot) : 'currentColor'));
 }
 
@@ -764,12 +826,15 @@ async function loadChart(o = {}) {
   try {
     // start/end 를 보내지 않는다 = 상장 이후 전체 히스토리.
     // 기간 버튼은 데이터 재요청이 아니라 뷰포트 변경으로 처리한다.
+    const seq = ++S.chartSeq;
     const payload = await api.getChart({
       code,
       n: 4000,                    // 폴백 mockdata 전용 (실서버는 이 값을 쓰지 않는다)
       indicators: S.active.map((a) => a.key),
       run_id: S.result ? S.result.run_id : undefined,
     });
+    // 지표를 연달아 추가하면 요청이 겹친다. 늦게 도착한 예전 응답은 버린다.
+    if (seq !== S.chartSeq) return;
     S.symbol = { code: payload.code || code, name: payload.name || o.name || '' };
     $('symCode').textContent = S.symbol.code || '—';
     $('symName').textContent = S.symbol.name || '이름 없음';
@@ -794,6 +859,7 @@ async function loadChart(o = {}) {
       });
     }
     P.renderLegend(null, [], () => '', `${S.symbol.code} ${S.symbol.name}`);
+    P.highlightSymbol(S.symbol.code);
     P.clearBanner('err-차트 불러오기');
   } catch (e) {
     // 종목을 안 보내서 거절당한 경우는 오류가 아니라 "종목을 골라야 한다"는 뜻이다
@@ -967,6 +1033,127 @@ function setRange(months) {
   }
   if (S.chart && S.chart.hasData()) { applyRangeViewport(); return Promise.resolve(); }
   return loadChart();
+}
+
+/* ---------------- 종목 선택 (모든 진입점 공통) ---------------- */
+
+/**
+ * 화면 어디서 종목을 누르든 이 함수 하나를 거친다.
+ * 거래가 있으면 첫 거래 구간으로, 없으면 차트만 바꾼다.
+ */
+async function selectSymbol(code, opts = {}) {
+  if (!code) return;
+  const trades = (S.result && S.result.trades) || [];
+  const first = trades.find((t) => t.code === code);
+  if (first) {
+    await gotoTrade(first.no);           // 차트 교체 + 구간 이동 + 마커 강조 + 행 선택
+  } else {
+    await loadChart({ code, name: opts.name });
+    S.chart.setHighlight(null);
+    S.tradeNo = 0;
+    P.selectTradeRow(null);
+    $('tradeIdxLabel').textContent = trades.length ? `— / ${trades.length}` : '—';
+    if (S.ran) {
+      P.toast(`${opts.name || code} 은 이번 백테스트에서 거래가 없습니다. 차트만 표시합니다.`, '', 3600);
+    }
+  }
+  P.highlightSymbol(S.symbol.code);
+}
+
+/* ---------------- 지표 관리 ---------------- */
+
+/** 현재 지표 목록 + 추가를 한 화면에서 처리한다 (추가만 되는 단방향을 없앤다) */
+function openIndicatorManager() {
+  const rows = () => {
+    const items = [
+      ...S.active.map((a) => ({ ...a, hidden: false })),
+      ...[...S.hiddenInd].map((k) => ({ key: k, label: k, hidden: true, fromStrategy: true })),
+    ];
+    if (!items.length) return '<p class="hint">아직 추가된 지표가 없습니다.</p>';
+    return `<div class="ind-list">${items.map((a) => `
+      <div class="ind-row${a.hidden ? ' off' : ''}" data-k="${P.esc(a.key)}">
+        <span class="ind-sw" style="background:${a.hidden ? 'transparent' : P.esc(S.chart.slotColor(a.slot))}"></span>
+        <span class="ind-nm">${P.esc(a.longLabel || a.label)}
+          ${a.fromStrategy ? '<span class="ind-tag">전략</span>' : '<span class="ind-tag ui">임시</span>'}
+        </span>
+        <button type="button" class="btn btn-sm" data-ind-vis="${P.esc(a.key)}">${a.hidden ? '표시' : '숨기기'}</button>
+        <button type="button" class="btn btn-sm btn-danger" data-ind-del="${P.esc(a.key)}">삭제</button>
+      </div>`).join('')}</div>`;
+  };
+
+  const opts = S.specs.map((sp) => `<option value="${P.esc(sp.key)}">${P.esc(sp.label || sp.key)} (${P.esc(sp.key)})</option>`).join('');
+  P.modal('지표 관리',
+    `<div class="ind-mgr-list">${rows()}</div>
+     <div style="border-top:1px dashed var(--bd);margin-top:12px;padding-top:12px">
+       <b style="font-size:12.5px">지표 추가</b>
+       <div class="fld" style="margin-top:6px"><label for="dlgType"><b>지표</b></label>
+         <select class="inp wide" id="dlgType">${opts}</select><span class="unit"></span></div>
+       <div id="dlgParams"></div>
+       <div id="dlgDup" class="fld-err" hidden></div>
+     </div>`,
+    [
+      { label: '닫기' },
+      {
+        label: '추가', primary: true, keepOpen: true, onClick: () => {
+          const spec = specOf($('dlgType').value);
+          const entry = { key: '', type: spec.key, plot: true };
+          for (const pp of spec.params || []) {
+            const el = $('dlgP_' + pp.name);
+            let v = el ? el.value : pp.default;
+            if (pp.type === 'int') v = parseInt(v, 10);
+            else if (pp.type === 'float' || pp.type === 'number') v = parseFloat(v);
+            entry[pp.name] = Number.isNaN(v) ? pp.default : v;
+          }
+          entry.key = P.indLabel(spec, entry);
+          const key = P.indKey(spec, entry);
+          if (S.hiddenInd.has(key)) {
+            S.hiddenInd.delete(key);
+            P.closeModal(); afterIndicatorChange(`${entry.key} 다시 표시`);
+            return;
+          }
+          if (indExists(key)) {
+            const w = $('dlgDup');
+            w.hidden = false;
+            w.textContent = `${entry.key} 은 이미 추가되어 있습니다. 파라미터를 바꾸거나 위 목록에서 관리하세요.`;
+            return;
+          }
+          (S.draft.indicators ||= []).push(entry);
+          P.closeModal();
+          afterIndicatorChange(`${entry.key} 추가됨`);
+        },
+      },
+    ]);
+
+  // 목록의 표시/삭제 버튼
+  document.getElementById('modalBody').addEventListener('click', (e) => {
+    const del = e.target.closest('[data-ind-del]');
+    const vis = e.target.closest('[data-ind-vis]');
+    if (del) { P.closeModal(); requestRemoveIndicator(del.dataset.indDel); return; }
+    if (vis) {
+      const k = vis.dataset.indVis;
+      if (S.hiddenInd.has(k)) S.hiddenInd.delete(k); else S.hiddenInd.add(k);
+      P.closeModal();
+      afterIndicatorChange(S.hiddenInd.has(k) ? '지표를 숨겼습니다' : '지표를 다시 표시합니다');
+    }
+  });
+
+  const paint = () => {
+    const spec = specOf($('dlgType').value);
+    $('dlgDup').hidden = true;
+    $('dlgParams').innerHTML = (spec.params || []).map((pp) => {
+      if (Array.isArray(pp.options)) {
+        const os = pp.options.map((o) => `<option value="${P.esc(o)}"${o === pp.default ? ' selected' : ''}>${P.esc(o)}</option>`).join('');
+        return `<div class="fld"><label for="dlgP_${P.esc(pp.name)}"><b>${P.esc(pp.name)}</b></label>
+          <select class="inp wide" id="dlgP_${P.esc(pp.name)}">${os}</select><span class="unit"></span></div>`;
+      }
+      return `<div class="fld"><label for="dlgP_${P.esc(pp.name)}"><b>${P.esc(pp.name)}</b></label>
+        <input class="inp" id="dlgP_${P.esc(pp.name)}" type="number"
+          value="${P.esc(pp.default)}"${pp.min !== undefined ? ` min="${P.esc(pp.min)}"` : ''}${pp.max !== undefined ? ` max="${P.esc(pp.max)}"` : ''}${pp.step !== undefined ? ` step="${P.esc(pp.step)}"` : ''}>
+        <span class="unit"></span></div>`;
+    }).join('') || '<p class="hint">이 지표는 따로 정할 값이 없습니다.</p>';
+  };
+  $('dlgType').addEventListener('change', paint);
+  paint();
 }
 
 /* ============================================================
@@ -1155,7 +1342,9 @@ function applyResult(res) {
   S.mo.set(res.monthly || null);
   P.renderByStock(res.by_stock, { ran: true });
   P.renderTrades(res.trades, gotoTrade, { ran: true, hints: emptyHints() });
-  P.renderSignals(res.signals, { ran: true });
+  const nameByCode = new Map((res.trades || []).map((t) => [t.code, t.name]));
+  for (const b of (res.by_stock || [])) if (b.code) nameByCode.set(b.code, b.name);
+  P.renderSignals(res.signals, { ran: true, nameOf: (c) => nameByCode.get(c) });
 
   if (Array.isArray(res.warnings) && res.warnings.length) {
     P.banner('warnings', 'warn',
@@ -1166,7 +1355,7 @@ function applyResult(res) {
 
   if (res.trades && res.trades.length) {
     $('tradeIdxLabel').textContent = `1 / ${res.trades.length}`;
-    gotoTrade(res.trades[0].no);
+    gotoTrade(res.trades[0].no).then(() => P.highlightSymbol(S.symbol.code));
   } else {
     $('tradeIdxLabel').textContent = '0 / 0';
   }
@@ -1310,7 +1499,7 @@ function wire() {
   $('btnDelete').addEventListener('click', deleteStrategy);
   $('btnExport').addEventListener('click', exportStrategy);
   $('btnNewStrategy').addEventListener('click', newStrategy);
-  $('btnAddInd').addEventListener('click', openIndicatorDialog);
+  $('btnAddInd').addEventListener('click', openIndicatorManager);
   $('btnAI').addEventListener('click', runAi);
   $('btnAiExample').addEventListener('click', () => { $('aiIn').value = AI_EXAMPLE; $('aiIn').focus(); });
   $('prevTrade').addEventListener('click', () => stepTrade(-1));
@@ -1342,6 +1531,21 @@ function wire() {
   });
   document.addEventListener('click', (e) => {
     if (!$('symPop').hidden && !e.target.closest('.sym-picker')) closeSymbolPicker();
+  });
+
+  // 종목이 보이는 곳은 어디든 눌러서 차트를 바꾼다
+  P.bindSymbolLinks((code, o) => selectSymbol(code, o));
+
+  // 범례의 지표 삭제 / 접기·펼치기 (범례는 hover 마다 다시 그려지므로 위임 처리)
+  document.addEventListener('click', (e) => {
+    const x = e.target.closest('[data-ind-remove]');
+    if (x) { e.preventDefault(); e.stopPropagation(); requestRemoveIndicator(x.dataset.indRemove); return; }
+    const t = e.target.closest('[data-legend-toggle]');
+    if (t) {
+      e.preventDefault(); e.stopPropagation();
+      P.toggleLegendExpanded();
+      S.chart.requestOverlay();
+    }
   });
 
   // 오류 배너의 "자세히"
@@ -1386,7 +1590,8 @@ function setupCharts() {
   const wrap = $('chartWrap');
   S.chart = new CandleChart(wrap, {
     onHover: (info) => {
-      const meta = S.active.map((a) => ({ key: a.key, label: a.label, slot: a.slot }));
+      // 차트가 실제로 그린 지표 메타를 그대로 쓴다 — S.active 와 어긋날 여지를 없앤다
+      const meta = (info && info.indicatorMeta) || [];
       P.renderLegend(info, meta, (slot) => S.chart.slotColor(slot),
         `${S.symbol.code} ${S.symbol.name}`);
       P.renderTooltip(info, wrap.getBoundingClientRect());

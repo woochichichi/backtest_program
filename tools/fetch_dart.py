@@ -23,10 +23,10 @@
 
 이 모듈이 지키는 두 가지 규칙 (자세한 배경은 ``docs/DART.md``)
 ----------------------------------------------------------
-1. **룩어헤드 편향 차단** — 재무제표는 분기 종료 후 45~90 일 뒤에 공시된다.
+1. **룩어헤드 편향 차단** - 재무제표는 분기 종료 후 45~90 일 뒤에 공시된다.
    ``rcept_no`` 앞 8자리(접수일자) 를 ``disclosed_at`` 으로 저장하고,
    조회는 ``engine.dart.DartStore.as_of()`` 로만 한다.
-2. **분기 손익은 누적값 차분** — 손익계산서(IS) 금액은 누적이다.
+2. **분기 손익은 누적값 차분** - 손익계산서(IS) 금액은 누적이다.
    ``Q2 = 반기누적 - 1분기누적`` 처럼 차분해 ``op_income_quarter`` 를 만든다.
    중간 분기가 비면 ``None`` 으로 두고 "모른다" 로 처리한다.
 """
@@ -121,8 +121,19 @@ AMOUNT_COLUMNS = [
 ]
 
 META_COLUMNS = ["code", "corp_code", "year", "quarter", "disclosed_at", "fs_div", "currency"]
-DERIVED_COLUMNS = ["debt_ratio_pct", "current_ratio_pct", "op_income_quarter"]
+DERIVED_COLUMNS = [
+    "debt_ratio_pct", "current_ratio_pct", "op_income_quarter", "capital_impaired",
+]
 OUTPUT_COLUMNS = META_COLUMNS + AMOUNT_COLUMNS + DERIVED_COLUMNS
+
+#: 분모가 자산총계의 이 비율보다 작으면 비율을 계산하지 않는다.
+#: 유동부채가 1,000원인데 유동자산이 52조면 유동비율이 52억% 가 된다. 그런 값은
+#: "유동비율 100% 초과" 필터를 무조건 통과시켜 필터를 무력화한다.
+MIN_DENOM_RATIO = 0.0001   # 자산총계의 0.01%
+
+#: DART 재무정보 API 는 2015년은 사업보고서만 제공하고, 분기·반기는 2016년부터 제공한다.
+#: (사용자 실측: 2015 Q1~Q3 는 전부 status 013, 2015 사업보고서와 2016 이후는 정상)
+DART_QUARTERLY_FROM_YEAR = 2016
 
 STATE_FILENAME = ".fetch_state.json"
 CORP_MAP_FILENAME = "corp_map.parquet"
@@ -162,7 +173,7 @@ class AuthError(DartStatusError):
 
 
 class NoData(DartStatusError):
-    """조회된 데이터가 없다 (013). **오류가 아니다** — 조용히 건너뛴다."""
+    """조회된 데이터가 없다 (013). **오류가 아니다** - 조용히 건너뛴다."""
 
 
 class RateLimitExceeded(DartStatusError):
@@ -735,27 +746,60 @@ def quarterly_from_cumulative(
     return out
 
 
-def _ratio(numer, denom) -> Optional[float]:
+#: ``_ratio`` 가 값을 내지 못한 이유
+RATIO_OK = "ok"
+RATIO_MISSING = "missing"        # 분자/분모 원자료가 없다
+RATIO_NONPOSITIVE = "nonpositive"  # 분모가 0 이하 (자본잠식 포함)
+RATIO_TINY = "tiny"              # 분모가 자산총계에 비해 터무니없이 작다
+
+
+def _ratio_reason(numer, denom, scale=None) -> Tuple[Optional[float], str]:
+    """비율(%)과 계산하지 못한 이유를 함께 돌려준다.
+
+    분모가 0 이하이거나 **자산총계의 0.01% 미만**이면 계산하지 않는다.
+    유동부채가 1,000원짜리 껍데기 회사에서 유동비율 52억% 같은 값이 나오면
+    "유동비율 100% 초과" 필터가 통째로 무력화되기 때문이다.
+    """
     n = _as_opt_int(numer)
     d = _as_opt_int(denom)
-    if n is None or d is None or d <= 0:
-        # 자본잠식(자본총계<=0)·분모 0 은 "계산 불가" 로 둔다.
-        # 필터에서는 값이 없으므로 보수적으로 제외된다.
-        return None
-    return round(n / d * 100.0, 2)
+    if n is None or d is None:
+        return None, RATIO_MISSING
+    if d <= 0:
+        return None, RATIO_NONPOSITIVE
+    s = _as_opt_int(scale)
+    if s is not None and s > 0 and d < s * MIN_DENOM_RATIO:
+        return None, RATIO_TINY
+    return round(n / d * 100.0, 2), RATIO_OK
+
+
+def _ratio(numer, denom, scale=None) -> Optional[float]:
+    return _ratio_reason(numer, denom, scale)[0]
 
 
 def add_quarter_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """``debt_ratio_pct`` / ``current_ratio_pct`` / ``op_income_quarter`` 를 채운다.
+    """파생 컬럼을 채운다.
 
-    ``op_income_quarter`` 는 **같은 회사·같은 연도 안에서** 누적 영업이익을 차분한 값이다.
+    - ``debt_ratio_pct`` = 부채총계 / 자본총계 × 100
+    - ``current_ratio_pct`` = 유동자산 / 유동부채 × 100
+    - ``op_income_quarter`` — **같은 회사·같은 연도 안에서** 누적 영업이익을 차분한 값
+    - ``capital_impaired`` — 자본총계 <= 0 (자본잠식). 부채비율로는 걸러지지 않으므로
+      **별도 플래그로 표시**한다. 부채비율은 이때 계산하지 않는다(음수 비율은 의미가 없다).
     """
     if df.empty:
         return df
 
     out = df.copy()
-    out["debt_ratio_pct"] = [_ratio(a, b) for a, b in zip(out["부채총계"], out["자본총계"])]
-    out["current_ratio_pct"] = [_ratio(a, b) for a, b in zip(out["유동자산"], out["유동부채"])]
+    scale = list(out["자산총계"]) if "자산총계" in out.columns else [None] * len(out)
+    out["debt_ratio_pct"] = [
+        _ratio(a, b, s) for a, b, s in zip(out["부채총계"], out["자본총계"], scale)
+    ]
+    out["current_ratio_pct"] = [
+        _ratio(a, b, s) for a, b, s in zip(out["유동자산"], out["유동부채"], scale)
+    ]
+    out["capital_impaired"] = pd.array(
+        [None if _as_opt_int(v) is None else (_as_opt_int(v) <= 0) for v in out["자본총계"]],
+        dtype="boolean",
+    )
 
     q_values: List[Optional[int]] = [None] * len(out)
     positions: Dict[Tuple[str, int], Dict[int, int]] = {}
@@ -807,11 +851,25 @@ def to_frame(rows: Sequence[dict]) -> pd.DataFrame:
         df[c] = pd.array([_as_opt_int(v) for v in df[c]], dtype="Int64")
     for c in ("debt_ratio_pct", "current_ratio_pct"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    df["capital_impaired"] = pd.array(
+        [_as_opt_bool(v) for v in df["capital_impaired"]], dtype="boolean"
+    )
     return df[OUTPUT_COLUMNS]
 
 
+def _as_opt_bool(v) -> Optional[bool]:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return bool(v)
+
+
 # ======================================================================================
-# 6. 공시 시점 — 아직 나오지 않은 분기는 요청하지 않는다
+# 6. 공시 시점 - 아직 나오지 않은 분기는 요청하지 않는다
 # ======================================================================================
 
 
@@ -848,13 +906,35 @@ PLAN_FETCH = "fetch"
 PLAN_RECENT = "recent"
 PLAN_DONE = "done"
 PLAN_NOT_DUE = "not_due"
+PLAN_NO_COVERAGE = "no_coverage"
+PLAN_NOT_SELECTED = "not_selected"
 
 PLAN_REASON_TEXT = {
     PLAN_DONE: "이미 받음",
     PLAN_NOT_DUE: "아직 공시 기간이 아님",
+    PLAN_NO_COVERAGE: "DART 가 제공하지 않는 구간",
+    PLAN_NOT_SELECTED: "--only 로 고르지 않음",
     PLAN_RECENT: "최근 분기 재확인",
     PLAN_FETCH: "받는 중",
 }
+
+_ONLY_RE = re.compile(r"^\s*(\d{4})\s*[-Qq]\s*([1-4])\s*$")
+
+
+def parse_only(spec) -> Optional[set]:
+    """``"2015-1,2015-2,2015Q3"`` → ``{(2015,1),(2015,2),(2015,3)}``."""
+    if spec is None:
+        return None
+    items = spec if isinstance(spec, (list, tuple, set)) else str(spec).split(",")
+    out = set()
+    for raw in items:
+        if not str(raw).strip():
+            continue
+        m = _ONLY_RE.match(str(raw))
+        if not m:
+            raise ValueError(f"--only 형식이 잘못됐습니다: {raw!r} (예: 2015-1 또는 2015Q1)")
+        out.add((int(m.group(1)), int(m.group(2))))
+    return out or None
 
 
 def plan_quarters(
@@ -866,13 +946,23 @@ def plan_quarters(
     refresh_recent: int = 2,
     lag_days: int = DISCLOSURE_LAG_DAYS,
     annual_lag_days: Optional[int] = ANNUAL_DISCLOSURE_LAG_DAYS,
+    quarterly_from: int = DART_QUARTERLY_FROM_YEAR,
+    only=None,
 ) -> List[dict]:
     """받을 (연도, 분기) 목록과 각각의 사유를 만든다.
 
     반환 원소: ``{"year","quarter","action","reason","rows","due"}``
     ``action`` 은 ``"fetch"`` 또는 ``"skip"``.
+
+    건너뛰는 경우
+      - ``not_due``      — 법정 제출 기한이 아직 안 왔다
+      - ``no_coverage``  — DART 재무정보 API 가 제공하지 않는 구간
+                           (2015년 1~3분기. ``--force`` / ``--only`` 로 무시할 수 있다)
+      - ``done``         — 이미 받았다
+      - ``not_selected`` — ``--only`` 로 고르지 않았다
     """
     today = today or dt.date.today()
+    only_set = parse_only(only)
 
     due: List[Tuple[int, int, dt.date]] = []
     not_due: List[Tuple[int, int, dt.date]] = []
@@ -886,27 +976,38 @@ def plan_quarters(
     not_due_set = {(y, q) for y, q, _ in not_due}
 
     plan: List[dict] = []
+
+    def add(y, q, action, reason, rows, d):
+        plan.append({"year": y, "quarter": q, "action": action,
+                     "reason": reason, "rows": rows, "due": d})
+
     for y, q, d in sorted(due + not_due):
         rec = state.quarter(y, q)
         rows = int(rec.get("rows", 0)) if rec else 0
+        explicit = only_set is not None and (y, q) in only_set
+
+        if only_set is not None and not explicit:
+            add(y, q, "skip", PLAN_NOT_SELECTED, rows, d)
+            continue
+        if explicit:                      # 사용자가 콕 집었으면 다른 규칙보다 우선
+            add(y, q, "fetch", PLAN_FETCH, rows, d)
+            continue
         if (y, q) in not_due_set:
-            plan.append({"year": y, "quarter": q, "action": "skip",
-                         "reason": PLAN_NOT_DUE, "rows": rows, "due": d})
+            add(y, q, "skip", PLAN_NOT_DUE, rows, d)
+            continue
+        if q in (1, 2, 3) and y < int(quarterly_from) and not force:
+            add(y, q, "skip", PLAN_NO_COVERAGE, rows, d)
             continue
         if force:
-            plan.append({"year": y, "quarter": q, "action": "fetch",
-                         "reason": PLAN_FETCH, "rows": rows, "due": d})
+            add(y, q, "fetch", PLAN_FETCH, rows, d)
             continue
         if (y, q) in recent:
-            plan.append({"year": y, "quarter": q, "action": "fetch",
-                         "reason": PLAN_RECENT, "rows": rows, "due": d})
+            add(y, q, "fetch", PLAN_RECENT, rows, d)
             continue
         if rec and rec.get("complete"):
-            plan.append({"year": y, "quarter": q, "action": "skip",
-                         "reason": PLAN_DONE, "rows": rows, "due": d})
+            add(y, q, "skip", PLAN_DONE, rows, d)
             continue
-        plan.append({"year": y, "quarter": q, "action": "fetch",
-                     "reason": PLAN_FETCH, "rows": rows, "due": d})
+        add(y, q, "fetch", PLAN_FETCH, rows, d)
     return plan
 
 
@@ -961,7 +1062,7 @@ class FetchState:
 
         quarters = raw.get("quarters")
         if not isinstance(quarters, dict):
-            # v1 포맷(done) 에서 올라온 경우 — 완료 표시만 살린다.
+            # v1 포맷(done) 에서 올라온 경우 - 완료 표시만 살린다.
             quarters = {}
             for k, v in (raw.get("done") or {}).items():
                 m = re.match(r"^(\d{4})Q([1-4])$", str(k))
@@ -1083,10 +1184,45 @@ def _rebuild_year(out_dir: Path, year: int) -> int:
     if not frames:
         return 0
     df = pd.concat(frames, ignore_index=True)
+    for c in OUTPUT_COLUMNS:                      # 예전 파일에 없던 파생 컬럼 보정
+        if c not in df.columns:
+            df[c] = None
     df = add_quarter_columns(df)
     df = df.sort_values(["code", "year", "quarter"], kind="stable").reset_index(drop=True)
+    df = to_frame(df.to_dict("records"))
     df.to_parquet(out_dir / f"fundamentals-{int(year)}.parquet", index=False)
     return len(df)
+
+
+def rebuild_all(out_dir: str | os.PathLike = "dart") -> int:
+    """이미 받아 둔 ``.parts/`` 만 가지고 연도 파일을 다시 만든다. **네트워크를 쓰지 않는다.**
+
+    파생 컬럼(부채비율·유동비율·분기영업이익·자본잠식 플래그) 계산 규칙이 바뀌었을 때
+    다시 내려받지 않고 반영하는 길이다.
+    """
+    out = Path(out_dir)
+    parts = sorted((out / PARTS_DIRNAME).glob("fundamentals-*-Q*.parquet"))
+    if not parts:
+        print("다시 만들 원본 조각(.parts)이 없습니다.", flush=True)
+        print(f"  찾은 위치: {out / PARTS_DIRNAME}", flush=True)
+        print("  update_dart.bat 을 먼저 실행해 데이터를 받으세요.", flush=True)
+        return REPORT_NO_DATA
+    years = sorted({
+        int(m.group(1))
+        for m in (re.search(r"fundamentals-(\d{4})-Q", p.name) for p in parts)
+        if m
+    })
+    print(f"원본 조각 {len(parts)}개로 {len(years)}개 연도 파일을 다시 만듭니다. "
+          "인터넷은 쓰지 않습니다.", flush=True)
+    total = 0
+    for y in years:
+        n = _rebuild_year(out, y)
+        total += n
+        print(f"  fundamentals-{y}.parquet  ({n:,}행)", flush=True)
+    print("", flush=True)
+    print(f"[완료] 총 {total:,}행. 파생 지표를 새 규칙으로 다시 계산했습니다.", flush=True)
+    print("       dart_report.bat 으로 결과를 확인하세요.", flush=True)
+    return 0
 
 
 def run_fetch(
@@ -1104,6 +1240,8 @@ def run_fetch(
     lag_days: int = DISCLOSURE_LAG_DAYS,
     annual_lag_days: Optional[int] = ANNUAL_DISCLOSURE_LAG_DAYS,
     call_limit: int = DAILY_CALL_LIMIT,
+    quarterly_from: int = DART_QUARTERLY_FROM_YEAR,
+    only=None,
 ) -> int:
     """전체 수집 절차. 종료 코드를 돌려준다.
 
@@ -1174,9 +1312,12 @@ def run_fetch(
     plan = plan_quarters(
         year_from, year_to, state, today=today, force=force,
         refresh_recent=refresh_recent, lag_days=lag_days, annual_lag_days=annual_lag_days,
+        quarterly_from=quarterly_from, only=only,
     )
     targets = [p for p in plan if p["action"] == "fetch"]
-    skipped = [p for p in plan if p["action"] == "skip"]
+    # --only 로 빼놓은 분기는 화면에 나열하지 않는다 (수십 줄이 쏟아진다)
+    skipped = [p for p in plan
+               if p["action"] == "skip" and p["reason"] != PLAN_NOT_SELECTED]
 
     per_quarter_calls = math.ceil(len(corp_codes) / max(1, batch))
     est_calls = len(targets) * per_quarter_calls
@@ -1194,13 +1335,15 @@ def run_fetch(
     print("", flush=True)
 
     # 건너뛰는 분기부터 이유와 함께 보여준다.
-    for p in plan:
+    for p in skipped:
         tag = f"{p['year']}-{p['quarter']}"
-        if p["action"] == "skip":
-            if p["reason"] == PLAN_DONE:
-                print(f"  {tag}  건너뜀 (이미 받음, {p['rows']:,}행)", flush=True)
-            else:
-                print(f"  {tag}  건너뜀 (아직 공시 기간이 아님, {p['due']} 이후 수집)", flush=True)
+        if p["reason"] == PLAN_DONE:
+            print(f"  {tag}  건너뜀 (이미 받음, {p['rows']:,}행)", flush=True)
+        elif p["reason"] == PLAN_NO_COVERAGE:
+            print(f"  {tag}  건너뜀 (DART 가 {quarterly_from}년 이전 분기보고서를 "
+                  "제공하지 않습니다)", flush=True)
+        else:
+            print(f"  {tag}  건너뜀 (아직 공시 기간이 아님, {p['due']} 이후 수집)", flush=True)
     if skipped:
         print("", flush=True)
 
@@ -1446,7 +1589,7 @@ def selftest(
 
 
 # ======================================================================================
-# 10. 진단 리포트 (--report) — 네트워크를 쓰지 않는다
+# 10. 진단 리포트 (--report) - 네트워크를 쓰지 않는다
 # ======================================================================================
 
 REPORT_OK = 0
@@ -1498,6 +1641,28 @@ def _num(v, digits: int = 0) -> str:
     return f"{float(v):,.{digits}f}"
 
 
+def _fitnum(v, digits: int = 0, width: int = 9) -> str:
+    """폭 안에 안 들어가면 지수 표기로 떨어뜨린다 (표가 깨지지 않게)."""
+    s = _num(v, digits)
+    if _w(s) <= width - 1:
+        return s
+    try:
+        return f"{float(v):.2e}"
+    except (TypeError, ValueError):  # pragma: no cover
+        return s
+
+
+def _fitnum(v, digits: int = 0, width: int = 9) -> str:
+    """폭 안에 안 들어가면 지수 표기로 떨어뜨린다 (표가 깨지지 않게)."""
+    s = _num(v, digits)
+    if _w(s) <= width - 1:
+        return s
+    try:
+        return f"{float(v):.2e}"
+    except (TypeError, ValueError):  # pragma: no cover
+        return s
+
+
 def _eok(v) -> str:
     """원 단위 정수를 억원으로."""
     n = _as_opt_int(v)
@@ -1542,6 +1707,31 @@ class _Report:
 
 
 # --- marcap 쪽 읽기 (engine 을 수정하지 않고 컬럼 하나만 읽는다) -----------------------
+
+
+def _load_raw(root: Path) -> pd.DataFrame:
+    """연도 parquet 를 **그대로** 읽는다.
+
+    ``DartStore`` 는 자기가 아는 컬럼만 남기므로, 진단할 때는 디스크에 실제로 무엇이
+    들어 있는지 그대로 봐야 한다 (예: ``capital_impaired`` 는 아직 엔진 스키마에 없다).
+    """
+    frames = []
+    for p in sorted(root.glob("fundamentals-*.parquet")):
+        try:
+            frames.append(pd.read_parquet(p))
+        except Exception:  # pragma: no cover - 손상 파일
+            continue
+    if not frames:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in OUTPUT_COLUMNS})
+    df = pd.concat(frames, ignore_index=True)
+    for c in OUTPUT_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int32")
+    df["quarter"] = pd.to_numeric(df["quarter"], errors="coerce").astype("Int8")
+    df["code"] = df["code"].astype("string")
+    df["disclosed_at"] = pd.to_datetime(df["disclosed_at"], errors="coerce")
+    return df
 
 
 def _marcap_files(marcap_root: str | os.PathLike) -> Dict[int, Path]:
@@ -1596,7 +1786,7 @@ def _marcap_live_codes(marcap_root) -> set:
 
 
 def _section_collection(r: _Report, df: pd.DataFrame, files: Dict[int, Path],
-                        root: Path, marcap_root) -> None:
+                        root: Path, marcap_root, today: dt.date) -> None:
     r.p("[가] 수집 현황")
     r.p(THIN)
 
@@ -1672,13 +1862,43 @@ def _section_collection(r: _Report, df: pd.DataFrame, files: Dict[int, Path],
 
     r.p("")
     if empty_rows:
-        recent = [s for s in empty_rows if int(s.split("-")[0]) >= max(years) - 1]
-        old = [s for s in empty_rows if s not in recent]
-        if recent:
-            r.note(f"아직 공시 기간이 아닌 분기가 비어 있습니다: {', '.join(recent)}")
-        if old:
-            r.issue(f"과거 분기가 비어 있습니다: {', '.join(old[:8])}"
-                    f"{' …' if len(old) > 8 else ''} — 그 분기를 못 받았을 수 있습니다.")
+        # 왜 비었는지 .fetch_state.json 을 보고 갈라 본다.
+        quarters_state = {}
+        try:
+            if state_path.is_file():
+                raw = json.loads(state_path.read_text(encoding="utf-8-sig"))
+                quarters_state = raw.get("quarters") or {}
+        except (OSError, ValueError):  # pragma: no cover
+            pass
+
+        not_due, no_coverage, no_data, never = [], [], [], []
+        for s in empty_rows:
+            y, q = (int(x) for x in s.split("-"))
+            if disclosure_due_date(y, q, DISCLOSURE_LAG_DAYS,
+                                   ANNUAL_DISCLOSURE_LAG_DAYS) > today:
+                not_due.append(s)
+            elif q in (1, 2, 3) and y < DART_QUARTERLY_FROM_YEAR:
+                no_coverage.append(s)
+            elif isinstance(quarters_state.get(f"{y}-{q}"), dict):
+                no_data.append(s)
+            else:
+                never.append(s)
+
+        if not_due:
+            r.note(f"아직 공시 기간이 아닌 분기가 비어 있습니다: {', '.join(not_due)}")
+        if no_coverage:
+            r.note(f"{', '.join(no_coverage)} 은 DART 재무정보 API 가 제공하지 않는 구간입니다. "
+                   f"분기·반기보고서는 {DART_QUARTERLY_FROM_YEAR}년부터, "
+                   f"{DART_QUARTERLY_FROM_YEAR - 1}년은 사업보고서만 있습니다. 정상입니다.")
+        if no_data:
+            r.issue(f"요청은 했는데 DART 가 데이터 없음(013)으로 답한 분기가 있습니다: "
+                    f"{', '.join(no_data[:8])}{' …' if len(no_data) > 8 else ''} - "
+                    "python -m tools.fetch_dart --only "
+                    f"{','.join(no_data[:3])} 로 다시 받아 보세요.")
+        if never:
+            r.issue(f"아예 받지 않은 분기가 있습니다: {', '.join(never[:8])}"
+                    f"{' …' if len(never) > 8 else ''} - "
+                    "update_dart.bat 을 다시 실행하면 이어받습니다.")
     if thin_rows:
         r.issue(f"행 수가 유난히 적은 분기가 있습니다: {', '.join(thin_rows[:8])}"
                 f"{' …' if len(thin_rows) > 8 else ''}")
@@ -1688,12 +1908,13 @@ def _section_collection(r: _Report, df: pd.DataFrame, files: Dict[int, Path],
 
 
 def _section_parsing(r: _Report, df: pd.DataFrame) -> None:
-    r.p("[나] 파싱 점검 — 계정명·금액 표기가 제대로 잡혔는지")
+    r.p("[나] 파싱 점검 - 계정명·금액 표기가 제대로 잡혔는지")
     r.p(THIN)
     n = len(df)
 
     r.p("  재무 항목별 결측률")
     r.p("  " + _lj("항목", 14) + _rj("값 있음", 10) + _rj("결측", 10) + _rj("결측률", 10))
+    pending: List[str] = []
     for c in AMOUNT_COLUMNS:
         have = int(df[c].notna().sum())
         miss = n - have
@@ -1702,40 +1923,48 @@ def _section_parsing(r: _Report, df: pd.DataFrame) -> None:
             + _rj(f"{pct:.1f}%", 10))
         limit = MISSING_WARN_PCT_CURRENT if c in ("유동자산", "유동부채") else MISSING_WARN_PCT
         if pct > limit:
-            r.issue(f"'{c}' 가 {pct:.0f}% 결측입니다. "
-                    "DART 응답의 account_nm 표기와 매칭이 어긋났을 수 있습니다.")
+            pending.append(f"'{c}' 항목이 {pct:.0f}% 결측입니다. "
+                           "DART 응답의 account_nm 표기와 매칭이 어긋났을 수 있습니다.")
+    for msg in pending:
+        r.issue(msg)
     r.p("")
 
     # --- 파생 지표 분포 ---
     r.p("  파생 지표 분포")
-    r.p("  " + _lj("지표", 18) + _rj("건수", 9) + _rj("최소", 12) + _rj("25%", 11)
-        + _rj("중앙", 11) + _rj("75%", 11) + _rj("최대", 13))
-    for col, unit, digits in (
-        ("debt_ratio_pct", "%", 1),
-        ("current_ratio_pct", "%", 1),
-        ("op_income_quarter", "억원", 0),
+    r.p("    (컬럼명: debt_ratio_pct / current_ratio_pct / op_income_quarter)")
+    r.p("  " + _lj("지표", 18) + _rj("건수", 9) + _rj("최소", 10) + _rj("25%", 10)
+        + _rj("중앙", 10) + _rj("75%", 10) + _rj("최대", 10))
+    pending = []
+    for col, label, digits in (
+        ("debt_ratio_pct", "부채비율(%)", 1),
+        ("current_ratio_pct", "유동비율(%)", 1),
+        ("op_income_quarter", "분기영업이익(억)", 0),
     ):
         s = df[col]
         if col == "op_income_quarter":
             s = pd.to_numeric(s, errors="coerce").astype("float64") / 100_000_000.0
         st = _stats(s)
         if st is None:
-            r.p("  " + _lj(f"{col}({unit})", 18) + _rj("0", 9) + "  (값 없음)")
-            r.issue(f"'{col}' 에 값이 하나도 없습니다.")
+            r.p("  " + _lj(label, 18) + _rj("0", 9) + "   (값 없음)")
+            pending.append(f"'{col}' 에 값이 하나도 없습니다.")
             continue
-        r.p("  " + _lj(f"{col}({unit})", 18) + _rj(f"{st['n']:,}", 9)
-            + _rj(_num(st["min"], digits), 12) + _rj(_num(st["p25"], digits), 11)
-            + _rj(_num(st["median"], digits), 11) + _rj(_num(st["p75"], digits), 11)
-            + _rj(_num(st["max"], digits), 13))
+        r.p("  " + _lj(label, 18) + _rj(f"{st['n']:,}", 9)
+            + _rj(_fitnum(st["min"], digits, 10), 10)
+            + _rj(_fitnum(st["p25"], digits, 10), 10)
+            + _rj(_fitnum(st["median"], digits, 10), 10)
+            + _rj(_fitnum(st["p75"], digits, 10), 10)
+            + _rj(_fitnum(st["max"], digits, 10), 10))
         miss_pct = (1 - st["n"] / n) * 100.0 if n else 0.0
         if miss_pct > MISSING_WARN_PCT_CURRENT:
-            r.issue(f"'{col}' 이 {miss_pct:.0f}% 결측입니다.")
+            pending.append(f"'{col}' 이 {miss_pct:.0f}% 결측입니다.")
+    for msg in pending:
+        r.issue(msg)
 
     st = _stats(df["debt_ratio_pct"])
     if st is not None:
         if not (5.0 <= st["median"] <= 400.0):
             r.issue(f"부채비율 중앙값이 {st['median']:,.1f}% 입니다. "
-                    "보통 40~150% 범위입니다 — 단위나 부호 파싱을 의심하세요.")
+                    "보통 40~150% 범위입니다 - 단위나 부호 파싱을 의심하세요.")
         absurd = int((pd.to_numeric(df["debt_ratio_pct"], errors="coerce")
                       > DEBT_RATIO_ABSURD).sum())
         if absurd:
@@ -1750,6 +1979,37 @@ def _section_parsing(r: _Report, df: pd.DataFrame) -> None:
     st = _stats(df["current_ratio_pct"])
     if st is not None and not (30.0 <= st["median"] <= 1000.0):
         r.issue(f"유동비율 중앙값이 {st['median']:,.1f}% 입니다. 보통 100~250% 범위입니다.")
+    r.p("")
+
+    # --- 분모 방어: 왜 계산하지 못했는가 ------------------------------------------------
+    r.p("  비율을 계산하지 않은 건수 (분모 방어)")
+    r.p(f"    분모가 자산총계의 {MIN_DENOM_RATIO * 100:.2f}% 미만이면 계산하지 않습니다.")
+    r.p("    그런 값을 남겨 두면 '유동비율 100% 초과' 필터를 무조건 통과해 필터가 무력해집니다.")
+    r.p("  " + _lj("비율", 12) + _rj("계산됨", 10) + _rj("분모<=0", 10)
+        + _rj("분모 과소", 11) + _rj("원자료 없음", 13))
+    for label, numer, denom in (("부채비율", "부채총계", "자본총계"),
+                                ("유동비율", "유동자산", "유동부채")):
+        counts = {RATIO_OK: 0, RATIO_NONPOSITIVE: 0, RATIO_TINY: 0, RATIO_MISSING: 0}
+        for a, b, s in zip(df[numer], df[denom], df["자산총계"]):
+            counts[_ratio_reason(a, b, s)[1]] += 1
+        r.p("  " + _lj(label, 12) + _rj(f"{counts[RATIO_OK]:,}", 10)
+            + _rj(f"{counts[RATIO_NONPOSITIVE]:,}", 10)
+            + _rj(f"{counts[RATIO_TINY]:,}", 11)
+            + _rj(f"{counts[RATIO_MISSING]:,}", 13))
+        if counts[RATIO_TINY] > max(1, n // 100):
+            r.note(f"{label}: 분모가 지나치게 작아 계산하지 않은 행이 "
+                   f"{counts[RATIO_TINY]:,}건 있습니다. 껍데기 회사·관리종목에서 나옵니다.")
+
+    imp = df["capital_impaired"]
+    if imp.notna().any():
+        n_imp = int((imp == True).sum())  # noqa: E712 - nullable boolean
+        codes_imp = int(df.loc[imp == True, "code"].nunique())  # noqa: E712
+        r.p(f"  자본잠식(자본총계 <= 0)                : {n_imp:,}행 / {codes_imp:,}종목")
+        r.p("    부채비율로는 걸러지지 않으므로 capital_impaired 플래그로 따로 표시합니다.")
+        r.p("    (음수 비율은 의미가 없어 부채비율은 비워 둡니다)")
+    else:
+        r.note("capital_impaired 컬럼이 비어 있습니다. 예전 규칙으로 받은 파일입니다. "
+               "'python -m tools.fetch_dart --rebuild' 로 다시 계산하세요 (인터넷 안 씀).")
     r.p("")
 
     # --- 음수가 실제로 잡혔는가 ---
@@ -1786,7 +2046,8 @@ def _section_parsing(r: _Report, df: pd.DataFrame) -> None:
 
     # --- 유동자산/유동부채가 아예 없는 종목 ---
     by_code = df.groupby("code")[["유동자산", "유동부채"]].count()
-    no_current = by_code[(by_code["유동자산"] == 0) & (by_code["유동부채"] == 0)]
+    # 둘 중 하나만 없어도 유동비율을 못 구한다
+    no_current = by_code[(by_code["유동자산"] == 0) | (by_code["유동부채"] == 0)]
     total_codes = int(df["code"].nunique())
     r.p(f"  유동자산/유동부채가 한 번도 없는 종목 : {len(no_current):,}개 "
         f"/ {total_codes:,}개 ({len(no_current) / total_codes * 100 if total_codes else 0:.1f}%)")
@@ -1812,7 +2073,7 @@ def _pick_loss_code(df: pd.DataFrame) -> Optional[str]:
 
 
 def _section_samples(r: _Report, store, df: pd.DataFrame, limit: int = 12) -> None:
-    r.p("[다] 대표 종목 샘플 — 숫자가 상식적인지 눈으로 확인")
+    r.p("[다] 대표 종목 샘플 - 숫자가 상식적인지 눈으로 확인")
     r.p(THIN)
 
     targets = list(SAMPLE_CODES)
@@ -1842,8 +2103,8 @@ def _section_samples(r: _Report, store, df: pd.DataFrame, limit: int = 12) -> No
             r.p("  "
                 + _lj(f"{_as_opt_int(row['year'])}-{_as_opt_int(row['quarter'])}", 10)
                 + _lj("-" if pd.isna(d) else str(pd.Timestamp(d).date()), 13)
-                + _rj(_num(row["debt_ratio_pct"], 1), 11)
-                + _rj(_num(row["current_ratio_pct"], 1), 11)
+                + _rj(_fitnum(row["debt_ratio_pct"], 1, 11), 11)
+                + _rj(_fitnum(row["current_ratio_pct"], 1, 11), 11)
                 + _rj(_eok(row["op_income_quarter"]), 20))
         if len(sub) > limit:
             r.p(f"      (최근 {limit}개만 표시. 전체 {len(sub)}행)")
@@ -1855,21 +2116,21 @@ def _section_samples(r: _Report, store, df: pd.DataFrame, limit: int = 12) -> No
                 r.issue("삼성전자 부채비율이 전부 비어 있습니다.")
             elif not (lo <= st["median"] <= hi):
                 r.issue(f"삼성전자 부채비율 중앙값이 {st['median']:,.1f}% 입니다. "
-                        f"정상 범위는 {lo:.0f}~{hi:.0f}% 입니다 — 파싱 오류를 의심하세요.")
+                        f"정상 범위는 {lo:.0f}~{hi:.0f}% 입니다 - 파싱 오류를 의심하세요.")
             else:
-                r.p(f"      삼성전자 부채비율 중앙값 {st['median']:.1f}% — 정상 범위입니다.")
+                r.p(f"      삼성전자 부채비율 중앙값 {st['median']:.1f}% - 정상 범위입니다.")
             st = _stats(sub["current_ratio_pct"])
             lo, hi = SAMSUNG_CURRENT_RATIO_RANGE
             if st is not None and not (lo <= st["median"] <= hi):
                 r.issue(f"삼성전자 유동비율 중앙값이 {st['median']:,.1f}% 입니다. "
                         f"정상 범위는 {lo:.0f}~{hi:.0f}% 입니다.")
             elif st is not None:
-                r.p(f"      삼성전자 유동비율 중앙값 {st['median']:.1f}% — 정상 범위입니다.")
+                r.p(f"      삼성전자 유동비율 중앙값 {st['median']:.1f}% - 정상 범위입니다.")
     r.p("")
 
 
 def _section_asof(r: _Report, store, df: pd.DataFrame) -> None:
-    r.p("[라] as-of 동작 확인 — 공시 전 재무를 미리 보고 있지 않은지")
+    r.p("[라] as-of 동작 확인 - 공시 전 재무를 미리 보고 있지 않은지")
     r.p(THIN)
 
     code = "005930"
@@ -1937,7 +2198,7 @@ def _section_asof(r: _Report, store, df: pd.DataFrame) -> None:
 
 
 def _section_survivorship(r: _Report, df: pd.DataFrame, marcap_root) -> None:
-    r.p("[마] 생존 편향 규모 — marcap 에는 있는데 재무가 없는 종목")
+    r.p("[마] 생존 편향 규모 - marcap 에는 있는데 재무가 없는 종목")
     r.p(THIN)
 
     years = sorted(int(y) for y in df["year"].dropna().unique())
@@ -1956,18 +2217,32 @@ def _section_survivorship(r: _Report, df: pd.DataFrame, marcap_root) -> None:
     missing_live = missing & live
     missing_gone = missing - live
 
+    pct = len(missing) / len(marcap_all) * 100.0 if marcap_all else 0.0
     r.p(f"  marcap 등장 종목 ({min(years)}~{max(years)}) : {len(marcap_all):,}개")
-    r.p(f"  DART 재무가 한 건도 없는 종목        : {len(missing):,}개 "
-        f"({len(missing) / len(marcap_all) * 100:.1f}%)")
-    r.p(f"    - 지금도 상장 중                   : {len(missing_live):,}개")
+    r.p(f"  DART 재무가 한 건도 없는 종목        : {len(missing):,}개 ({pct:.1f}%)")
+    r.p(f"    - 지금도 상장 중 (미커버)          : {len(missing_live):,}개")
     r.p(f"    - 지금은 없음 (상장폐지 추정)      : {len(missing_gone):,}개")
     r.p("")
     r.p("  상장폐지 종목의 과거 재무는 corpCode.xml 에 종목코드가 남지 않아 받을 수 없습니다.")
-    r.p("  재무 필터를 켜면 그 종목들이 통째로 빠지므로, 실제보다 결과가 좋게 나올 수 있습니다.")
+    r.p("")
+    r.p("  이 종목들을 재무 필터에서 어떻게 다룰지는 universe.filters.on_missing 이 정합니다.")
+    r.p("")
+    r.p(f'  on_missing: "include"  (현재 기본값)')
+    r.p("    재무를 모르는 종목은 그냥 통과시킵니다. 위 종목들이 후보에 그대로 남습니다.")
+    r.p(f"    -> 생존 편향은 없지만, 재무 조건이 {len(missing):,}개 종목에는 적용되지 않습니다.")
+    r.p("       '부채비율 200% 미만' 을 켜도 그만큼은 안 걸러진다는 뜻입니다.")
+    r.p("")
+    r.p('  on_missing: "exclude"')
+    r.p("    재무를 모르는 종목을 후보에서 뺍니다. 재무 조건은 온전히 적용됩니다.")
+    r.p("    -> 대신 상장폐지 종목이 통째로 빠져 생존 편향이 생깁니다.")
+    r.p("       망한 회사를 미리 피한 것처럼 보여 수익률이 좋게 나옵니다.")
+    r.p("")
+    r.p("  어느 쪽도 공짜가 아닙니다. 두 설정으로 각각 돌려 결과 차이를 보는 편이 가장 안전합니다.")
 
-    if len(missing_gone):
-        r.note(f"재무 필터를 켠 백테스트에서는 상장폐지 종목 {len(missing_gone):,}개가 "
-               "자동 제외됩니다. 필터를 끈 결과와 비교해 보세요.")
+    if len(missing):
+        r.note(f"재무를 알 수 없는 종목 {len(missing):,}개({pct:.1f}%) - "
+               f"미커버 {len(missing_live):,} + 상장폐지 추정 {len(missing_gone):,}. "
+               'on_missing 을 "include"/"exclude" 로 각각 돌려 비교해 보세요.')
     if len(missing_live) and len(missing_live) / max(1, len(live)) > 0.15:
         r.issue(f"현재 상장 중인데 재무가 없는 종목이 {len(missing_live):,}개 "
                 f"({len(missing_live) / len(live) * 100:.0f}%) 입니다. "
@@ -1979,6 +2254,7 @@ def run_report(
     dart_root: str | os.PathLike = "dart",
     marcap_root: str | os.PathLike = "marcap",
     out=None,
+    today: Optional[dt.date] = None,
 ) -> int:
     """받아 둔 ``dart/`` 를 읽어 한국어 진단 리포트를 낸다. **네트워크를 쓰지 않는다.**
 
@@ -1988,6 +2264,7 @@ def run_report(
 
     r = _Report(out)
     root = Path(dart_root)
+    today = today or dt.date.today()
 
     r.p(RULE)
     r.p(" DART 재무 데이터 진단 리포트")
@@ -2010,7 +2287,8 @@ def run_report(
         r.p(RULE)
         return REPORT_NO_DATA
 
-    df = store.load()
+    # 진단은 디스크에 실제로 저장된 내용을 그대로 본다 (엔진 스키마로 걸러진 것 말고).
+    df = _load_raw(root)
     files = {y: root / f"fundamentals-{y}.parquet" for y in store.years}
 
     if df.empty:
@@ -2020,7 +2298,7 @@ def run_report(
         r.p(RULE)
         return REPORT_NO_DATA
 
-    _section_collection(r, df, files, root, marcap_root)
+    _section_collection(r, df, files, root, marcap_root, today)
     _section_parsing(r, df)
     _section_samples(r, store, df)
     _section_asof(r, store, df)
@@ -2029,7 +2307,7 @@ def run_report(
     # ---- 판정 -----------------------------------------------------------------------
     r.p(RULE)
     if r.issues:
-        r.p(f" 판정: 확인 필요 — {len(r.issues)}건")
+        r.p(f" 판정: 확인 필요 - {len(r.issues)}건")
         r.p(RULE)
         for i, msg in enumerate(r.issues, start=1):
             r.p(f"  {i}. {msg}")
@@ -2081,6 +2359,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"사업보고서(4분기) 기준 일수 (기본 {ANNUAL_DISCLOSURE_LAG_DAYS})")
     p.add_argument("--call-limit", dest="call_limit", type=int, default=DAILY_CALL_LIMIT,
                    help=f"하루 호출 한도 (기본 {DAILY_CALL_LIMIT})")
+    p.add_argument("--only", default=None,
+                   help="이 분기만 받는다. 쉼표 구분 (예: 2015-1,2015-2,2015-3). "
+                        "이미 받았든 제공 구간 밖이든 무조건 요청한다")
+    p.add_argument("--quarterly-from", dest="quarterly_from", type=int,
+                   default=DART_QUARTERLY_FROM_YEAR,
+                   help=f"DART 가 분기·반기보고서를 제공하는 첫 연도 "
+                        f"(기본 {DART_QUARTERLY_FROM_YEAR}). 그 이전 1~3분기는 요청하지 않는다")
+    p.add_argument("--rebuild", action="store_true",
+                   help="이미 받아 둔 .parts 로 연도 파일만 다시 만든다 (네트워크 안 씀)")
     p.add_argument("--selftest", action="store_true", help="키·연결·삼성전자 1건만 확인하고 끝낸다")
     p.add_argument("--report", action="store_true",
                    help="받아 둔 데이터를 읽어 진단 리포트를 낸다 (네트워크 안 씀)")
@@ -2092,9 +2379,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
 
-    # --report 는 인증키도 네트워크도 필요 없다. 키 검사보다 먼저 처리한다.
+    # --report / --rebuild 는 인증키도 네트워크도 필요 없다. 키 검사보다 먼저 처리한다.
     if args.report:
         return run_report(args.out_dir, args.marcap_root)
+    if args.rebuild:
+        return rebuild_all(args.out_dir)
 
     key = read_api_key(args.key_file)
     if args.selftest:
@@ -2116,6 +2405,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.batch = MAX_CORP_PER_CALL
 
     try:
+        parse_only(args.only)          # 형식 오류를 실행 전에 잡는다
+    except ValueError as e:
+        print(f"[오류] {e}", flush=True)
+        return 2
+
+    try:
         return run_fetch(
             key,
             args.year_from,
@@ -2129,6 +2424,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lag_days=args.lag_days,
             annual_lag_days=args.annual_lag_days,
             call_limit=args.call_limit,
+            quarterly_from=args.quarterly_from,
+            only=args.only,
         )
     except KeyboardInterrupt:  # pragma: no cover
         print("", flush=True)

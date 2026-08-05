@@ -236,7 +236,22 @@ export function indKey(spec, params) {
 }
 
 /** 지표 인스턴스 → 화면 라벨 */
+/** 범례에 들어갈 짧은 표기. 전략 정의 지표와 화면 추가 지표를 같은 형식으로 통일한다. */
+const SHORT = {
+  SMA: 'MA', EMA: 'EMA', WMA: 'WMA', BBANDS: 'BB', RSI: 'RSI', MACD: 'MACD',
+  STOCH: 'STOCH', ATR: 'ATR', ADX: 'ADX', CCI: 'CCI', OBV: 'OBV', VWAP: 'VWAP',
+  ENVELOPE: 'ENV', DONCHIAN: 'DC',
+};
 export function indLabel(spec, params) {
+  const ps = (spec.params || [])
+    .filter((p) => NUMERIC.has(p.type) || (p.type === undefined && typeof params[p.name] === 'number'))
+    .map((p) => params[p.name])
+    .filter((v) => v !== undefined && v !== null);
+  const base = SHORT[spec.key] || spec.key;
+  return ps.length ? `${base} ${ps.join('/')}` : base;
+}
+/** 다이얼로그처럼 넓은 곳에서 쓰는 긴 이름 */
+export function indLongLabel(spec, params) {
   const ps = (spec.params || [])
     .filter((p) => NUMERIC.has(p.type) || (p.type === undefined && typeof params[p.name] === 'number'))
     .map((p) => params[p.name])
@@ -678,6 +693,17 @@ export function progress(pct) {
    12. 차트 범례 / 툴팁
    ============================================================ */
 
+/** 범례에서 지표를 몇 개까지 펼쳐 둘지 (넘으면 접는다) */
+const LEGEND_MAX = 4;
+let legendExpanded = false;
+export function setLegendExpanded(v) { legendExpanded = !!v; }
+export function toggleLegendExpanded() { legendExpanded = !legendExpanded; return legendExpanded; }
+
+/**
+ * 차트 좌상단 범례.
+ * 지표 값은 **슬롯 인덱스**로 읽는다. 키로 읽으면 같은 키가 두 번 있을 때 겹쳐서 사라진다.
+ * 각 항목에는 hover 시에만 보이는 삭제 버튼이 있고, 자리는 미리 확보해 레이아웃이 밀리지 않는다.
+ */
 export function renderLegend(info, meta, slotColor, symbol) {
   const host = $('legend');
   if (!info) {
@@ -686,20 +712,33 @@ export function renderLegend(info, meta, slotColor, symbol) {
       : '';
     return;
   }
-  const rows = [
-    `<div class="row">
+  const head = `<div class="row">
       <span class="k">O</span><span>${fmt(info.o)}</span>
       <span class="k">H</span><span>${fmt(info.h)}</span>
       <span class="k">L</span><span>${fmt(info.l)}</span>
       <span class="k">C</span><span>${fmt(info.c)}</span>
       <span style="color:var(--${info.up ? 'up' : 'dn'})">${pct(info.chgPct)}</span>
-    </div>`,
-  ];
-  for (const m of meta) {
-    const v = info.indicators[m.key];
-    rows.push(`<div class="row"><span class="sq" style="background:${esc(slotColor(m.slot))}"></span><span class="k">${esc(m.label)}</span><span>${v === null ? '—' : fmt(v)}</span></div>`);
-  }
-  host.innerHTML = rows.join('');
+    </div>`;
+
+  const vals = info.indicatorValues || [];
+  const shown = legendExpanded ? meta : meta.slice(0, LEGEND_MAX);
+  const items = shown.map((m, i) => {
+    const v = vals[legendExpanded ? i : i];      // meta 와 같은 순서
+    const num = (v === null || v === undefined) ? '—' : fmt(v);
+    return `<span class="lg-item${m.fromStrategy ? ' strat' : ''}" data-ind-key="${esc(m.key)}" data-ind-slot="${m.slot}">
+      <span class="sq" style="background:${esc(slotColor(m.slot))}"></span>
+      <span class="k">${esc(m.label)}</span><span class="lg-v">${num}</span>
+      <button type="button" class="lg-x" data-ind-remove="${esc(m.key)}" data-ind-slot="${m.slot}"
+        title="${esc(m.label)} 지표 제거" aria-label="${esc(m.label)} 지표 제거">
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button></span>`;
+  }).join('');
+
+  const more = meta.length > LEGEND_MAX
+    ? `<button type="button" class="lg-more" data-legend-toggle>${legendExpanded ? '접기' : `외 ${meta.length - LEGEND_MAX}개`}</button>`
+    : '';
+
+  host.innerHTML = head + (meta.length ? `<div class="legend-inds">${items}${more}</div>` : '');
 }
 
 export function renderTooltip(info, hostRect) {

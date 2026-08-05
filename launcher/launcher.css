@@ -1,9 +1,26 @@
 ﻿@charset "utf-8";
 /* ============================================================
-   KRX Backtester - launcher (HTA / IE11)
-   server/web/css/tokens.css 의 다크 팔레트를 따른다.
-   IE11 제약: flexbox 미사용. position / float 레이아웃만 쓴다.
-   상태 전환 애니메이션은 모두 300ms 이하로 유지한다.
+   KRX Backtester - launcher (HTA / mshta.exe = IE11 MSHTML)
+
+   server/web/css/tokens.css 의 다크 팔레트와 형제로 보이게 만든다.
+   런처를 닫고 브라우저가 열렸을 때 "같은 프로그램" 으로 느껴져야 한다.
+
+   -- IE11 제약 --------------------------------------------
+     사용자 정의 속성(커스텀 프로퍼티), 신형 레이아웃 모듈 두 가지와
+     그 간격 단축 속성, 배경 흐림 계열 두 가지, 이미지 맞춤 속성,
+     도형 잘라내기, 가로세로비 속성, 신형 선택자 두 가지,
+     목록 표식 의사요소, 논리 속성 - 이 파일에서 전부 쓰지 않는다.
+     자동 검사가 이 목록을 grep 하므로 여기에 실제 이름을 적지 않는다.
+   -- 대신 쓰는 것 (IE10+ 확인) -----------------------------
+     linear-gradient / radial-gradient / border-radius
+     다중 box-shadow / transition / transform / @keyframes
+     opacity / rgba() / text-shadow / position / float / table-cell
+
+   모던함은 blur 나 flex 가 아니라
+   색과 간격, 타이포, 모션, 겹친 그림자로 만든다.
+
+   모션 원칙: 상태 전환은 전부 300ms 이하.
+   무한 애니메이션은 스피너와 진행바 시머 둘뿐이다.
    ============================================================ */
 
 * { -ms-box-sizing: border-box; box-sizing: border-box; }
@@ -15,170 +32,210 @@ html, body {
 }
 
 body {
-  background: #0b0e11;
-  color: #d9dde7;
-  font-family: "Malgun Gothic", "Segoe UI", Tahoma, sans-serif;
-  font-size: 12px;
-  line-height: 1.45;
+  background: #070a12;
+  color: #c8cfdd;
+  /* Pretendard 가 깔린 PC 는 드물다. 맑은 고딕에서 예뻐야 한다. */
+  font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif;
+  font-size: 12.5px;
+  line-height: 1.5;
   cursor: default;
   -ms-user-select: none;
   user-select: none;
 }
 
-/* ---------- 배경: 캔들 실루엣 + 우상향 추세선 ---------- */
+/* ============================================================
+   배경 - 평평한 단색을 쓰지 않는다
+   ============================================================ */
 #sky {
   position: absolute; left: 0; top: 0; right: 0; bottom: 0;
-  background: #0b0e11;
-  background: -ms-linear-gradient(top, #141a2b 0%, #0d1118 55%, #0b0e11 100%);
-  background: linear-gradient(to bottom, #141a2b 0%, #0d1118 55%, #0b0e11 100%);
+  background: #0d1220;
+  background: -ms-linear-gradient(top, #0d1220 0%, #0a0e1a 52%, #070a12 100%);
+  background: linear-gradient(to bottom, #0d1220 0%, #0a0e1a 52%, #070a12 100%);
   overflow: hidden;
 }
-/* 하드한 원이 보이지 않도록 radial-gradient 로 부드럽게 흘린다 (IE10+ 지원) */
+/* 좌상단에서 퍼지는 푸른 글로우 / 우하단 적색. 하드한 원이 보이면 안 된다. */
 #glow {
-  position: absolute; left: -140px; top: -170px;
-  width: 460px; height: 460px;
-  background: radial-gradient(circle, rgba(41, 98, 255, .22) 0%, rgba(41, 98, 255, .07) 45%, rgba(41, 98, 255, 0) 70%);
+  position: absolute; left: -170px; top: -200px;
+  width: 520px; height: 520px;
+  background: radial-gradient(circle,
+              rgba(41, 98, 255, .13) 0%,
+              rgba(41, 98, 255, .05) 42%,
+              rgba(41, 98, 255, 0) 70%);
 }
 #glow2 {
-  position: absolute; right: -170px; bottom: -190px;
-  width: 460px; height: 460px;
-  background: radial-gradient(circle, rgba(242, 54, 69, .16) 0%, rgba(242, 54, 69, .05) 45%, rgba(242, 54, 69, 0) 70%);
+  position: absolute; right: -190px; bottom: -210px;
+  width: 500px; height: 500px;
+  background: radial-gradient(circle,
+              rgba(242, 54, 69, .085) 0%,
+              rgba(242, 54, 69, .03) 42%,
+              rgba(242, 54, 69, 0) 70%);
 }
-#candles { position: absolute; left: 0; right: 0; bottom: 0; height: 190px; }
+
+/* 캔들 실루엣 - 아주 절제해서. 로드 시 한 번만 자라고 이후 정지한다. */
+#candles { position: absolute; left: 0; right: 0; bottom: 0; height: 180px; }
 .cd {
   position: absolute; bottom: 0; width: 9px;
   -ms-transform-origin: 50% 100%; transform-origin: 50% 100%;
   animation: cdin 260ms ease-out 1 both;
 }
-.cd b {
-  position: absolute; left: 0; bottom: 0; width: 9px;
-  border-radius: 1px;
-  display: block;
+.cd b { position: absolute; left: 0; bottom: 0; width: 9px; border-radius: 1px; display: block; }
+.cd i { position: absolute; left: 4px; width: 1px; bottom: 0; display: block; }
+.cd.up b { background: rgba(242, 54, 69, .05); }
+.cd.up i { background: rgba(242, 54, 69, .04); }
+.cd.dn b { background: rgba(80, 140, 255, .045); }
+.cd.dn i { background: rgba(80, 140, 255, .035); }
+@keyframes cdin {
+  from { -ms-transform: scaleY(0); transform: scaleY(0); opacity: 0; }
+  to   { -ms-transform: scaleY(1); transform: scaleY(1); opacity: 1; }
 }
-.cd i {
-  position: absolute; left: 4px; width: 1px; bottom: 0;
-  display: block;
-}
-.cd.up b { background: rgba(242, 54, 69, .075); }
-.cd.up i { background: rgba(242, 54, 69, .065); }
-.cd.dn b { background: rgba(72, 134, 255, .065); }
-.cd.dn i { background: rgba(72, 134, 255, .055); }
-@keyframes cdin { from { -ms-transform: scaleY(0); transform: scaleY(0); opacity: 0; }
-                  to   { -ms-transform: scaleY(1); transform: scaleY(1); opacity: 1; } }
-
 #trend {
-  position: absolute; left: 0; bottom: 34px;
-  width: 560px; height: 2px;
-  background: rgba(242, 54, 69, .10);
+  position: absolute; left: 0; bottom: 30px;
+  width: 560px; height: 1px;
+  background: rgba(242, 54, 69, .07);
   -ms-transform: rotate(-11deg); transform: rotate(-11deg);
   -ms-transform-origin: 0 50%; transform-origin: 0 50%;
 }
-
-/* 글자가 놓이는 아래쪽은 배경을 덮어 가독성을 지킨다 */
+/* 글자가 놓이는 아래쪽은 배경을 확실히 덮어 가독성을 지킨다 */
 #scrim {
   position: absolute; left: 0; right: 0; bottom: 0;
-  height: 240px;
-  background: -ms-linear-gradient(top, rgba(11, 14, 17, 0) 0%, rgba(11, 14, 17, .62) 38%, rgba(11, 14, 17, .93) 100%);
-  background: linear-gradient(to bottom, rgba(11, 14, 17, 0) 0%, rgba(11, 14, 17, .62) 38%, rgba(11, 14, 17, .93) 100%);
+  height: 250px;
+  background: -ms-linear-gradient(top, rgba(7, 10, 18, 0) 0%, rgba(7, 10, 18, .78) 34%, rgba(7, 10, 18, .97) 100%);
+  background: linear-gradient(to bottom, rgba(7, 10, 18, 0) 0%, rgba(7, 10, 18, .78) 34%, rgba(7, 10, 18, .97) 100%);
 }
 
-/* ---------- 본문 ---------- */
+/* ============================================================
+   본문 - 창이 뜰 때 한 번 페이드인
+   ============================================================ */
 #app {
   position: absolute; left: 0; top: 0; right: 0; bottom: 0;
-  padding: 15px 18px 12px 18px;
+  padding: 12px 17px 10px 17px;
+  animation: appin 160ms ease-out 1 both;
+}
+@keyframes appin {
+  from { opacity: 0; -ms-transform: translateY(6px); transform: translateY(6px); }
+  to   { opacity: 1; -ms-transform: translateY(0); transform: translateY(0); }
 }
 
 /* ---------- 머리말 ---------- */
-#head { position: relative; height: 42px; }
+#head { position: relative; height: 41px; }
 #logo {
-  position: absolute; left: 0; top: 2px;
-  width: 34px; height: 34px;
-  border-radius: 7px;
-  border: 1px solid #2a3143;
-  background: #131722;
+  position: absolute; left: 0; top: 0;
+  width: 32px; height: 32px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, .08);
+  background: #101725;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .07) inset,
+              0 4px 14px rgba(0, 0, 0, .5);
 }
 #htitle {
-  margin-left: 45px;
-  font-size: 15px; font-weight: bold;
-  color: #f2f5fa;
-  letter-spacing: -.2px;
+  margin-left: 43px;
+  font-size: 15.5px;
+  font-weight: 600;
+  color: #f4f7fc;
+  letter-spacing: -.02em;   /* 한글 제목은 조여야 세련돼 보인다 */
+  line-height: 1.35;
 }
 #hsub {
-  margin-left: 45px;
-  font-size: 11px;
-  color: #8b93a7;
-  margin-top: 1px;
+  margin-left: 43px;
+  font-size: 11.5px;
+  color: #98a2b6;
+  letter-spacing: -.01em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* ---------- 단계 목록 ---------- */
-#steps { margin-top: 10px; }
+/* ============================================================
+   단계 목록
+   ============================================================ */
+#steps { margin-top: 4px; }
 
 .step {
   position: relative;
   height: 40px;
   padding-left: 32px;
-  padding-top: 1px;
+  padding-top: 2px;
 }
-.step + .step { border-top: 1px solid rgba(42, 49, 67, .55); }
+.step + .step { border-top: 1px solid rgba(255, 255, 255, .045); }
 
-.mk { position: absolute; left: 0; top: 8px; width: 22px; height: 22px; }
-.mk > div { position: absolute; left: 0; top: 0; width: 22px; height: 22px; border-radius: 50%; }
+/* 마커는 다섯 상태 모두 같은 크기여야 리스트가 흔들리지 않는다 */
+.mk { position: absolute; left: 0; top: 9px; width: 21px; height: 21px; }
+.mk > div { position: absolute; left: 0; top: 0; width: 21px; height: 21px; border-radius: 50%; }
 
-/* 대기 : 흐린 원 */
-.mk-idle { border: 1px dashed #2a3143; background: rgba(19, 23, 34, .8); }
-/* 진행 : 회전 스피너 */
+/* 대기 : 옅은 실선 원 + 안쪽 작은 점 (점선은 거칠어 보인다) */
+.mk-idle {
+  border: 1px solid rgba(255, 255, 255, .13);
+  background: rgba(255, 255, 255, .015);
+}
+.mk-idle i {
+  position: absolute; left: 8px; top: 8px;
+  display: block; width: 4px; height: 4px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .3);
+}
+
+/* 진행 : 얇고 긴 호 (270도), 900ms 등속 */
 .mk-spin {
   display: none;
-  border: 2px solid rgba(242, 54, 69, .22);
-  border-top-color: #f23645;
-  animation: spin 750ms linear infinite;
+  border: 2px solid rgba(242, 54, 69, .16);
+  border-top-color: #ff4757;
+  border-right-color: #ff4757;
+  border-bottom-color: #ff4757;
+  animation: spin 900ms linear infinite;
 }
-@keyframes spin { from { -ms-transform: rotate(0deg); transform: rotate(0deg); }
-                  to   { -ms-transform: rotate(360deg); transform: rotate(360deg); } }
-/* 완료 : 그려지는 체크 */
+@keyframes spin {
+  from { -ms-transform: rotate(0deg); transform: rotate(0deg); }
+  to   { -ms-transform: rotate(360deg); transform: rotate(360deg); }
+}
+
+/* 완료 : 그려지는 체크 + 옅은 글로우 */
 .mk-done {
   display: none;
-  border: 1px solid #26a69a;
-  background: rgba(38, 166, 154, .16);
+  border: 1px solid rgba(45, 212, 191, .55);
+  background: rgba(45, 212, 191, .13);
+  box-shadow: 0 0 0 3px rgba(45, 212, 191, .06),
+              0 0 12px rgba(45, 212, 191, .18);
 }
 .mk-done i {
   position: absolute; left: 7px; top: 4px;
   display: block; width: 6px; height: 11px;
-  border-right: 2px solid #4db6ac;
-  border-bottom: 2px solid #4db6ac;
+  border-right: 2px solid #5eead4;
+  border-bottom: 2px solid #5eead4;
   -ms-transform: rotate(42deg); transform: rotate(42deg);
 }
+
 /* 실패 : 붉은 느낌표 */
 .mk-fail {
   display: none;
-  border: 1px solid #f23645;
-  background: rgba(242, 54, 69, .18);
-  color: #ff7b86;
-  font-weight: bold; font-size: 13px;
-  text-align: center; line-height: 20px;
+  border: 1px solid rgba(255, 71, 87, .6);
+  background: rgba(255, 71, 87, .15);
+  box-shadow: 0 0 0 3px rgba(255, 71, 87, .05),
+              0 0 12px rgba(255, 71, 87, .16);
+  color: #ff969f;
+  font-weight: 700; font-size: 13px;
+  text-align: center; line-height: 19px;
 }
+
 /* 건너뜀 : 회색 대시 */
 .mk-skip {
   display: none;
-  border: 1px solid #2a3143;
-  background: rgba(19, 23, 34, .8);
+  border: 1px solid rgba(255, 255, 255, .11);
+  background: rgba(255, 255, 255, .02);
 }
 .mk-skip i {
   position: absolute; left: 6px; top: 9px;
   display: block; width: 10px; height: 2px;
-  background: #7c8599; border-radius: 1px;
+  border-radius: 1px;
+  background: #8a94a9;
 }
 
 .step.is-run  .mk-idle { display: none; }
 .step.is-run  .mk-spin { display: block; }
 .step.is-done .mk-idle { display: none; }
-.step.is-done .mk-done { display: block; }
-.step.is-done .mk-done i { animation: drawck 260ms ease-out 1 both; }
+.step.is-done .mk-done { display: block; animation: pop 280ms cubic-bezier(.2, .9, .3, 1.2) 1 both; }
+.step.is-done .mk-done i { animation: drawck 260ms ease-out 40ms 1 both; }
 .step.is-fail .mk-idle { display: none; }
-.step.is-fail .mk-fail { display: block; animation: pop 240ms ease-out 1 both; }
+.step.is-fail .mk-fail { display: block; animation: pop 280ms cubic-bezier(.2, .9, .3, 1.2) 1 both; }
 .step.is-skip .mk-idle { display: none; }
-.step.is-skip .mk-skip { display: block; animation: pop 220ms ease-out 1 both; }
+.step.is-skip .mk-skip { display: block; animation: pop 240ms ease-out 1 both; }
 
 @keyframes drawck {
   0%   { width: 0;   height: 0;    opacity: .3; }
@@ -186,196 +243,315 @@ body {
   100% { width: 6px; height: 11px; opacity: 1; }
 }
 @keyframes pop {
-  0%   { -ms-transform: scale(.4); transform: scale(.4); opacity: 0; }
-  60%  { -ms-transform: scale(1.12); transform: scale(1.12); opacity: 1; }
+  0%   { -ms-transform: scale(.8); transform: scale(.8); opacity: 0; }
+  60%  { -ms-transform: scale(1.06); transform: scale(1.06); opacity: 1; }
   100% { -ms-transform: scale(1); transform: scale(1); opacity: 1; }
 }
 
+/* ---------- 단계 글자 ---------- */
 .stt {
-  font-size: 12.5px;
-  color: #7c8599;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -.02em;
+  color: #98a2b6;
+  line-height: 1.28;
   transition: color 220ms ease;
 }
 .sts {
-  font-size: 11px;
-  color: #5f6879;
-  margin-top: 1px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: -.01em;
+  color: #8d97ab;
+  line-height: 1.35;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   transition: color 220ms ease;
 }
-.step.is-run  .stt { color: #f2f5fa; font-weight: bold; }
-.step.is-run  .sts { color: #8fb0ff; }
-.step.is-done .stt { color: #d9dde7; }
-.step.is-done .sts { color: #8b93a7; }
-.step.is-skip .stt { color: #8b93a7; }
-.step.is-skip .sts { color: #7c8599; }
-.step.is-fail .stt { color: #ff7b86; }
-.step.is-fail .sts { color: #ff7b86; }
+/* 버전 해시와 숫자는 등폭으로 찍혀야 신뢰감이 생긴다 */
+.mono {
+  font-family: Consolas, "D2Coding", "Courier New", monospace;
+  font-size: 11.5px;
+  letter-spacing: 0;
+  color: #b9c2d3;
+}
 
-/* 상세 메시지 페이드 인 */
+/* 현재 단계가 도드라지고, 끝난 단계는 한 걸음 물러난다 */
+.step.is-run  .stt { color: #f4f7fc; }
+.step.is-run  .sts { color: #9dbaff; }
+.step.is-run  .sts .mono { color: #cbd6ea; }
+.step.is-done .stt { color: #b3bccc; }
+.step.is-done .sts { color: #949eb2; }
+.step.is-skip .stt { color: #a2abbe; }
+.step.is-skip .sts { color: #8d97ab; }
+.step.is-fail .stt { color: #ff969f; }
+.step.is-fail .sts { color: #ffa2ab; }
+.step.is-fail .sts .mono { color: #ffa2ab; }
+
+/* 상태가 바뀐 줄은 살짝 떠오르며 페이드 */
 .fx { animation: fadein 240ms ease-out 1 both; }
 @keyframes fadein {
   from { opacity: 0; -ms-transform: translateY(4px); transform: translateY(4px); }
   to   { opacity: 1; -ms-transform: translateY(0); transform: translateY(0); }
 }
 
-/* ---------- 진행바 ---------- */
+/* ============================================================
+   진행바
+   ============================================================ */
 #barwrap {
-  position: absolute; left: 18px; right: 18px; bottom: 74px;
-  height: 6px;
-  background: #131722;
-  border: 1px solid #232a3b;
-  border-radius: 4px;
+  position: absolute; left: 17px; right: 17px; bottom: 66px;
+  height: 4px;
+  background: rgba(255, 255, 255, .06);
+  border-radius: 3px;
   overflow: hidden;
 }
 #bar {
+  position: relative;
   width: 0;
   height: 100%;
   border-radius: 3px;
-  background: #f23645;
-  background: -ms-linear-gradient(left, #2962ff 0%, #f23645 100%);
-  background: linear-gradient(to right, #2962ff 0%, #f23645 100%);
+  background: #ff4757;
+  background: -ms-linear-gradient(left, #3b7bff 0%, #8f5bff 52%, #ff4757 100%);
+  background: linear-gradient(to right, #3b7bff 0%, #8f5bff 52%, #ff4757 100%);
+  box-shadow: 0 0 10px rgba(255, 71, 87, .45);
   transition: width 300ms cubic-bezier(.4, 0, .2, 1);
 }
+/* 아주 은은한 시머. 과하면 싸구려로 보이니 알파를 낮게 유지한다. */
+#shine {
+  position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+  background: -ms-linear-gradient(left, rgba(255,255,255,0) 0%, rgba(255,255,255,.08) 50%, rgba(255,255,255,0) 100%);
+  background: linear-gradient(to right, rgba(255,255,255,0) 0%, rgba(255,255,255,.08) 50%, rgba(255,255,255,0) 100%);
+  animation: shimmer 2000ms linear infinite;
+}
+@keyframes shimmer {
+  from { -ms-transform: translateX(-100%); transform: translateX(-100%); }
+  to   { -ms-transform: translateX(100%); transform: translateX(100%); }
+}
 
-/* ---------- 로그 꼬리 ---------- */
+/* ============================================================
+   로그 꼬리
+   ============================================================ */
 #logbox {
-  position: absolute; left: 18px; right: 18px; bottom: 88px;
-  height: 46px;
+  position: absolute; left: 17px; right: 17px; bottom: 78px;
+  height: 45px;
   overflow: hidden;
 }
 .lg {
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 10.5px;
+  font-family: Consolas, "D2Coding", "Courier New", monospace;
+  font-size: 11px;
   line-height: 15px;
-  color: #4f5768;
+  letter-spacing: -.01em;
+  color: #8b95a8;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.lg.l2 { color: #626b7e; }
-.lg.l3 { color: #7c8599; }
+.lg.l2 { color: #97a1b3; }
+.lg.l3 { color: #a3adbf; }
 
-/* ---------- 바닥 ---------- */
+/* ============================================================
+   바닥
+   ============================================================ */
 #foot {
-  position: absolute; left: 18px; right: 18px; bottom: 12px;
+  position: absolute; left: 17px; right: 17px; bottom: 10px;
   height: 52px;
 }
 #fnote {
-  position: absolute; left: 0; top: 8px; right: 190px;
-  font-size: 11px;
-  color: #8b93a7;
+  position: absolute; left: 0; top: 6px; right: 180px;
+  font-size: 11.5px;
+  color: #98a2b6;
+  letter-spacing: -.01em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-#fbtns { position: absolute; right: 0; top: 2px; }
+#fbtns { position: absolute; right: 0; top: 0; }
 
 button {
-  font-family: "Malgun Gothic", "Segoe UI", Tahoma, sans-serif;
-  font-size: 11.5px;
-  color: #d9dde7;
-  background: #1b2130;
-  border: 1px solid #2a3143;
-  border-radius: 5px;
-  padding: 6px 13px;
+  font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -.01em;
+  min-height: 32px;
+  padding: 7px 15px;
+  color: #dde3ee;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, .13);
+  border-radius: 7px;
   cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease;
+  /* hover 에서 크기를 바꾸지 않는다 - 레이아웃이 흔들린다 */
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, color 160ms ease;
 }
-button:hover { background: #232a3b; border-color: #3a4359; }
-button:active { background: #2c344a; }
+button:hover { background-color: rgba(255, 255, 255, .06); border-color: rgba(255, 255, 255, .22); }
+button:active { background-color: rgba(255, 255, 255, .10); }
+
 button.pri {
-  background: #2962ff; border-color: #2962ff; color: #ffffff; font-weight: bold;
+  color: #ffffff;
+  background: #2f6bff;
+  background: -ms-linear-gradient(top, #3d78ff 0%, #2458e6 100%);
+  background: linear-gradient(to bottom, #3d78ff 0%, #2458e6 100%);
+  border-color: rgba(255, 255, 255, .18);
+  font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .22) inset,
+              0 4px 14px rgba(37, 89, 230, .38);
 }
-button.pri:hover { background: #1e50d8; border-color: #1e50d8; }
-button.dgr { color: #ff7b86; border-color: #3a4359; }
-button.dgr:hover { background: rgba(242, 54, 69, .14); border-color: #f23645; }
+button.pri:hover {
+  background: -ms-linear-gradient(top, #4d84ff 0%, #2f63f0 100%);
+  background: linear-gradient(to bottom, #4d84ff 0%, #2f63f0 100%);
+  border-color: rgba(255, 255, 255, .3);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .26) inset,
+              0 6px 18px rgba(37, 89, 230, .5);
+}
+
+button.dgr {
+  color: #ffb4ba;
+  border-color: rgba(255, 71, 87, .35);
+  background: rgba(255, 71, 87, .07);
+}
+button.dgr:hover {
+  color: #ffd0d4;
+  background-color: rgba(255, 71, 87, .16);
+  border-color: rgba(255, 71, 87, .6);
+}
+
+button[disabled] {
+  color: #8992a6;
+  border-color: rgba(255, 255, 255, .07);
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+button[disabled]:hover {
+  background-color: transparent;
+  border-color: rgba(255, 255, 255, .07);
+  box-shadow: none;
+}
 
 a.lnk {
-  color: #7c8599;
-  font-size: 10.5px;
+  color: #98a2b6;
+  font-size: 11px;
+  letter-spacing: -.01em;
   text-decoration: none;
-  border-bottom: 1px dotted #3a4359;
+  border-bottom: 1px solid rgba(255, 255, 255, .12);
+  padding-bottom: 1px;
   cursor: pointer;
+  transition: color 160ms ease, border-color 160ms ease;
 }
-a.lnk:hover { color: #8fb0ff; border-bottom-color: #8fb0ff; }
-#frecheck { position: absolute; left: 0; bottom: 2px; }
-#fcfg { position: absolute; left: 92px; bottom: 2px; }
+a.lnk:hover { color: #a8c2ff; border-bottom-color: rgba(168, 194, 255, .5); }
+#frecheck { position: absolute; left: 0; bottom: 3px; }
+#fcfg { position: absolute; left: 94px; bottom: 3px; }
 
-button[disabled] { color: #4f5768; border-color: #232a3b; cursor: default; }
-button[disabled]:hover { background: #1b2130; border-color: #232a3b; }
-
-/* 겹친 포트 안내 / 설정 폼 */
-.pth {
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 10px;
-  color: #7c8599;
-}
-.row { margin-top: 8px; height: 22px; }
-.row .lbl { display: inline-block; width: 74px; color: #8b93a7; }
-.row .hint { color: #5f6879; font-size: 10.5px; margin-left: 8px; }
-.row label { color: #d9dde7; margin-left: 5px; cursor: pointer; }
-.row input[type="text"] {
-  width: 72px;
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 12px;
-  color: #f2f5fa;
-  background: #0f131d;
-  border: 1px solid #2a3143;
-  border-radius: 4px;
-  padding: 3px 6px;
-}
-.row input[type="checkbox"] { vertical-align: middle; }
-#cfgErr { margin-top: 9px; color: #ff7b86; font-size: 11px; height: 14px; }
-
-/* ---------- 덮개 ---------- */
+/* ============================================================
+   덮개
+   ============================================================ */
 .ov {
   display: none;
   position: absolute; left: 0; top: 0; right: 0; bottom: 0;
-  background: rgba(4, 6, 10, .82);
+  background: rgba(4, 6, 12, .78);
   z-index: 50;
 }
 .ov.on { display: block; animation: fadein 200ms ease-out 1 both; }
+
+/* 더블 베젤 : 바깥 그림자 + 안쪽 상단 하이라이트.
+   IE11 에서 낼 수 있는 가장 고급스러운 표면 표현이다. */
 .ovin {
-  position: absolute; left: 24px; right: 24px; top: 50%;
-  margin-top: -105px;
-  min-height: 180px;
+  position: absolute; left: 22px; right: 22px; top: 50%;
+  margin-top: -108px;
+  min-height: 186px;
   padding: 20px 22px 18px 22px;
-  background: #131722;
-  border: 1px solid #2a3143;
-  border-radius: 10px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .65);
+  background: #111828;
+  background: -ms-linear-gradient(top, #141c2e 0%, #0f1523 100%);
+  background: linear-gradient(to bottom, #141c2e 0%, #0f1523 100%);
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 14px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset,
+              0 20px 48px rgba(0, 0, 0, .55),
+              0 2px 8px rgba(0, 0, 0, .35);
 }
-.ovt { font-size: 14px; font-weight: bold; color: #f2f5fa; }
-.ovb { font-size: 11.5px; color: #8b93a7; margin-top: 9px; line-height: 1.6; }
-.ovb b { color: #d9dde7; font-weight: bold; }
-.ovf { margin-top: 16px; text-align: right; }
+.ovt {
+  font-size: 15px; font-weight: 600;
+  color: #f4f7fc;
+  letter-spacing: -.02em;
+}
+.ovb {
+  font-size: 12px;
+  color: #a4aec1;
+  margin-top: 9px;
+  line-height: 1.65;
+  letter-spacing: -.01em;
+}
+.ovb b { color: #e2e8f2; font-weight: 600; }
+.ovf { margin-top: 15px; text-align: right; }
 .ovf button { margin-left: 6px; }
 
-/* 완료 덮개 */
-#ovDone .ovin { text-align: center; margin-top: -92px; min-height: 165px; }
+.pth {
+  font-family: Consolas, "D2Coding", "Courier New", monospace;
+  font-size: 10.5px;
+  color: #98a2b6;
+  letter-spacing: 0;
+}
+
+/* ---------- 설정 폼 ---------- */
+.row { margin-top: 9px; height: 24px; }
+.row .lbl { display: inline-block; width: 76px; color: #a4aec1; }
+.row .hint { color: #98a2b6; font-size: 11px; margin-left: 9px; }
+.row label { color: #d3dae7; margin-left: 6px; cursor: pointer; }
+.row input[type="text"] {
+  width: 76px;
+  font-family: Consolas, "D2Coding", "Courier New", monospace;
+  font-size: 12.5px;
+  color: #f4f7fc;
+  background: #0a0f1b;
+  border: 1px solid rgba(255, 255, 255, .11);
+  border-radius: 6px;
+  padding: 4px 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .4) inset;
+}
+.row input[type="text"]:focus { border-color: rgba(61, 120, 255, .7); outline: none; }
+.row input[type="checkbox"] { vertical-align: middle; }
+#cfgErr { margin-top: 10px; color: #ffa2ab; font-size: 11.5px; height: 15px; }
+
+/* ---------- 완료 덮개 ---------- */
+#ovDone .ovin { text-align: center; margin-top: -96px; min-height: 172px; }
+#ckglow {
+  position: absolute; left: 50%; top: 18px;
+  width: 170px; height: 170px;
+  margin-left: -85px;
+  background: radial-gradient(circle,
+              rgba(45, 212, 191, .20) 0%,
+              rgba(45, 212, 191, .07) 40%,
+              rgba(45, 212, 191, 0) 68%);
+}
 #bigck {
   position: relative;
-  width: 54px; height: 54px;
-  margin: 4px auto 12px auto;
+  width: 56px; height: 56px;
+  margin: 4px auto 13px auto;
   border-radius: 50%;
-  border: 2px solid #26a69a;
-  background: rgba(38, 166, 154, .16);
-  animation: bigpop 300ms cubic-bezier(.34, 1.56, .64, 1) 1 both;
+  border: 2px solid rgba(45, 212, 191, .7);
+  background: rgba(45, 212, 191, .13);
+  box-shadow: 0 0 0 5px rgba(45, 212, 191, .05),
+              0 0 26px rgba(45, 212, 191, .28);
+  animation: pop 280ms cubic-bezier(.2, .9, .3, 1.2) 1 both;
 }
 #bigck i {
-  position: absolute; left: 18px; top: 12px;
+  position: absolute; left: 19px; top: 13px;
   display: block; width: 13px; height: 24px;
-  border-right: 3px solid #4db6ac;
-  border-bottom: 3px solid #4db6ac;
+  border-right: 3px solid #5eead4;
+  border-bottom: 3px solid #5eead4;
   -ms-transform: rotate(42deg); transform: rotate(42deg);
-  animation: drawbig 280ms ease-out 120ms 1 both;
-}
-@keyframes bigpop {
-  0%   { -ms-transform: scale(.3); transform: scale(.3); opacity: 0; }
-  55%  { -ms-transform: scale(1.18); transform: scale(1.18); opacity: 1; }
-  100% { -ms-transform: scale(1); transform: scale(1); opacity: 1; }
+  animation: drawbig 280ms ease-out 110ms 1 both;
 }
 @keyframes drawbig {
   0%   { width: 0;    height: 0;    opacity: .3; }
   45%  { width: 13px; height: 0;    opacity: 1; }
   100% { width: 13px; height: 24px; opacity: 1; }
 }
-#dtitle { font-size: 14px; font-weight: bold; color: #f2f5fa; }
-#dsum { font-size: 11.5px; color: #8b93a7; margin-top: 6px; }
+#dtitle {
+  position: relative;
+  font-size: 15px; font-weight: 600;
+  color: #f4f7fc;
+  letter-spacing: -.02em;
+}
+#dsum {
+  position: relative;
+  font-size: 12px;
+  color: #a4aec1;
+  margin-top: 6px;
+  letter-spacing: -.01em;
+}
+/* 요약 줄은 숫자만 도드라지게 */
+#dsum b { color: #7fdcd0; font-weight: 600; }

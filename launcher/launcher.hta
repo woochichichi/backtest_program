@@ -44,7 +44,7 @@
   <div id="steps">
     <div class="step is-wait" id="s0">
       <div class="mk">
-        <div class="mk-idle"></div>
+        <div class="mk-idle"><i></i></div>
         <div class="mk-spin"></div>
         <div class="mk-done"><i></i></div>
         <div class="mk-fail">!</div>
@@ -55,7 +55,7 @@
     </div>
     <div class="step is-wait" id="s1">
       <div class="mk">
-        <div class="mk-idle"></div>
+        <div class="mk-idle"><i></i></div>
         <div class="mk-spin"></div>
         <div class="mk-done"><i></i></div>
         <div class="mk-fail">!</div>
@@ -66,7 +66,18 @@
     </div>
     <div class="step is-wait" id="s2">
       <div class="mk">
-        <div class="mk-idle"></div>
+        <div class="mk-idle"><i></i></div>
+        <div class="mk-spin"></div>
+        <div class="mk-done"><i></i></div>
+        <div class="mk-fail">!</div>
+        <div class="mk-skip"><i></i></div>
+      </div>
+      <div class="stt">재무 데이터</div>
+      <div class="sts">대기 중</div>
+    </div>
+    <div class="step is-wait" id="s3">
+      <div class="mk">
+        <div class="mk-idle"><i></i></div>
         <div class="mk-spin"></div>
         <div class="mk-done"><i></i></div>
         <div class="mk-fail">!</div>
@@ -75,9 +86,9 @@
       <div class="stt">서버 시작</div>
       <div class="sts">대기 중</div>
     </div>
-    <div class="step is-wait" id="s3">
+    <div class="step is-wait" id="s4">
       <div class="mk">
-        <div class="mk-idle"></div>
+        <div class="mk-idle"><i></i></div>
         <div class="mk-spin"></div>
         <div class="mk-done"><i></i></div>
         <div class="mk-fail">!</div>
@@ -94,7 +105,7 @@
     <div class="lg l3" id="lg2">&nbsp;</div>
   </div>
 
-  <div id="barwrap"><div id="bar"></div></div>
+  <div id="barwrap"><div id="bar"><div id="shine"></div></div></div>
 
   <div id="foot">
     <div id="fnote">잠시만 기다려 주세요</div>
@@ -137,6 +148,21 @@
   </div>
 </div>
 
+<div class="ov" id="ovDart">
+  <div class="ovin">
+    <div class="ovt">재무 데이터가 아직 없습니다</div>
+    <div class="ovb">
+      부채비율, 영업이익 같은 <b>재무 조건</b>으로 종목을 거르려면 필요합니다.<br>
+      처음 한 번은 <b>2,400여 건</b>을 부르느라 시간이 걸립니다. 이후에는 훨씬 짧습니다.<br>
+      나중에 받아도 됩니다. 그동안은 <b>재무 조건 없이</b> 계산됩니다.
+    </div>
+    <div class="ovf">
+      <button type="button" id="dartNo">나중에 하기</button>
+      <button type="button" class="pri" id="dartYes">지금 받기</button>
+    </div>
+  </div>
+</div>
+
 <div class="ov" id="ovPort">
   <div class="ovin">
     <div class="ovt">포트가 겹칩니다</div>
@@ -175,6 +201,7 @@
 
 <div class="ov" id="ovDone">
   <div class="ovin">
+    <div id="ckglow"></div>
     <div id="bigck"><i></i></div>
     <div id="dtitle">준비 완료</div>
     <div id="dsum">브라우저를 엽니다</div>

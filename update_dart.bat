@@ -56,6 +56,8 @@ echo.
 echo  - 이미 받은 분기는 자동으로 건너뜁니다. 같은 자료를 두 번 받지 않습니다.
 echo  - 가장 최근 2개 분기는 정정공시 때문에 매번 다시 확인합니다.
 echo  - 아직 공시 기간이 아닌 분기는 아예 요청하지 않습니다.
+echo  - 2015년 1분기^,반기^,3분기는 요청하지 않습니다. DART 가 주지 않는 구간입니다.
+echo    ^(분기^·반기보고서는 2016년부터입니다. 2015년은 사업보고서만 있습니다^)
 echo  - 중간에 끊겨도 다시 실행하면 이어받습니다.
 echo  - DART 는 하루 20,000건까지만 부를 수 있습니다. 넘으면 알아서 멈춥니다.
 echo.
@@ -120,8 +122,20 @@ goto :end
 
 :end
 echo.
-echo  참고 : 받은 것까지 무시하고 처음부터 전부 다시 받으려면 아래를 실행하세요.
-echo         .venv\Scripts\python.exe -m tools.fetch_dart --from !FROMYEAR! --force
+echo  ------------------------------------------
+echo  받은 데이터가 제대로인지 확인하려면 dart_report.bat 을 실행하세요.
+echo.
+echo  그 밖에 쓸 수 있는 명령 ^(cmd 창에서 이 폴더로 이동한 뒤^)
+echo.
+echo    특정 분기만 다시 받기
+echo      .venv\Scripts\python.exe -m tools.fetch_dart --only 2015-1,2015-2,2015-3
+echo.
+echo    받은 자료는 그대로 두고 계산만 다시 하기 ^(인터넷 안 씀^)
+echo      .venv\Scripts\python.exe -m tools.fetch_dart --rebuild
+echo.
+echo    전부 무시하고 처음부터 다시 받기 ^(오래 걸립니다^)
+echo      .venv\Scripts\python.exe -m tools.fetch_dart --from !FROMYEAR! --force
+echo  ------------------------------------------
 echo.
 if /i "%1"=="/silent" goto :quit
 pause

@@ -189,7 +189,8 @@ def test_validate_reports_missing_param_path():
     (lambda d: d["params"][0].pop("group"), "params[0].group"),
     (lambda d: d["params"][0].pop("default"), "params[0].default"),
     (lambda d: d["params"][0].update(type="colour"), "params[0].type"),
-    (lambda d: d["params"][1].pop("unavailable_reason"), "params[1].unavailable_reason"),
+    (lambda d: d["params"][1].update(available=False, unavailable_reason=None),
+     "params[1].unavailable_reason"),
     (lambda d: d["params"][0].update(key=d["params"][1]["key"]), "params[1].key"),
     (lambda d: d.update(params={"not": "a list"}), "params"),
 ])

@@ -51,6 +51,37 @@ CATEGORY_COLUMNS = ("Code", "Name", "Market", "MarketId", "Dept", "ChangeCode")
 
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
+#: ``bars()`` 기본 컬럼. 차트/UI 가 실제로 쓰는 것만 읽는다 (읽기 비용이 컬럼 수에 비례한다).
+#: 더 필요하면 ``columns=`` 로 지정하거나 ``columns="all"`` 을 쓴다.
+BARS_DEFAULT_COLUMNS = [
+    "Date", "Code", "Name", "Open", "High", "Low", "Close", "Volume", "Amount", "Marcap",
+]
+
+#: 종목별 캐시 폴더 (``cache/sym/<code>.parquet``)
+SYMBOL_CACHE_DIRNAME = "sym"
+
+#: 종목 캐시 폴더 총 크기 상한. 넘으면 오래된 것부터 지운다.
+SYMBOL_CACHE_MAX_BYTES = 200 * 1024 * 1024
+
+#: 이 개수 이하의 연도만 바뀌었으면 그 연도만 다시 읽어 캐시를 이어붙인다(증분 갱신).
+SYMBOL_CACHE_INCREMENTAL_MAX_YEARS = 3
+
+
+def code_variants(code: str) -> List[str]:
+    """종목코드의 표기 변형.
+
+    marcap 은 **1995~2000년 파일에서 앞자리 0 을 떼고 저장한다** (``005930`` → ``5930``).
+    parquet 푸시다운 필터는 문자열을 그대로 비교하므로 변형을 전부 넣어야 과거 데이터가 누락되지 않는다.
+    (삼성전자의 경우 이걸 빠뜨리면 7,876행 중 1,420행이 조용히 사라진다)
+    """
+    padded = str(code).strip().zfill(6)
+    out = [padded]
+    stripped = padded
+    while stripped.startswith("0") and len(stripped) > 1:
+        stripped = stripped[1:]
+        out.append(stripped)
+    return list(dict.fromkeys(out))
+
 
 def _concat_columnwise(frames: List[pd.DataFrame], beat, consume: bool = True) -> pd.DataFrame:
     """여러 해치 프레임을 **컬럼 단위로** 이어붙인다.
@@ -480,26 +511,225 @@ class MarcapStore:
         beat(0.3)
         return out
 
-    def bars(self, code: str, start=None, end=None) -> pd.DataFrame:
-        """한 종목의 일봉. index=Date, 컬럼은 marcap 원본 표기(Open/High/.../Amount/Name)."""
+    def bars(self, code: str, start=None, end=None,
+             columns: Sequence[str] | str | None = None,
+             use_cache: bool = True) -> pd.DataFrame:
+        """한 종목의 일봉. index=Date, 컬럼은 marcap 원본 표기(Open/High/.../Amount/Name).
+
+        연도 파일을 통째로 읽지 않고 **parquet 푸시다운으로 그 종목만** 읽는다.
+        전체 히스토리를 읽었으면 ``cache/sym/<code>.parquet`` 에 저장해 다음부터는 그걸 쓴다.
+
+        Parameters
+        ----------
+        columns : list | "all" | None
+            ``None`` 이면 ``BARS_DEFAULT_COLUMNS``. ``"all"`` 이면 파일의 전 컬럼.
+        """
         files = self._require()
         code = str(code).zfill(6)
         s = _to_date(start) if start is not None else dt.date(min(files), 1, 1)
         e = _to_date(end) if end is not None else dt.date(max(files), 12, 31)
-        frames = []
-        for y in self._range_years(s, e):
-            df = self.load_year(y)
-            m = (
-                (df["Code"] == code)
-                & (df["Date"] >= pd.Timestamp(s))
-                & (df["Date"] <= pd.Timestamp(e))
-            )
-            if m.any():
-                frames.append(df.loc[m])
-        if not frames:
+        if e < s:
+            raise DataUnavailable(f"구간이 뒤집혔습니다: {s} ~ {e}")
+
+        cols = None if columns == "all" else list(columns or BARS_DEFAULT_COLUMNS)
+        years = self._range_years(s, e)
+        whole = start is None and end is None
+
+        frame = None
+        if use_cache:
+            frame = self._symbol_cache_get(code, cols)
+        if frame is None:
+            frame = self._read_symbol(code, cols, years)
+            # 전체 히스토리를 읽은 경우에만 캐시한다 (부분 구간을 캐시하면 다음 조회가 틀린다)
+            if use_cache and whole and frame is not None and len(frame):
+                self._symbol_cache_put(code, frame, cols)
+
+        if frame is None or not len(frame):
             raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
-        out = pd.concat(frames, ignore_index=True)
+
+        m = (frame["Date"] >= pd.Timestamp(s)) & (frame["Date"] <= pd.Timestamp(e))
+        out = frame.loc[m]
+        if not len(out):
+            raise DataUnavailable(f"{code} 의 {s} ~ {e} 구간 데이터가 없습니다")
         return out.set_index("Date").sort_index()
+
+    # ---------------------------------------------------------------- 단일 종목 읽기
+    def _year_from_memory(self, year: int, cols: Sequence[str] | None) -> Optional[pd.DataFrame]:
+        """이미 메모리에 올라온 연도 프레임 중 필요한 컬럼을 다 가진 것."""
+        need = set(cols or ())
+        for (y, _ck), df in self._years.items():
+            if y != int(year):
+                continue
+            if not need or need <= set(df.columns):
+                return df
+        return None
+
+    def _read_symbol(self, code: str, cols: Sequence[str] | None,
+                     years: Sequence[int]) -> Optional[pd.DataFrame]:
+        """연도별로 그 종목만 읽어 붙인다. **연도 캐시(``_years``)를 오염시키지 않는다.**"""
+        files = self._require()
+        variants = code_variants(code)
+        frames = []
+        for y in years:
+            path = files.get(int(y))
+            if path is None:
+                continue
+            mem = self._year_from_memory(y, cols)
+            if mem is not None:
+                m = mem["Code"] == code
+                if bool(m.any()):
+                    keep = [c for c in (cols or mem.columns) if c in mem.columns]
+                    frames.append(mem.loc[m, keep])
+                continue
+            part = self._read_symbol_year(path, variants, cols)
+            if part is not None and len(part):
+                frames.append(part)
+        if not frames:
+            return None
+        out = pd.concat(frames, ignore_index=True)
+        return self._normalize(out)
+
+    @staticmethod
+    def _read_symbol_year(path: Path, variants: Sequence[str],
+                          cols: Sequence[str] | None) -> Optional[pd.DataFrame]:
+        """parquet 필터 푸시다운으로 한 종목만 읽는다 (연도 전체를 메모리에 올리지 않는다)."""
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:  # pragma: no cover
+            df = pd.read_parquet(path, columns=list(cols) if cols else None)
+            return df[df["Code"].astype(str).isin(list(variants))]
+        try:
+            pf = pq.ParquetFile(path)
+            have = set(pf.schema_arrow.names)
+            use = [c for c in cols if c in have] if cols else None
+            tb = pq.read_table(path, columns=use, filters=[("Code", "in", list(variants))])
+        except Exception:  # pragma: no cover - 구버전 pyarrow / 이상한 파일은 통째로 읽는다
+            df = pd.read_parquet(path, columns=list(cols) if cols else None)
+            return df[df["Code"].astype(str).isin(list(variants))]
+        if tb.num_rows == 0:
+            return None
+        return tb.to_pandas()
+
+    # ---------------------------------------------------------------- 종목 캐시
+    @property
+    def symbol_cache_dir(self) -> Path:
+        return self.cache_dir / SYMBOL_CACHE_DIRNAME
+
+    def _symbol_cache_paths(self, code: str) -> tuple:
+        d = self.symbol_cache_dir
+        return d / f"{code}.parquet", d / f"{code}.meta.json"
+
+    def _source_fingerprint(self) -> Dict[str, int]:
+        """연도 파일들의 mtime. 데이터가 갱신되면 값이 바뀐다."""
+        out: Dict[str, int] = {}
+        for y, p in self._files().items():
+            try:
+                out[str(y)] = int(p.stat().st_mtime_ns)
+            except OSError:  # pragma: no cover
+                continue
+        return out
+
+    def _symbol_cache_get(self, code: str, cols: Sequence[str] | None) -> Optional[pd.DataFrame]:
+        """유효한 종목 캐시를 돌려준다. 일부 연도만 바뀌었으면 그 연도만 다시 읽어 잇는다."""
+        pq_path, meta_path = self._symbol_cache_paths(code)
+        if not (pq_path.is_file() and meta_path.is_file()):
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+        cached_cols = meta.get("columns")
+        if cols is not None and cached_cols is not None and not set(cols) <= set(cached_cols):
+            return None                       # 캐시에 없는 컬럼을 요구한다 → 다시 읽는다
+        if cols is None and cached_cols is not None:
+            return None                       # columns="all" 인데 캐시는 일부만 갖고 있다
+
+        cur = self._source_fingerprint()
+        old = {str(k): int(v) for k, v in (meta.get("files") or {}).items()}
+        stale = sorted({int(y) for y in cur if old.get(y) != cur[y]}
+                       | {int(y) for y in old if y not in cur})
+        if meta.get("last_sync") != (self._read_status_file().get("last_sync") or None):
+            stale = sorted({int(y) for y in cur})
+
+        try:
+            df = pd.read_parquet(pq_path)
+            df["Date"] = pd.to_datetime(df["Date"])
+        except Exception:  # pragma: no cover - 깨진 캐시
+            return None
+
+        if not stale:
+            return df
+        if len(stale) > SYMBOL_CACHE_INCREMENTAL_MAX_YEARS:
+            return None                       # 너무 많이 바뀌었다 → 전체 재생성
+
+        # 증분 갱신: 바뀐 연도의 행만 버리고 그 연도만 다시 읽어 붙인다
+        keep = df[~df["Date"].dt.year.isin(stale)]
+        fresh = self._read_symbol(code, cols, [y for y in stale if y in {int(k) for k in cur}])
+        parts = [x for x in (keep, fresh) if x is not None and len(x)]
+        if not parts:
+            return None
+        merged = self._normalize(pd.concat(parts, ignore_index=True))
+        self._symbol_cache_put(code, merged, cols)
+        return merged
+
+    def _symbol_cache_put(self, code: str, df: pd.DataFrame,
+                          cols: Sequence[str] | None) -> None:
+        pq_path, meta_path = self._symbol_cache_paths(code)
+        try:
+            self.symbol_cache_dir.mkdir(parents=True, exist_ok=True)
+            df.reset_index(drop=True).to_parquet(pq_path, index=False)
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "code": code,
+                        "columns": list(cols) if cols is not None else None,
+                        "rows": int(len(df)),
+                        "first": str(df["Date"].min().date()) if len(df) else None,
+                        "last": str(df["Date"].max().date()) if len(df) else None,
+                        "files": self._source_fingerprint(),
+                        "last_sync": self._read_status_file().get("last_sync") or None,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:  # pragma: no cover - 캐시 실패는 치명적이지 않다
+            return
+        self._trim_symbol_cache()
+
+    def _trim_symbol_cache(self, max_bytes: int = SYMBOL_CACHE_MAX_BYTES) -> None:
+        """폴더 크기 상한을 넘으면 오래된 것부터 지운다."""
+        d = self.symbol_cache_dir
+        try:
+            items = []
+            total = 0
+            for p in d.glob("*.parquet"):
+                st = p.stat()
+                items.append((st.st_mtime, st.st_size, p))
+                total += st.st_size
+            if total <= max_bytes:
+                return
+            for _mt, size, p in sorted(items):
+                p.unlink(missing_ok=True)
+                p.with_suffix("").with_suffix(".meta.json").unlink(missing_ok=True)
+                (d / f"{p.stem}.meta.json").unlink(missing_ok=True)
+                total -= size
+                if total <= max_bytes:
+                    break
+        except OSError:  # pragma: no cover
+            return
+
+    def clear_symbol_cache(self) -> int:
+        """종목 캐시를 전부 지운다. 지운 파일 수를 돌려준다."""
+        n = 0
+        try:
+            for p in self.symbol_cache_dir.glob("*"):
+                p.unlink(missing_ok=True)
+                n += 1
+        except OSError:  # pragma: no cover
+            pass
+        return n
 
     def names(self, on: dt.date | None = None) -> Dict[str, str]:
         """``{code: name}``. 가장 최근 거래일 기준."""

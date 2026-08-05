@@ -162,7 +162,11 @@ export class CandleChart {
     for (const meta of indicatorMeta) {
       const raw = src[meta.key];
       if (!raw) continue;
-      ind.push({ key: meta.key, label: meta.label || meta.key, slot: meta.slot | 0, overlay: meta.overlay !== false, arr: toF64(raw, n) });
+      ind.push({
+        key: meta.key, label: meta.label || meta.key, slot: meta.slot | 0,
+        overlay: meta.overlay !== false, fromStrategy: meta.fromStrategy === true,
+        arr: toF64(raw, n),
+      });
     }
     // 메타에 없지만 응답에 있는 지표도 버리지 않는다
     let slot = ind.length;
@@ -989,8 +993,16 @@ export class CandleChart {
   _hoverInfo(i, px, py, changed) {
     if (i < 0 || !this.d) return null;
     const d = this.d;
+    // 키로만 담으면 같은 지표가 두 번 있을 때 서로 덮어써서 값이 사라진다.
+    // 범례는 순서가 보장되는 indicatorValues 를 쓴다.
     const ind = {};
-    for (const x of d.ind) { const v = x.arr[i]; ind[x.key] = (v === v) ? v : null; }
+    const indicatorValues = [];
+    for (const x of d.ind) {
+      const v = x.arr[i];
+      const val = (v === v) ? v : null;
+      ind[x.key] = val;
+      indicatorValues.push(val);
+    }
     let marker = null;
     const M = d.markers;
     for (let k = 0; k < M.n; k++) {
@@ -1005,7 +1017,10 @@ export class CandleChart {
       spike: (d.flag[i] & 2) !== 0,
       up: (d.flag[i] & 1) !== 0,
       indicators: ind,
-      indicatorMeta: d.ind.map((x) => ({ key: x.key, label: x.label, slot: x.slot })),
+      indicatorValues,
+      indicatorMeta: d.ind.map((x) => ({
+        key: x.key, label: x.label, slot: x.slot, fromStrategy: x.fromStrategy === true,
+      })),
       marker,
     };
   }

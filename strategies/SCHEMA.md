@@ -128,7 +128,48 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `amount_min_eok` | 거래대금 하한 (억) |
 | `volume_min` | 거래량 하한 (주) |
 
-**그 밖의 키는 조용히 무시하지 않는다.** marcap 에 없는 데이터(재무제표 등)를 요구하는 조건은
+DART 재무 데이터(`dart/fundamentals-YYYY.parquet`)가 연결되면 아래 키도 적용된다.
+연결되지 않았으면 자동으로 무시 목록으로 간다.
+
+| 키 | 의미 | 판정 |
+|---|---|---|
+| `debt_ratio_max_pct` | 부채비율 상한 (%) | `debt_ratio_pct < 값` |
+| `current_ratio_min_pct` | 유동비율 하한 (%) | `current_ratio_pct > 값` |
+| `profitable_quarters_min` | 영업이익 연속 흑자 분기 | `consecutive_profit_quarters >= 값` |
+
+#### 재무 조건은 **그 시점에 공시된 것만** 본다 (as-of)
+
+재무제표는 분기가 끝나고 45~90일 뒤에 공시된다.
+2025-04-01 매매 판단에 2025Q1 재무를 쓰면 **그날 존재하지도 않던 정보**로 종목을 고른 것이다.
+
+엔진은 기준일마다 `DartStore.as_of_panel(codes, 기준일)` 을 부른다.
+즉 `disclosed_at <= 기준일` 인 행만 본다. 2025Q1 이 5/15 공시라면 5/14 판정에는 2024Q4 가 쓰인다.
+전 구간에 최신 재무를 한 번 붙이는 식은 쓰지 않는다.
+
+#### `on_missing` — 재무를 알 수 없는 종목
+
+```json
+"filters": { "debt_ratio_max_pct": 200, "on_missing": "include" }
+```
+
+| 값 | 동작 |
+|---|---|
+| `include` **(기본)** | 재무를 모르는 종목은 **통과**시킨다. 그 종목에는 재무 조건을 적용하지 않은 것으로 본다 |
+| `exclude` | 제외한다. `warnings` 에 생존 편향 경고가 붙는다 |
+
+**기본값이 `include` 인 이유가 중요하다.** DART 기업목록(`corp_map`)은 **현재 상장사만** 담는다.
+상장폐지된 회사는 종목코드가 비어 있어 재무가 수집되지 않는다.
+그래서 "재무를 모르면 제외"로 두면 **망한 회사만 골라서 빠지는 생존 편향**이 생기고
+결과가 실제보다 좋게 나온다.
+
+어느 쪽을 쓰든 몇 종목이 "재무 모름" 이었는지는 항상 집계되어 나온다
+(`assumptions.stats.missing_financials` / `missing_financials_pct`,
+`assumptions.dart.coverage_pct`).
+
+판정 우선순위는 **"확실한 탈락" > "모름"** 이다.
+부채비율은 알고 있는데 기준을 넘겼다면, 유동비율을 몰라도 그 종목은 탈락이다.
+
+**그 밖의 키는 조용히 무시하지 않는다.** marcap 에도 DART 에도 없는 데이터를 요구하는 조건은
 결과에 그대로 드러난다.
 
 - `warnings` 에 한국어 한 줄
@@ -339,6 +380,24 @@ LLM이 자연어를 이 JSON으로 변환해 그대로 실행할 수도 있다.
 | `default` | O | **초기화 버튼이 되돌릴 값.** 저장해도 이 값은 바뀌지 않는다 |
 | `unit` `min` `max` `step` `options` `help` | | 폼 렌더링 힌트 (`type: "select"` 는 `options` 필수) |
 | `available` | | `false` 면 입력 비활성화 + `unavailable_reason` 표시. 기본 `true` |
+| `requires` | | 이 파라미터가 실제로 동작하려면 필요한 외부 데이터. 현재 `"dart"` 만 |
+
+**`available` 을 파일에 박아두지 마라.** 전략 JSON은 정적인데 DART 연결 여부는 실행 환경에 달렸다.
+재무처럼 외부 데이터가 필요한 항목은 `requires: "dart"` 로 선언하고 `unavailable_reason` 을 함께 둔다.
+프런트가 `/api/status` 로 DART 가용 여부를 확인해 `available` 을 **런타임에** 판단한다.
+
+```json
+{
+  "key": "debt_ratio_max_pct",
+  "label": "부채비율 상한",
+  "group": "1. 종목 선정",
+  "path": "universe.filters.debt_ratio_max_pct",
+  "type": "number", "unit": "%", "default": 200,
+  "available": true,
+  "requires": "dart",
+  "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+}
+```
 
 **초기화 동작** — "기본값으로 되돌리기"는 모든 `params[].default` 를 각 `path` 에 다시 써넣는다.
 `available: false` 항목도 되돌린다. `params` 배열 자체는 절대 수정하지 않는다.
@@ -446,8 +505,19 @@ B1만 체결된 상태에서 다음 날 B2가 체결되면, B2 체결일에도 �
 | `assumptions.stats` | 의미 |
 |---|---|
 | `ambiguous_bars` | 진입과 청산이 같은 봉 안에서 모두 성립해 **순서를 알 수 없었던** 봉의 수. 많을수록 결과가 가정에 크게 의존한다 |
+| `missing_financials` / `_pct` | 재무를 알 수 없었던 종목 수와 비중 (`on_missing` 이 처리한 대상) |
 | `same_day_profit_exits_blocked` | 그중 `loss_only`/`never` 규칙 때문에 **당일 이익 청산이 차단되어** 다음 거래일로 넘어간 건수. 이 옵션이 실제로 얼마나 작동했는지를 보여준다 |
 | `same_day_entry_exit` / `_pct` | 진입일과 청산일이 같은 거래 수와 비중 |
+
+`assumptions.dart` 블록도 함께 나온다.
+
+```json
+"dart": {"available": true, "as_of": true, "coverage_pct": 87.3,
+         "on_missing": "include", "last_fetch": "2026-08-05 14:20:00"}
+```
+
+`available: false` 면 재무 조건은 하나도 적용되지 않았다는 뜻이고,
+그 조건들은 `ignored_filters` 에 사유와 함께 들어 있다.
 
 ---
 
@@ -463,8 +533,10 @@ B1만 체결된 상태에서 다음 날 B2가 체결되면, B2 체결일에도 �
 7. 이동평균·신고가 같은 지표는 `indicators` 에 `key` 를 붙여 선언하고 조건식에서는 그 이름을 쓴다
    (인라인 `{"indicator": ...}` 를 여기저기 박지 않는다)
 8. `expr` 에 함수 호출을 쓰지 않는다 (`sma(...)` 불가). 지표는 반드시 별칭이나 `{"indicator": ...}` 로 쓴다
-9. marcap 으로 판정할 수 없는 조건(재무제표 등)은 지어내지 말고 `universe.filters` 에 값만 두고
-   `params` 에서 `available: false` + `unavailable_reason` 을 붙인다
+9. 재무 조건(부채비율·유동비율·연속 흑자)은 `universe.filters` 의 정해진 키를 쓰고,
+   `params` 에는 `requires: "dart"` + `unavailable_reason` 을 붙인다. `available: false` 를 박지 않는다
+10. marcap 에도 DART 에도 없는 조건은 지어내지 말고 `universe.filters` 에 값만 두면
+   엔진이 `ignored_filters` 로 사용자에게 알린다
 
 ### 프롬프트 템플릿
 

@@ -1061,7 +1061,7 @@ def test_report_영업이익_전량결측을_잡아낸다(tmp_path, capsys):
     root = _break_store(tmp_path, kill_op)
     rc, out = run_report(root, tmp_path / "marcap", capsys)
     assert rc == fd.REPORT_ISSUES
-    assert "'영업이익' 가 100% 결측입니다" in out
+    assert "'영업이익' 항목이 100% 결측입니다" in out
     assert "account_nm" in out, "계정명 매칭 실패를 의심하라고 알려야 한다"
 
 
@@ -1074,7 +1074,7 @@ def test_report_유동자산_전량결측을_잡아낸다(tmp_path, capsys):
     root = _break_store(tmp_path, kill)
     rc, out = run_report(root, tmp_path / "marcap", capsys)
     assert rc == fd.REPORT_ISSUES
-    assert "'유동자산' 가 100% 결측입니다" in out
+    assert "'유동자산' 항목이 100% 결측입니다" in out
     assert "유동비율을 계산할 수 없는 종목이" in out
 
 
@@ -1126,17 +1126,36 @@ def test_report_삼성전자가_아예_없으면_잡아낸다(tmp_path, capsys):
     assert "005930" in out and "재무가 하나도 없습니다" in out
 
 
-def test_report_빠진_분기를_잡아낸다(tmp_path, capsys):
-    """중간 분기를 통째로 못 받은 상황."""
-    def drop_q2_2024(df):
-        bad = (df["year"].astype("int64") == 2024) & (df["quarter"].astype("int64") == 2)
+def _drop_quarter(year, quarter):
+    def f(df):
+        bad = ((df["year"].astype("int64") == year)
+               & (df["quarter"].astype("int64") == quarter))
         return df[~bad]
+    return f
 
-    root = _break_store(tmp_path, drop_q2_2024)
+
+def test_report_아예_안받은_분기를_잡아낸다(tmp_path, capsys):
+    """상태 파일에도 기록이 없는 = 요청조차 안 한 분기."""
+    root = _break_store(tmp_path, _drop_quarter(2024, 2))
     rc, out = run_report(root, tmp_path / "marcap", capsys)
     assert rc == fd.REPORT_ISSUES
-    assert "과거 분기가 비어 있습니다" in out
+    assert "아예 받지 않은 분기가 있습니다" in out
     assert "2024-2" in out
+
+
+def test_report_요청했는데_013이_온_분기를_잡아낸다(tmp_path, capsys):
+    """요청은 했는데 DART 가 빈 응답을 준 경우 - 재시도 명령까지 안내해야 한다."""
+    root = _break_store(tmp_path, _drop_quarter(2024, 2))
+    (root / fd.STATE_FILENAME).write_text(
+        json.dumps({"version": 2, "quarters": {
+            "2024-2": {"fetched_at": "2026-08-01 10:00:00", "rows": 0,
+                       "corps": 22, "complete": True}}}),
+        encoding="utf-8",
+    )
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert rc == fd.REPORT_ISSUES
+    assert "데이터 없음(013)으로 답한 분기" in out
+    assert "--only 2024-2" in out, "다시 받는 명령을 알려줘야 한다"
 
 
 def test_report_행이_유난히_적은_분기를_잡아낸다(tmp_path, capsys):
@@ -1200,7 +1219,8 @@ def test_report_생존편향_규모를_센다(healthy, capsys):
 def test_report_marcap이_없으면_그_절만_건너뛴다(tmp_path, capsys):
     codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(10)]
     root = tmp_path / "dart"
-    write_store(root, realistic_rows(codes, [2023, 2024, 2025]))
+    write_store(root, realistic_rows(codes, [2023, 2024, 2025],
+                                     loss_codes=set(codes[3:9])))
     rc, out = run_report(root, tmp_path / "없는marcap", capsys)
     assert "marcap 데이터가 없어 생존 편향 규모를 재지 못했습니다" in out
     assert rc == fd.REPORT_OK
@@ -1254,3 +1274,269 @@ def test_dart_report_bat_출력파일_인코딩_지정():
     assert "PYTHONIOENCODING" in text or "chcp" in text.lower(), \
         "파이썬 출력 인코딩을 고정해야 한글이 안 깨진다"
     assert "BOM" in text or "utf8" in text.lower() or "cp949" in text.lower()
+
+
+# ======================================================================================
+# 15. 2015년 1~3분기 누락 — DART 제공 구간 밖이다
+# ======================================================================================
+
+
+def test_plan_2015_1_2_3분기는_요청하지_않는다(tmp_path):
+    """DART 재무정보 API 는 2015년은 사업보고서만, 분기·반기는 2016년부터 준다.
+
+    사용자 실측: 2015-1/2/3 만 0행, 2015-4 는 1,841행, 2016 은 4분기 모두 정상.
+    없는 걸 계속 요청하면 연 186회씩 헛돈다.
+    """
+    state = fd.FetchState(tmp_path / fd.STATE_FILENAME, today=TODAY)
+    plan = {(p["year"], p["quarter"]): p
+            for p in fd.plan_quarters(2015, 2016, state, today=TODAY, refresh_recent=0)}
+
+    for q in (1, 2, 3):
+        assert plan[(2015, q)]["action"] == "skip"
+        assert plan[(2015, q)]["reason"] == fd.PLAN_NO_COVERAGE
+    assert plan[(2015, 4)]["action"] == "fetch", "2015 사업보고서는 있다"
+    for q in (1, 2, 3, 4):
+        assert plan[(2016, q)]["action"] == "fetch", "2016 부터는 분기도 있다"
+
+
+def test_force면_2015_분기도_다시_요청한다(tmp_path):
+    state = fd.FetchState(tmp_path / fd.STATE_FILENAME, today=TODAY)
+    plan = {(p["year"], p["quarter"]): p
+            for p in fd.plan_quarters(2015, 2015, state, today=TODAY,
+                                      refresh_recent=0, force=True)}
+    assert all(plan[(2015, q)]["action"] == "fetch" for q in (1, 2, 3, 4))
+
+
+def test_only로_특정_분기만_받는다(tmp_path):
+    state = fd.FetchState(tmp_path / fd.STATE_FILENAME, today=TODAY)
+    state.mark_quarter(2015, 4, rows=1841, corps=3058)     # 이미 받았어도
+    plan = fd.plan_quarters(2015, 2016, state, today=TODAY, refresh_recent=0,
+                            only="2015-1,2015-2,2015-3")
+    fetched = {(p["year"], p["quarter"]) for p in plan if p["action"] == "fetch"}
+    assert fetched == {(2015, 1), (2015, 2), (2015, 3)}, \
+        "--only 는 제공 구간 밖이든 이미 받았든 콕 집은 것만 받는다"
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("2015-1", {(2015, 1)}),
+    ("2015Q1,2016-3", {(2015, 1), (2016, 3)}),
+    (" 2015-1 , 2015-2 ", {(2015, 1), (2015, 2)}),
+    (None, None),
+    ("", None),
+])
+def test_only_문자열_파싱(spec, expected):
+    assert fd.parse_only(spec) == expected
+
+
+def test_only_형식이_틀리면_오류():
+    with pytest.raises(ValueError):
+        fd.parse_only("2015-5")
+    with pytest.raises(ValueError):
+        fd.parse_only("올해1분기")
+
+
+def test_only_end_to_end(tmp_path):
+    out = tmp_path / "dart"
+    corps = make_corps(4)
+    fd.run_fetch("KEY", 2015, 2016, out_dir=out, batch=4, fetch=FakeDart(corps),
+                 today=TODAY, refresh_recent=0)
+
+    again = FakeDart(corps)
+    fd.run_fetch("KEY", 2015, 2016, out_dir=out, batch=4, fetch=again,
+                 today=TODAY, refresh_recent=0, only="2015-1,2015-2")
+    got = {(int(p["bsns_year"]), fd.QUARTER_BY_REPRT_CODE[p["reprt_code"]])
+           for p in again.acnt_calls}
+    assert got == {(2015, 1), (2015, 2)}
+
+
+def test_report_2015_공백은_정상으로_본다(tmp_path, capsys):
+    """2015-1/2/3 이 비어도 이슈가 아니라 '참고' 여야 한다."""
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(20)]
+    rows = [r for r in realistic_rows(codes, [2015, 2016], loss_codes=set(codes[3:9]))
+            if not (r["year"] == 2015 and r["quarter"] in (1, 2, 3))]
+    root = tmp_path / "dart"
+    write_store(root, rows)
+    make_marcap(tmp_path / "marcap", [2015, 2016], {y: set(codes) for y in (2015, 2016)})
+
+    rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert "2015-1, 2015-2, 2015-3" in out
+    assert "제공하지 않는 구간" in out
+    assert "사업보고서만" in out
+    assert rc == fd.REPORT_OK, f"2015 공백을 오류로 잡으면 안 된다:\n{out}"
+
+
+# ======================================================================================
+# 16. 비율 분모 방어 · 자본잠식 플래그
+# ======================================================================================
+
+
+def test_유동부채가_0이면_유동비율을_계산하지_않는다():
+    df = fd.add_quarter_columns(
+        fd.to_frame([row("005930", 2024, 4, "2025-03-11", 10 * EOK, 유동부채=0)])
+    )
+    assert pd.isna(df["current_ratio_pct"].iloc[0])
+
+
+def test_분모가_자산총계에_비해_너무_작으면_계산하지_않는다():
+    """유동부채 1,000원 / 유동자산 52조 -> 유동비율 52억%. 그대로 두면 필터가 무력해진다."""
+    df = fd.add_quarter_columns(fd.to_frame([
+        row("005930", 2024, 4, "2025-03-11", 10 * EOK,
+            자산총계=5000 * EOK, 유동자산=2000 * EOK, 유동부채=1000)      # 1,000원
+    ]))
+    assert pd.isna(df["current_ratio_pct"].iloc[0]), \
+        "52억% 같은 값을 남기면 '유동비율 100% 초과' 를 무조건 통과한다"
+
+
+def test_분모가_경계보다_크면_정상_계산():
+    # 자산총계 5,000억의 0.01% = 5,000만원. 그보다 크면 계산한다.
+    df = fd.add_quarter_columns(fd.to_frame([
+        row("005930", 2024, 4, "2025-03-11", 10 * EOK,
+            자산총계=5000 * EOK, 유동자산=100 * EOK, 유동부채=1 * EOK)
+    ]))
+    assert df["current_ratio_pct"].iloc[0] == pytest.approx(10000.0)
+
+
+@pytest.mark.parametrize("equity,impaired", [
+    (-5 * EOK, True),
+    (0, True),
+    (350 * EOK, False),
+])
+def test_자본잠식_플래그(equity, impaired):
+    df = fd.add_quarter_columns(
+        fd.to_frame([row("005930", 2024, 4, "2025-03-11", 10 * EOK, 자본총계=equity)])
+    )
+    assert bool(df["capital_impaired"].iloc[0]) is impaired
+    if impaired:
+        assert pd.isna(df["debt_ratio_pct"].iloc[0]), \
+            "자본잠식이면 부채비율은 음수/무한대가 되므로 계산하지 않는다"
+    else:
+        assert not pd.isna(df["debt_ratio_pct"].iloc[0])
+
+
+def test_자본총계가_없으면_플래그도_모름():
+    df = fd.add_quarter_columns(
+        fd.to_frame([row("005930", 2024, 4, "2025-03-11", 10 * EOK, 자본총계=None)])
+    )
+    assert pd.isna(df["capital_impaired"].iloc[0]), "모르는 것을 False 로 단정하면 안 된다"
+
+
+def test_capital_impaired가_저장_컬럼에_있다(tmp_path):
+    out = tmp_path / "dart"
+    fd.run_fetch("KEY", 2024, 2024, out_dir=out, batch=4, fetch=FakeDart(make_corps(3)),
+                 today=TODAY, refresh_recent=0)
+    df = pd.read_parquet(out / "fundamentals-2024.parquet")
+    assert "capital_impaired" in df.columns
+    assert list(df.columns) == fd.OUTPUT_COLUMNS
+    assert str(df["capital_impaired"].dtype) == "boolean"
+
+
+def test_report_분모방어_건수를_보여준다(tmp_path, capsys):
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(20)]
+    rows = realistic_rows(codes, [2023, 2024, 2025], loss_codes=set(codes[3:9]))
+    for r in rows:                                   # 절반은 분모를 망가뜨린다
+        if r["code"] == codes[15]:
+            r["유동부채"] = 1000                      # 자산총계 대비 극소
+        if r["code"] == codes[16]:
+            r["자본총계"] = -3 * EOK                  # 자본잠식
+    root = tmp_path / "dart"
+    write_store(root, rows)
+
+    _rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert "비율을 계산하지 않은 건수" in out
+    assert "분모 과소" in out
+    assert "자본잠식(자본총계 <= 0)" in out
+    assert "capital_impaired" in out
+    # 방어가 걸렸으니 유동비율 최대가 억 단위로 튀지 않는다
+    st = fd._stats(pd.read_parquet(root / "fundamentals-2024.parquet")["current_ratio_pct"])
+    assert st["max"] < 100_000, f"유동비율 최대가 {st['max']} 로 여전히 터졌다"
+
+
+def test_report_예전파일이면_rebuild를_안내한다(tmp_path, capsys):
+    codes = ["005930", "000660"] + [f"{200000 + i:06d}" for i in range(10)]
+    root = tmp_path / "dart"
+    write_store(root, realistic_rows(codes, [2023, 2024, 2025], loss_codes=set(codes[3:9])))
+    for p in sorted(root.glob("fundamentals-*.parquet")):     # 컬럼을 지운다
+        pd.read_parquet(p).drop(columns=["capital_impaired"]).to_parquet(p, index=False)
+
+    _rc, out = run_report(root, tmp_path / "marcap", capsys)
+    assert "--rebuild" in out
+
+
+# ======================================================================================
+# 17. --rebuild (네트워크 없이 파생 지표만 다시 계산)
+# ======================================================================================
+
+
+def test_rebuild는_받아둔_조각으로_다시_만든다(tmp_path, capsys):
+    out = tmp_path / "dart"
+    fd.run_fetch("KEY", 2024, 2024, out_dir=out, batch=4, fetch=FakeDart(make_corps(5)),
+                 today=TODAY, refresh_recent=0)
+    year_file = out / "fundamentals-2024.parquet"
+    before = pd.read_parquet(year_file)
+    year_file.unlink()                                   # 연도 파일을 지워도
+
+    rc = fd.rebuild_all(out)
+    out_text = capsys.readouterr().out
+    assert rc == 0
+    assert year_file.is_file(), ".parts 만으로 다시 만들어져야 한다"
+    after = pd.read_parquet(year_file)
+    assert len(after) == len(before)
+    assert list(after.columns) == fd.OUTPUT_COLUMNS
+    assert "인터넷은 쓰지 않습니다" in out_text
+
+
+def test_rebuild는_네트워크를_쓰지_않는다(tmp_path, monkeypatch):
+    out = tmp_path / "dart"
+    fd.run_fetch("KEY", 2024, 2024, out_dir=out, batch=4, fetch=FakeDart(make_corps(3)),
+                 today=TODAY, refresh_recent=0)
+    monkeypatch.setattr(fd, "http_get", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("--rebuild 는 네트워크를 쓰면 안 된다")))
+    assert fd.rebuild_all(out) == 0
+
+
+def test_rebuild는_조각이_없으면_안내(tmp_path, capsys):
+    rc = fd.rebuild_all(tmp_path / "없음")
+    assert rc == fd.REPORT_NO_DATA
+    assert "update_dart.bat" in capsys.readouterr().out
+
+
+def test_rebuild_CLI(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "dart"
+    fd.run_fetch("KEY", 2024, 2024, out_dir=out, batch=4, fetch=FakeDart(make_corps(3)),
+                 today=TODAY, refresh_recent=0)
+    monkeypatch.setattr(fd, "read_api_key", lambda *a, **k: None)   # 키 없이도 된다
+    assert fd.main(["--rebuild", "--out", str(out)]) == 0
+
+
+# ======================================================================================
+# 18. 생존 편향 문구 — on_missing trade-off 를 정확히 써야 한다
+# ======================================================================================
+
+
+def test_report_생존편향_문구가_on_missing을_설명한다(healthy, capsys):
+    dart_root, marcap_root, _ = healthy
+    _rc, out = run_report(dart_root, marcap_root, capsys)
+
+    assert "on_missing" in out
+    assert '"include"' in out and '"exclude"' in out
+    assert "현재 기본값" in out
+    # include 쪽: 통과하므로 필터가 덜 걸러진다
+    assert "재무 조건이" in out and "적용되지 않습니다" in out
+    # exclude 쪽: 생존 편향
+    assert "생존 편향이 생깁니다" in out
+    # 한쪽을 강요하지 않는다
+    assert "어느 쪽도 공짜가 아닙니다" in out
+
+
+def test_report_자동제외라고_단정하지_않는다(healthy, capsys):
+    """엔진 기본값이 include 라 '자동 제외됩니다' 는 사실이 아니다."""
+    dart_root, marcap_root, _ = healthy
+    _rc, out = run_report(dart_root, marcap_root, capsys)
+    assert "자동 제외됩니다" not in out
+
+
+def test_report_생존편향_합계를_보여준다(healthy, capsys):
+    dart_root, marcap_root, _ = healthy
+    _rc, out = run_report(dart_root, marcap_root, capsys)
+    assert "미커버" in out and "상장폐지 추정" in out
+    assert "재무를 알 수 없는 종목 6개" in out

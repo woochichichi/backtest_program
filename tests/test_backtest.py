@@ -1057,13 +1057,16 @@ def test_strategy3_defaults_match_spec():
         assert get_by_path(doc, path) == want, path
 
 
-def test_strategy3_financial_params_marked_unavailable():
+def test_strategy3_financial_params_require_dart():
+    """전략 파일은 정적이고 DART 유무는 실행 환경에 달렸다.
+    그러니 available 을 파일에 박지 않고 requires="dart" 로 선언한다."""
     doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
-    fin = {"debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min"}
-    got = {p["key"] for p in doc["params"] if p.get("available") is False}
+    fin = {"debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min", "on_missing"}
+    got = {p["key"] for p in doc["params"] if p.get("requires") == "dart"}
     assert got == fin
     for p in doc["params"]:
-        if p["key"] in fin:
+        if p["key"] in fin - {"on_missing"}:
+            assert p.get("available") is not False
             assert "재무" in p["unavailable_reason"]
 
 
@@ -1404,7 +1407,7 @@ def test_params_requires_dart_validation(strategy1):
 def test_strategy3_declares_requires_dart():
     doc = json.loads((ROOT / "strategies" / "strategy3.json").read_text(encoding="utf-8"))
     fin = {"debt_ratio_max_pct", "current_ratio_min_pct", "profitable_quarters_min"}
-    got = {p["key"] for p in doc["params"] if p.get("requires") == "dart"}
+    got = {p["key"] for p in doc["params"] if p.get("requires") == "dart"} - {"on_missing"}
     assert got == fin
     for p in doc["params"]:
         if p["key"] in fin:

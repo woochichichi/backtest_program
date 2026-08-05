@@ -30,7 +30,8 @@
       "debt_ratio_max_pct": 200,
       "current_ratio_min_pct": 100,
       "profitable_quarters_min": 4,
-      "comment": "재무 3종(부채비율/유동비율/영업이익 연속 흑자)은 marcap 에 데이터가 없어 엔진이 적용하지 못한다. 결과의 assumptions.ignored_filters 로 보고된다."
+      "comment": "재무 3종은 DART 재무 데이터(dart/fundamentals-YYYY.parquet)가 연결됐을 때만 적용된다. 판정은 기준일 시점 as-of 조회다. on_missing=include 는 재무를 알 수 없는 종목을 통과시킨다 — DART 기업목록에 상장폐지 종목이 빠져 있어 exclude 로 두면 망한 회사만 골라 빠지는 생존 편향이 생긴다.",
+      "on_missing": "include"
     },
     "reference_day": {
       "rule": "custom",
@@ -293,8 +294,9 @@
       "min": 0,
       "max": 10000,
       "step": 10,
-      "available": false,
-      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+      "available": true,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다.",
+      "requires": "dart"
     },
     {
       "key": "current_ratio_min_pct",
@@ -307,8 +309,9 @@
       "min": 0,
       "max": 10000,
       "step": 10,
-      "available": false,
-      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+      "available": true,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다.",
+      "requires": "dart"
     },
     {
       "key": "profitable_quarters_min",
@@ -321,8 +324,30 @@
       "min": 0,
       "max": 20,
       "step": 1,
-      "available": false,
-      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다."
+      "available": true,
+      "unavailable_reason": "marcap 에 재무 데이터가 없어 이 조건은 적용되지 않습니다. DART 연동이 필요합니다.",
+      "requires": "dart"
+    },
+    {
+      "key": "on_missing",
+      "label": "재무를 모르는 종목",
+      "group": "1. 종목 선정",
+      "path": "universe.filters.on_missing",
+      "type": "select",
+      "options": [
+        {
+          "value": "include",
+          "label": "통과시킴 (권장)"
+        },
+        {
+          "value": "exclude",
+          "label": "제외함 (생존 편향 주의)"
+        }
+      ],
+      "default": "include",
+      "help": "DART 기업목록에는 상장폐지 종목이 빠져 있습니다. 제외하면 망한 회사만 골라 빠져 결과가 좋게 나옵니다",
+      "available": true,
+      "requires": "dart"
     },
     {
       "key": "spike_amount_krw_eok",

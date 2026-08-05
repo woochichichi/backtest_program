@@ -1056,3 +1056,82 @@ tr.grp-first td.grp::after, tr.grp-mid td.grp::after {
   content: ""; position: absolute; left: 3px; bottom: -1px; height: 50%;
   border-left: 2px solid var(--accent-bd);
 }
+
+/* ============================================================
+   범례 — 지표 값 / 삭제 버튼 / 접기
+   ============================================================ */
+.legend { max-width: calc(100% - 90px); }
+.legend-inds {
+  display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center;
+  margin-top: 1px; pointer-events: auto;
+}
+.lg-item {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 3px 1px 2px; border-radius: 4px;
+  white-space: nowrap;
+  text-shadow: 0 0 4px var(--ch-bg), 0 0 4px var(--ch-bg), 0 0 8px var(--ch-bg);
+}
+.lg-item:hover { background: var(--bg-2); text-shadow: none; }
+.lg-item .lg-v { color: var(--tx); }
+/* 전략에 정의된 지표는 톤을 달리해 구분한다 */
+.lg-item.strat .k { color: var(--accent-tx); }
+.lg-item.strat::after {
+  content: "전략"; font-size: 8.5px; font-family: var(--sans);
+  color: var(--tx-dim); border: 1px solid var(--bd); border-radius: 2px;
+  padding: 0 3px; margin-left: 1px;
+}
+/* × 자리를 미리 확보해 나타날 때 레이아웃이 밀리지 않게 한다 */
+.lg-x {
+  width: 13px; height: 13px; flex: 0 0 13px;
+  display: grid; place-items: center; border-radius: 3px;
+  color: var(--tx-sub); opacity: 0;
+  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.lg-item:hover .lg-x { opacity: 1; }
+.lg-x:hover { background: var(--danger-soft); color: var(--danger-tx); }
+.lg-x:focus-visible { opacity: 1; }
+.lg-more {
+  font-size: 10px; color: var(--accent-tx); padding: 0 5px;
+  border: 1px solid var(--bd); border-radius: 9px; background: var(--bg-2);
+}
+.lg-more:hover { background: var(--bg-3); }
+
+/* ============================================================
+   종목 링크 — 종목이 보이는 곳은 어디든 누를 수 있다
+   ============================================================ */
+.symlink {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  padding: 0; color: inherit; font: inherit; text-align: left;
+  cursor: pointer; border-radius: 3px;
+  transition: color var(--dur) var(--ease);
+}
+.symlink:hover { color: var(--accent-tx); text-decoration: underline; text-underline-offset: 2px; }
+.symlink.mono { font-family: var(--mono); color: var(--code-num); }
+.symlink.mono:hover { color: var(--accent-tx); }
+.symlink .symlink-cd { font-family: var(--mono); font-size: 10.5px; color: var(--tx-dim); }
+/* 지금 차트에 떠 있는 종목은 어디서든 같은 방식으로 강조 */
+.symlink.sym-on { color: var(--accent-tx); font-weight: 700; }
+.symlink.sym-on::before {
+  content: ""; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent); flex: 0 0 5px; align-self: center;
+}
+#byStock tr[data-code] { cursor: pointer; }
+
+/* ============================================================
+   지표 관리 다이얼로그
+   ============================================================ */
+.ind-mgr-list { max-height: 230px; overflow: auto; }
+.ind-list { display: flex; flex-direction: column; gap: 5px; }
+.ind-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border: 1px solid var(--bd); border-radius: var(--r);
+  background: var(--bg-2);
+}
+.ind-row.off { opacity: .6; }
+.ind-sw { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 2px; border: 1px solid var(--bd-str); }
+.ind-nm { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--tx); display: flex; align-items: center; gap: 6px; }
+.ind-tag {
+  font-size: 9px; font-weight: 700; padding: 0 4px; border-radius: 2px;
+  background: var(--accent-soft); color: var(--accent-tx); border: 1px solid var(--accent-bd);
+}
+.ind-tag.ui { background: var(--bg-3); color: var(--tx-sub); border-color: var(--bd); }
