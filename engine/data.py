@@ -238,7 +238,13 @@ class MarcapStore:
             on_chunk(min(0.9 * done / total, 0.9))
         if not batches:
             return pd.read_parquet(path, columns=cols)
-        return pa.Table.from_batches(batches).to_pandas()
+        tbl = pa.Table.from_batches(batches)
+        batches.clear()
+        # self_destruct: 변환하면서 arrow 버퍼를 바로 반납한다 (같은 데이터를 두 벌 들지 않는다)
+        try:
+            return tbl.to_pandas(self_destruct=True)
+        except TypeError:  # pragma: no cover - 구버전 pyarrow
+            return tbl.to_pandas()
 
     @staticmethod
     def _normalize(df: pd.DataFrame,
@@ -426,6 +432,7 @@ class MarcapStore:
 
         frames = []
         years = self._range_years(s, e)
+        cache_years = len(years) <= self.MAX_CACHED_YEARS
         for i, y in enumerate(years):
             if on_year is not None:
                 on_year(i, len(years), y)
@@ -433,15 +440,18 @@ class MarcapStore:
             if on_year is not None:
                 def sub_cb(frac, _i=i, _n=len(years), _y=y):   # noqa: F811
                     on_year(_i + frac, _n, _y)
-            df = self.load_year(y, columns=cols, on_chunk=sub_cb,
-                                cache=len(years) <= self.MAX_CACHED_YEARS)
+            df = self.load_year(y, columns=cols, on_chunk=sub_cb, cache=cache_years)
             if on_year is not None:
                 on_year(i + 1.0, len(years), y)
             if cols is not None and len(df.columns) != len(cols):
                 keep = [c for c in cols if c in df.columns]
                 df = df[keep]
             m = (df["Date"] >= pd.Timestamp(s)) & (df["Date"] <= pd.Timestamp(e))
-            if m.any():
+            if bool(m.all()):
+                # 그 해가 통째로 구간 안이면 복사하지 않는다.
+                # (캐시 중이면 아래 concat 이 컬럼을 떼어가므로 반드시 사본을 넘긴다)
+                frames.append(df.copy() if cache_years else df)
+            elif m.any():
                 frames.append(df.loc[m])
         if not frames:
             raise DataUnavailable(f"{s} ~ {e} 구간에 데이터가 없습니다")

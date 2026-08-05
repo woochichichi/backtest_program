@@ -861,6 +861,10 @@ def run_backtest(
     # 700만 행 패널을 복사하지 않는다 (수 초가 걸리고 중단할 수 없다).
     # 제외 종목은 기준일 이벤트 단계에서 걸러낸다.
     eligible = set(codes) if len(codes) < ustats["total"] else None
+    # 종목 선정에만 쓰인 컬럼은 여기서 버린다 (메모리 회수)
+    for _c in ("Market", "MarketId", "Dept"):
+        if _c in panel.columns:
+            del panel[_c]
     rep.check(force=True)
 
     sig.add(
@@ -897,6 +901,11 @@ def run_backtest(
     report(20, f"후보 {len(cand_codes):,}종목")
 
     # ---------------------------------------------------------------- 후보 종목 봉 준비
+    # 날짜 → 행 번호를 종목마다 dict 로 들면 수백만 개 엔트리가 되어 메모리를 다 잡아먹는다.
+    # 전역 거래일 달력의 인덱스(gi)를 쓰는 int32 배열 두 개로 대체한다.
+    cal_ns = np.array([np.datetime64(d) for d in calendar], dtype="datetime64[ns]")
+    n_cal = len(cal_ns)
+
     recs: Dict[str, dict] = {}
     _n_cand = len(cand_codes)
     for _j, (code, gdf) in enumerate(_iter_candidate_bars(panel, cand_codes, rep, _n_cand)):
@@ -905,13 +914,15 @@ def run_backtest(
         recs[code] = {
             "df": df,
             "name": str(gdf["Name"].iloc[-1]) if "Name" in gdf.columns else code,
-            "pos": {d.date(): i for i, d in enumerate(df.index)},
-            "open": df["Open"].to_numpy("float64"),
-            "high": df["High"].to_numpy("float64"),
-            "low": df["Low"].to_numpy("float64"),
-            "close": df["Close"].to_numpy("float64"),
-            "volume": df["Volume"].to_numpy("float64") if "Volume" in df else np.zeros(len(df)),
-            "amount": df["Amount"].to_numpy("float64") if "Amount" in df else np.zeros(len(df)),
+            **_row_maps(df.index, cal_ns, n_cal),
+            # dtype 을 바꾸지 않으면 to_numpy() 가 뷰라서 복사본을 만들지 않는다.
+            # OHLC 는 float32 지만 KRX 주가 범위에서는 float64 와 값이 완전히 같다.
+            "open": df["Open"].to_numpy(),
+            "high": df["High"].to_numpy(),
+            "low": df["Low"].to_numpy(),
+            "close": df["Close"].to_numpy(),
+            "volume": df["Volume"].to_numpy() if "Volume" in df else np.zeros(len(df)),
+            "amount": df["Amount"].to_numpy() if "Amount" in df else np.zeros(len(df)),
             "ind": {},
             "ctx": None,
         }
@@ -970,8 +981,8 @@ def run_backtest(
             rec = recs.get(code)
             if rec is None:
                 continue
-            li = rec["pos"].get(day)
-            if li is None:
+            li = int(rec["row_of_gi"][gi])
+            if li < 0:
                 continue
             w = active.get(code)
             if w is None:
@@ -999,8 +1010,8 @@ def run_backtest(
             if w is None:
                 continue
             rec = recs[code]
-            li = rec["pos"].get(day)
-            if li is None:
+            li = int(rec["row_of_gi"][gi])
+            if li < 0:
                 continue  # 거래정지 등 — 해당일 봉 없음
 
             bar = _bar(rec, li)
@@ -1047,7 +1058,7 @@ def run_backtest(
                 fill_date = day if fill_model != "next_open" else _next_day(rec, li)
                 buy_px = px * (1.0 + slippage)
 
-                equity_now = cash + _mtm(active, recs, day)
+                equity_now = cash + _mtm(active, recs, gi)
                 if w["planned"] is None:
                     w["planned"] = _planned_position(sizing, portfolio, equity_now, max_positions)
                 qty = _entry_qty(rule, sizing, portfolio, w["planned"], equity_now, buy_px, cash)
@@ -1148,7 +1159,7 @@ def run_backtest(
                 if w["qty"] <= 0:
                     active.pop(code, None)
 
-        eq_values.append(cash + _mtm(active, recs, day))
+        eq_values.append(cash + _mtm(active, recs, gi))
 
     # ---------------------------------------------------------------- 미청산 강제 청산
     report(92, "미청산 포지션 정리", PHASE_SIM)
@@ -1160,7 +1171,7 @@ def run_backtest(
         if w["qty"] <= 0:
             continue
         rec = recs[code]
-        li = _last_index_upto(rec, last_day)
+        li = _last_index_upto(rec, len(calendar) - 1)
         if li is None:
             continue
         px = float(rec["close"][li])
@@ -1178,7 +1189,7 @@ def run_backtest(
                 f"{code} 실현손익 {trade['pnl']:+,.0f}원 ({trade['return_pct']:+.2f}%) "
                 f"· 보유 {trade['hold_days']}일", "15:30:00")
         active.pop(code, None)
-    eq_values[-1] = cash + _mtm(active, recs, last_day)
+    eq_values[-1] = cash + _mtm(active, recs, len(calendar) - 1)
 
     # ---------------------------------------------------------------- 성과
     rep.set_phase(PHASE_METRICS, 94)
@@ -1393,6 +1404,24 @@ def _new_watch(code: str, ref_date: dt.date, ref_li: int, ref_gi: int, refbar: d
     }
 
 
+def _row_maps(index: pd.DatetimeIndex, cal_ns: np.ndarray, n_cal: int) -> dict:
+    """거래일 달력 인덱스(gi) ↔ 종목 내 행 번호(li) 매핑을 int32 배열로 만든다.
+
+    * ``row_of_gi[gi]``   그 날의 행 번호 (없으면 -1 — 거래정지 등)
+    * ``row_upto_gi[gi]`` 그 날 **이하**의 마지막 행 번호 (없으면 -1)
+    """
+    row_of = np.full(n_cal, -1, dtype=np.int32)
+    if n_cal and len(index):
+        vals = index.values.astype("datetime64[ns]")
+        pos = np.searchsorted(cal_ns, vals)
+        ok = pos < n_cal
+        ok[ok] &= cal_ns[pos[ok]] == vals[ok]
+        row_of[pos[ok]] = np.flatnonzero(ok).astype(np.int32)
+    filled = np.where(row_of >= 0, row_of, -1).astype(np.int32)
+    row_upto = np.maximum.accumulate(filled)
+    return {"row_of_gi": row_of, "row_upto_gi": row_upto}
+
+
 def _bar(rec: dict, li: int) -> Dict[str, float]:
     return {
         "open": float(rec["open"][li]),
@@ -1410,13 +1439,12 @@ def _next_day(rec: dict, li: int) -> dt.date:
     return idx[j].date()
 
 
-def _last_index_upto(rec: dict, day: dt.date) -> Optional[int]:
-    li = rec["pos"].get(day)
-    if li is not None:
-        return li
-    idx = rec["df"].index
-    pos = idx.searchsorted(pd.Timestamp(day), side="right") - 1
-    return int(pos) if pos >= 0 else None
+def _last_index_upto(rec: dict, gi: int) -> Optional[int]:
+    """달력 인덱스 ``gi`` 시점의 (없으면 그 이전 마지막) 행 번호."""
+    if gi < 0 or gi >= rec["row_upto_gi"].shape[0]:
+        return None
+    li = int(rec["row_upto_gi"][gi])
+    return li if li >= 0 else None
 
 
 def _ctx(rec: dict, w: dict, bar: Optional[dict] = None, day: Optional[dt.date] = None,
@@ -1580,14 +1608,14 @@ def _close(w: dict, rec: dict, code: str, rule: Mapping, price: float, qty: int,
     return trade, proceeds
 
 
-def _mtm(active: Mapping[str, dict], recs: Mapping[str, dict], day: dt.date) -> float:
+def _mtm(active: Mapping[str, dict], recs: Mapping[str, dict], gi: int) -> float:
     """보유 포지션 평가액."""
     total = 0.0
     for code, w in active.items():
         if w["qty"] <= 0:
             continue
         rec = recs[code]
-        li = _last_index_upto(rec, day)
+        li = _last_index_upto(rec, gi)
         if li is None:
             total += w["cost"]
         else:
