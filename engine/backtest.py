@@ -503,7 +503,7 @@ def _custom_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
     sub = panel[panel["Code"].isin(codes)]
     total = len(codes)
     rows = []
-    for j, (code, g) in enumerate(sub.groupby("Code", sort=False)):
+    for j, (code, g) in enumerate(sub.groupby("Code", sort=False, observed=True)):
         if (j & 7) == 0:
             rep.tick(18 + 7.0 * j / max(total, 1),
                      f"기준일 조건 확인 중 ({j:,}/{total:,} 종목)", PHASE_SCAN)
@@ -540,7 +540,7 @@ def _reference_events(panel: pd.DataFrame, universe: Mapping, start: dt.date,
             rep.emit(19, msg, PHASE_SCAN, force=True)
 
     beat("기준일 조건 계산 중 (종목별 그룹핑)")
-    g = panel.groupby("Code", sort=False)
+    g = panel.groupby("Code", sort=False, observed=True)
 
     if rule == "none":
         mask = pd.Series(True, index=panel.index)
@@ -901,7 +901,7 @@ def run_backtest(
     _n_cand = len(cand_codes)
     for _j, (code, gdf) in enumerate(_iter_candidate_bars(panel, cand_codes, rep, _n_cand)):
         gdf = gdf.sort_values("Date", kind="stable")
-        df = gdf.set_index("Date")[[c for c in _PRICE_COLS if c in gdf.columns]]
+        df = gdf.set_index("Date")[[c for c in _PRICE_COLS if c in gdf.columns]].copy()
         recs[code] = {
             "df": df,
             "name": str(gdf["Name"].iloc[-1]) if "Name" in gdf.columns else code,
@@ -1356,7 +1356,7 @@ def _iter_candidate_bars(panel: pd.DataFrame, cand_codes, rep, total: int):
         rep.check(force=True)
         part = narrow[mask]
         rep.check(force=True)
-        for code, gdf in part.groupby("Code", sort=False):
+        for code, gdf in part.groupby("Code", sort=False, observed=True):
             done += 1
             if (done & 15) == 0:
                 rep.tick(20 + 5.0 * done / max(total, 1),
