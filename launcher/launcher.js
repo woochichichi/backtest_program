@@ -463,6 +463,8 @@ function buildPaths(root) {
   P.fetchDart = root + "\\tools\\fetch_dart.py";
   P.dartParts = root + "\\dart\\.parts";
   P.rebuildMark = root + "\\dart\\.rebuild_marker";
+  P.preBat = P.work + "\\pre.bat";
+  P.preLog = P.work + "\\pre.log";
   P.pbBat = P.work + "\\probe.bat";
   P.pbLog = P.work + "\\probe.log";
   P.cfgFile = root + "\\launcher_config.json";
@@ -470,7 +472,7 @@ function buildPaths(root) {
 }
 
 /* ---------- 설정 파일 (없으면 기본값) ---------- */
-function defaultCfg() { return { port: DEF_PORT, prog: true, quote: true }; }
+function defaultCfg() { return { port: DEF_PORT, prog: true, quote: true, onRunning: "ask" }; }
 
 function loadConfig() {
   var c = defaultCfg();
@@ -486,6 +488,8 @@ function loadConfig() {
     }
     if (/"auto_update_program"\s*:\s*false/.test(String(t))) { c.prog = false; }
     if (/"auto_update_quote"\s*:\s*false/.test(String(t))) { c.quote = false; }
+    var mr = /"on_already_running"\s*:\s*"(ask|restart|browser)"/.exec(String(t));
+    if (mr) { c.onRunning = mr[1]; }
   }
   return c;
 }
@@ -494,7 +498,8 @@ function saveConfig() {
   var t = "{\r\n" +
     "  \"port\": " + S.cfg.port + ",\r\n" +
     "  \"auto_update_program\": " + (S.cfg.prog ? "true" : "false") + ",\r\n" +
-    "  \"auto_update_quote\": " + (S.cfg.quote ? "true" : "false") + "\r\n" +
+    "  \"auto_update_quote\": " + (S.cfg.quote ? "true" : "false") + ",\r\n" +
+    "  \"on_already_running\": \"" + (S.cfg.onRunning || "ask") + "\"\r\n" +
     "}\r\n";
   SYS.write(P.cfgFile, t, true);
 }
@@ -1576,8 +1581,79 @@ function stopServer() {
 }
 
 /* ============================================================
-   12. 이미 켜져 있을 때의 선택 화면
+   12. 이미 켜져 있을 때
+
+   여기서 "브라우저만 열기" 를 고르면 서버는 옛 코드로 계속 돈다.
+   즉 업데이트가 반영되지 않는다. 그래서 [다시 시작] 이 기본값이고,
+   물어보기 전에 새 버전이 있는지 먼저 확인해서 알려 준다.
    ============================================================ */
+
+/* 네트워크는 git ls-remote 하나만 쓴다. 나머지는 전부 로컬 파일 판정. */
+function preBat() {
+  var W = P.work;
+  return [
+    "@echo off",
+    "setlocal enabledelayedexpansion",
+    "set \"ROOT=" + P.root + "\"",
+    "set \"OUT=" + W + "\"",
+    "set \"GIT_TERMINAL_PROMPT=0\"",
+    "set \"GCM_INTERACTIVE=never\"",
+    "set \"R=unknown\"",
+    "set \"OLD=\"",
+    "set \"REMOTE=\"",
+    "set \"BR=\"",
+    "where git >nul 2>&1",
+    "if !errorlevel! neq 0 goto :fin",
+    "if not exist \"!ROOT!\\.git\" goto :fin",
+    "for /f %%a in ('git -C \"!ROOT!\" rev-parse HEAD 2^>nul') do set \"OLD=%%a\"",
+    "for /f \"tokens=1\" %%a in ('git -C \"!ROOT!\" rev-parse --abbrev-ref HEAD 2^>nul') do set \"BR=%%a\"",
+    "if not defined BR goto :fin",
+    "if \"!BR!\"==\"HEAD\" goto :fin",
+    "for /f \"tokens=1\" %%a in ('git -C \"!ROOT!\" ls-remote origin \"refs/heads/!BR!\" 2^>nul') do set \"REMOTE=%%a\"",
+    "if not defined REMOTE goto :fin",
+    "if /i \"!REMOTE!\"==\"!OLD!\" (",
+    "    set \"R=fresh\"",
+    "    goto :fin",
+    ")",
+    "set \"R=behind\"",
+    ":fin",
+    "> \"!OUT!\\pre_r.txt\" echo.!R!",
+    "> \"!OUT!\\pre_old.txt\" echo.!OLD!",
+    "> \"!OUT!\\pre_new.txt\" echo.!REMOTE!",
+    "> \"!OUT!\\pre.done\" echo done",
+    "endlocal"
+  ];
+}
+
+function preCheck(cb) {
+  runBat(P.preBat, preBat(), P.work + "\\pre.done", P.preLog, 15000, null, function (how) {
+    if (how !== "ok") { cb({ r: "unknown" }); return; }
+    cb({
+      r: readOne("pre_r.txt") || "unknown",
+      old: readOne("pre_old.txt"),
+      neu: readOne("pre_new.txt")
+    });
+  });
+}
+
+/* 네트워크 없이 알 수 있는 것만 한 줄로 */
+function localSummaryLine() {
+  var out = [];
+  S.lastSync = readLastSync();
+  var q = decideQuotes();
+  out[out.length] = q.skip ? "시세는 최신" : "오늘 시세를 아직 받지 않았습니다";
+  var d = decideDart();
+  if (d.skip && d.why === "nokey") { out[out.length] = "재무는 사용 안 함"; }
+  else if (d.ask) { out[out.length] = "재무 데이터 없음"; }
+  else if (d.skip) { out[out.length] = "재무는 최신"; }
+  else { out[out.length] = "받을 재무 분기가 있습니다"; }
+  return out.join(" · ");
+}
+
+function setRunHot(hot) {
+  var b = el("runRestart");
+  if (b) { b.className = hot ? "pri hot" : "pri"; }
+}
 
 function showToggle(body) {
   clearTimers();
@@ -1588,14 +1664,122 @@ function showToggle(body) {
   setProg(100);
   setHead("이미 실행 중입니다");
   setNote("");
-  var m = el("runMsg");
-  var extra = "";
-  var d = pickTradeDate(body);
-  if (d) { extra = "<br>가지고 있는 시세: " + mono(d) + " 까지"; }
-  if (m) {
-    m.innerHTML = "KRX 백테스터가 이미 켜져 있습니다." + extra + "<br>무엇을 할까요?";
+  S.apiLatestTradeDate = pickTradeDate(body) || S.apiLatestTradeDate;
+
+  /* 설정으로 "묻지 않기" 를 골라 뒀으면 바로 실행한다 */
+  var mode = (S.cfg && S.cfg.onRunning) ? S.cfg.onRunning : "ask";
+  if (mode === "restart") { doRestart(false); return; }
+  if (mode === "browser") {
+    SYS.open(baseUrl());
+    S.openedBrowser = true;
+    later(function () { SYS.quit(); }, 500);
+    return;
   }
+
+  var d = pickTradeDate(body);
+  el("runPort").innerHTML = mono(S.port) + "번 포트에서 돌고 있습니다"
+    + (d ? (" · 시세 " + mono(d) + " 까지") : "");
+  el("runLocal").innerHTML = esc(localSummaryLine());
+  el("runVer").innerHTML = "새 버전이 있는지 확인하는 중입니다…";
+  el("runVer").className = "vchk";
+  el("runAlways").checked = false;
+  setRunHot(false);
   showOv("ovRun");
+  bindEnter(true);
+
+  /* 화면은 이미 떠 있고, 확인 결과만 나중에 채운다. 기다리게 하지 않는다. */
+  preCheck(function (r) {
+    var v = el("runVer");
+    if (!v) { return; }
+    if (r.r === "behind") {
+      v.className = "vchk vbehind";
+      v.innerHTML = "새 버전이 있습니다 (" + mono((r.old || "").substring(0, 7)) +
+        " → " + mono((r.neu || "").substring(0, 7)) + ")<br>" +
+        "지금 실행 중인 프로그램에는 <b>아직 반영되지 않았습니다</b>.";
+      setRunHot(true);
+    } else if (r.r === "fresh") {
+      v.className = "vchk vfresh";
+      v.innerHTML = "프로그램은 <b>최신 버전</b>입니다. 브라우저만 열어도 됩니다.";
+    } else {
+      /* 모르는 것과 최신인 것은 다르다. 최신이라고 말하지 않는다. */
+      v.className = "vchk vunknown";
+      v.innerHTML = "새 버전이 있는지 <b>확인하지 못했습니다</b>.<br>" +
+        "확실히 하려면 [다시 시작]을 고르세요.";
+    }
+  });
+}
+
+/* Enter = 다시 시작 */
+function bindEnter(on) {
+  document.onkeydown = on ? function (e) {
+    e = e || window.event;
+    if (!e) { return; }
+    if (e.keyCode === 13) {
+      var ov = el("ovRun");
+      if (ov && ov.className.indexOf(" on") >= 0) {
+        doRestart(el("runAlways") && el("runAlways").checked);
+        return false;
+      }
+    }
+    if (e.keyCode === 27) { SYS.quit(); return false; }
+  } : null;
+}
+
+/* 서버를 끄고 1단계부터 통째로 다시 돌린다 */
+function doRestart(always) {
+  bindEnter(false);
+  if (always) {
+    if (!S.cfg) { S.cfg = defaultCfg(); }
+    S.cfg.onRunning = "restart";
+    saveConfig();
+  }
+  hideOv("ovRun");
+  clearTimers();
+  S.cancelled = false;
+  S.finished = false;
+  resetSteps();
+  var btn = el("btnCancel");
+  btn.innerHTML = "취소";
+  btn.className = "";
+
+  setHead("기존 프로그램을 종료하는 중입니다");
+  setNote("잠시 걸릴 수 있습니다");
+  setLogs(["기존 서버를 종료합니다", "", ""]);
+  setProg(4);
+
+  stopServer();
+  var t0 = (new Date()).getTime();
+  var LIMIT = 10000;
+
+  function waitDown() {
+    if (S.cancelled) { return; }
+    SYS.ping(function (ok) {
+      if (S.cancelled) { return; }
+      var ms = (new Date()).getTime() - t0;
+      if (!ok) { afterDown("종료했습니다"); return; }
+      if (ms > LIMIT) {
+        /* 백테스트 중이면 늦게 죽는다. 10초까지 기다렸으면 강제로 정리한다. */
+        setNote("응답이 없어 강제로 종료합니다");
+        setLogs(["기존 서버를 종료합니다", "10초를 기다렸습니다", "강제 종료합니다"]);
+        stopServer();
+        later(function () { afterDown("강제로 종료했습니다"); }, 1200);
+        return;
+      }
+      setNote("종료를 기다리고 있습니다 (" + Math.round(ms / 1000) + "초)");
+      setProg(4 + Math.round(10 * (ms / LIMIT)));
+      later(waitDown, 600);
+    });
+  }
+  later(waitDown, 400);
+
+  function afterDown(msg) {
+    if (S.cancelled) { return; }
+    setLogs([msg, "처음부터 다시 시작합니다", ""]);
+    setNote("");
+    setProg(0);
+    resetSteps();
+    later(step1, 250);
+  }
 }
 
 /* ============================================================
@@ -1644,6 +1828,7 @@ function wire() {
     el("cfgPort").value = String(S.cfg ? S.cfg.port : DEF_PORT);
     el("cfgProg").checked = !(S.cfg && !S.cfg.prog);
     el("cfgQuote").checked = !(S.cfg && !S.cfg.quote);
+    el("cfgRun").value = (S.cfg && S.cfg.onRunning) ? S.cfg.onRunning : "ask";
     el("cfgErr").innerHTML = "";
     showOv("ovCfg");
     return false;
@@ -1659,6 +1844,7 @@ function wire() {
     S.cfg.port = v;
     S.cfg.prog = !!el("cfgProg").checked;
     S.cfg.quote = !!el("cfgQuote").checked;
+    S.cfg.onRunning = el("cfgRun").value || "ask";
     saveConfig();
     S.port = v;
     restartFlow(false, "설정을 저장했습니다");
@@ -1722,19 +1908,26 @@ function wire() {
     finishStep(2, "skip", "나중에 받기로 했습니다 (재무 조건 없이 실행)", step4);
     return false;
   };
+  el("runRestart").onclick = function () {
+    doRestart(el("runAlways") && el("runAlways").checked);
+    return false;
+  };
   el("runOpen").onclick = function () {
+    bindEnter(false);
     SYS.open(baseUrl());
+    S.openedBrowser = true;
     SYS.quit();
     return false;
   };
   el("runStop").onclick = function () {
-    var m = el("runMsg");
-    if (m) { m.innerHTML = "프로그램을 종료했습니다."; }
+    bindEnter(false);
+    el("runVer").className = "vchk";
+    el("runVer").innerHTML = "프로그램을 종료했습니다.";
     stopServer();
-    setTimeout(function () { SYS.quit(); }, 900);
+    setTimeout(function () { SYS.quit(); }, 1000);
     return false;
   };
-  el("runClose").onclick = function () { SYS.quit(); return false; };
+  el("runClose").onclick = function () { bindEnter(false); SYS.quit(); return false; };
 }
 
 function fatal(msg) {

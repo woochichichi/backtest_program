@@ -133,21 +133,6 @@
   </div>
 </div>
 
-<div class="ov" id="ovRun">
-  <div class="ovin">
-    <div class="ovt">이미 실행 중입니다</div>
-    <div class="ovb" id="runMsg">
-      KRX 백테스터가 켜져 있습니다.<br>
-      무엇을 할까요?
-    </div>
-    <div class="ovf">
-      <button type="button" id="runClose">닫기</button>
-      <button type="button" class="dgr" id="runStop">프로그램 종료</button>
-      <button type="button" class="pri" id="runOpen">브라우저 다시 열기</button>
-    </div>
-  </div>
-</div>
-
 <div class="ov" id="ovDart">
   <div class="ovin">
     <div class="ovt">재무 데이터가 아직 없습니다</div>
@@ -159,6 +144,26 @@
     <div class="ovf">
       <button type="button" id="dartNo">나중에 하기</button>
       <button type="button" class="pri" id="dartYes">지금 받기</button>
+    </div>
+  </div>
+</div>
+
+<div class="ov" id="ovRun">
+  <div class="ovin">
+    <div class="ovt">이미 실행 중입니다</div>
+    <div class="ovb">
+      <div id="runPort"></div>
+      <div id="runVer" class="vchk">새 버전이 있는지 확인하는 중입니다…</div>
+      <div id="runLocal" class="vloc"></div>
+    </div>
+    <div class="ovchk">
+      <input type="checkbox" id="runAlways"><label for="runAlways">다음부터 묻지 않고 항상 다시 시작</label>
+    </div>
+    <div class="ovf">
+      <button type="button" id="runClose">닫기</button>
+      <button type="button" class="dgr" id="runStop">종료</button>
+      <button type="button" id="runOpen">브라우저만 열기</button>
+      <button type="button" class="pri" id="runRestart">다시 시작</button>
     </div>
   </div>
 </div>
@@ -189,6 +194,14 @@
       </div>
       <div class="row">
         <input type="checkbox" id="cfgQuote"><label for="cfgQuote">켤 때 시세 자동 갱신</label>
+      </div>
+      <div class="row">
+        <span class="lbl">이미 실행 중</span>
+        <select id="cfgRun">
+          <option value="ask">물어보기</option>
+          <option value="restart">항상 다시 시작</option>
+          <option value="browser">브라우저만 열기</option>
+        </select>
       </div>
       <div id="cfgErr"></div>
     </div>

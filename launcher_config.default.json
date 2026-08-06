@@ -1,5 +1,6 @@
 {
   "port": 8000,
   "auto_update_program": true,
-  "auto_update_quote": true
+  "auto_update_quote": true,
+  "on_already_running": "ask"
 }
