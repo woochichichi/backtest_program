@@ -473,7 +473,117 @@ def build_status() -> Dict[str, Any]:
             payload.setdefault(key, None)
     payload["auto_sync"] = query_auto_sync()
     payload["features"] = build_features()
+    payload["app_version"] = get_app_version()
     return payload
+
+
+# ------------------------------------------------------- 프로그램 버전 표시
+_APP_VERSION: Optional[Dict[str, Any]] = None
+_APP_VERSION_LOCK = threading.Lock()
+
+_UNKNOWN_VERSION: Dict[str, Any] = {
+    "commit": None,
+    "commit_date": None,
+    "branch": None,
+    "dirty": None,
+    "source": "unknown",
+}
+
+
+def _git_out(*args: str, timeout: int = 5) -> Optional[str]:
+    """git 명령 실행. 실패하면 None, 성공하면 (빈 문자열 포함) 출력을 돌려준다.
+
+    `git status --porcelain` 은 깨끗하면 빈 문자열이 정상이므로
+    '실패(None)' 와 '빈 출력("")' 을 반드시 구분해야 한다.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(ROOT),
+            capture_output=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return _decode(proc.stdout).strip()
+
+
+def _read_version_file() -> Optional[Dict[str, Any]]:
+    """`.git` 이 없는 배포(zip) 대비 폴백. 루트의 VERSION 파일을 읽는다."""
+    try:
+        raw = (ROOT / "VERSION").read_text(encoding="utf-8-sig").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            def _s(v: Any) -> Optional[str]:
+                text = str(v).strip() if v is not None else ""
+                return text or None
+
+            return {
+                "commit": _s(obj.get("commit")),
+                "commit_date": _s(obj.get("commit_date")),
+                "branch": _s(obj.get("branch")),
+                "dirty": obj.get("dirty") if isinstance(obj.get("dirty"), bool) else None,
+                "source": "file",
+            }
+
+    return {
+        "commit": raw.splitlines()[0].strip() or None,
+        "commit_date": None,
+        "branch": None,
+        "dirty": None,
+        "source": "file",
+    }
+
+
+def _build_app_version() -> Dict[str, Any]:
+    """git -> VERSION 파일 -> unknown 순서. 어떤 경우에도 예외를 던지지 않는다."""
+    # 부모 디렉터리의 저장소를 잘못 집지 않도록 ROOT 의 .git 을 먼저 확인한다.
+    if (ROOT / ".git").exists():
+        commit = _git_out("rev-parse", "--short", "HEAD")
+        if commit:
+            commit_date = _git_out("log", "-1", "--format=%cd", "--date=short") or None
+            branch = _git_out("rev-parse", "--abbrev-ref", "HEAD") or None
+            if branch == "HEAD":  # detached HEAD
+                branch = None
+            # 추적 중인 파일만 본다. cache/ logs/ dart/ 같은 런타임 생성물은 제외.
+            porcelain = _git_out("status", "--porcelain", "--untracked-files=no")
+            return {
+                "commit": commit,
+                "commit_date": commit_date,
+                "branch": branch,
+                "dirty": None if porcelain is None else bool(porcelain),
+                "source": "git",
+            }
+
+    return _read_version_file() or dict(_UNKNOWN_VERSION)
+
+
+def get_app_version() -> Dict[str, Any]:
+    """프로세스당 한 번만 계산하고 캐시한다.
+
+    `/api/status` 는 프런트가 자주 부르므로 매 요청마다 git 을 돌리면 안 된다.
+    런처가 git pull 후 서버를 재시작하므로 프로세스 수명 동안 고정이면 충분하다.
+    """
+    global _APP_VERSION
+    if _APP_VERSION is None:
+        with _APP_VERSION_LOCK:
+            if _APP_VERSION is None:
+                try:
+                    _APP_VERSION = _build_app_version()
+                except Exception:
+                    _APP_VERSION = dict(_UNKNOWN_VERSION)
+    return _APP_VERSION
 
 
 def build_features() -> Dict[str, bool]:
