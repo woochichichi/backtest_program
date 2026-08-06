@@ -620,7 +620,18 @@ export function renderDataStatus(st, note) {
     ok ? '' : 'update_marcap.bat 을 실행해 marcap 저장소를 내려받으세요');
   row('저장소', '<code>./marcap</code>', 'github.com/FinanceData/marcap');
   row('마지막 갱신', esc(st.last_sync || '—'), st.result ? `결과: ${esc(st.result)}` : '');
-  row('최신 거래일', esc(st.latest_trade_date || '—'), st.git_rev ? `git ${esc(st.git_rev)}` : '');
+  row('최신 거래일', esc(st.latest_trade_date || '—'), '');
+  // 아래 두 줄은 서로 다른 것이다. 라벨을 분명히 구분한다.
+  const av = st.app_version || {};
+  if (av.commit && av.source !== 'unknown') {
+    row('프로그램 버전',
+      `<code>${esc(String(av.commit).slice(0, 7))}</code>${av.dirty === true ? ' <span class="mk s">수정됨</span>' : ''}`,
+      [av.commit_date ? `커밋 ${esc(av.commit_date)}` : '', av.branch ? esc(av.branch) : '',
+        av.dirty === true ? '이 컴퓨터에서 수정된 파일이 있습니다'
+          : (av.dirty === null || av.dirty === undefined) ? '수정 여부 확인 불가' : ''].filter(Boolean).join(' · '));
+  }
+  row('시세 데이터 리비전', st.git_rev ? `<code>${esc(st.git_rev)}</code>` : '—',
+    'marcap 저장소의 git 리비전 (프로그램 버전과 다릅니다)');
   row('커버리지', `${esc(st.first_trade_date || '—')} ~ ${esc(st.latest_trade_date || '—')}`,
     `${st.file_count ?? '—'}개 연도 파일 · ${st.row_count ? fmt(st.row_count) + '행' : '—'}`);
   const auto = st.auto_sync || {};
@@ -1696,4 +1707,50 @@ export function bindResizers() {
     }
     rzSqueeze();
   });
+}
+
+/* ============================================================
+   21. 프로그램 버전 표시
+   ------------------------------------------------------------
+   서버가 app_version 을 주지 않거나 commit 을 모르면 아무것도 띄우지 않는다.
+   (`-` 나 `unknown` 같은 빈 자리를 남기지 않는다)
+   dirty === null 은 "모름" 이지 "깨끗함" 이 아니므로 구분해서 다룬다.
+   ============================================================ */
+export function renderAppVersion(v, onClick) {
+  const el = $('appVer');
+  if (!el) return;
+
+  const commit = (v && typeof v === 'object') ? v.commit : null;
+  if (!commit || v.source === 'unknown') {
+    el.hidden = true; el.textContent = ''; el.removeAttribute('title');
+    return;
+  }
+
+  const short = String(commit).slice(0, 7);
+  const dirty = v.dirty === true;
+  const dirtyUnknown = v.dirty === null || v.dirty === undefined;
+
+  el.hidden = false;
+  el.textContent = 'v' + short + (dirty ? '*' : '');
+  el.classList.toggle('dirty', dirty);
+
+  el.title = [
+    `프로그램 버전 ${short}`,
+    v.commit_date ? `커밋 날짜 ${v.commit_date}` : '',
+    v.branch ? `브랜치 ${v.branch}` : '',
+    dirty ? '이 컴퓨터에서 수정된 파일이 있습니다.'
+      : dirtyUnknown ? '수정 여부를 확인할 수 없습니다.'
+        : '수정된 파일 없음',
+    v.source === 'file' ? '출처: VERSION 파일' : '',
+    '',
+    '클릭하면 데이터 상태 탭이 열립니다.',
+  ].filter((s) => s !== '').join('\n');
+
+  el.setAttribute('aria-label',
+    `프로그램 버전 ${short}${dirty ? ', 이 컴퓨터에서 수정됨' : ''}. 데이터 상태 탭 열기`);
+
+  if (onClick && !el.dataset.wired) {
+    el.addEventListener('click', onClick);
+    el.dataset.wired = '1';
+  }
 }

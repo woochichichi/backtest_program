@@ -133,6 +133,11 @@ function applyStatus(st) {
     : `마지막으로 시세를 받은 시각: ${st.last_sync || '기록 없음'} (${f.label})`;
 
   P.renderDataStatus(st, api.isFallback() ? api.fallbackNote() : '');
+  // 프로그램 버전 (서버가 안 주면 renderAppVersion 이 통째로 숨긴다)
+  P.renderAppVersion(st.app_version, () => {
+    if (S.activateTab) S.activateTab('pnData');
+    $('dataBody')?.scrollIntoView({ block: 'nearest' });
+  });
 
   if (st.available === false) {
     P.banner('no-data', 'err',
@@ -1651,7 +1656,7 @@ function wire() {
   // 패널 크기가 바뀌면 캔버스도 다시 그린다 (ResizeObserver 가 잡지만 미니차트는 명시 호출)
   window.addEventListener('panelresize', () => { S.eq.schedule(); S.mo.schedule(); });
 
-  P.bindTabs((name) => {
+  S.activateTab = P.bindTabs((name) => {
     if (name === 'pnJson' && S.draft) P.renderJson(S.draft);
     if (name === 'pnData') P.renderDataStatus(S.status, api.isFallback() ? api.fallbackNote() : '');
     if (name === 'pnTrades') { S.eq.schedule(); S.mo.schedule(); }
