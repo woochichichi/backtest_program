@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import gc
 import json
+import logging
 import os
 import re
 import tempfile
@@ -95,6 +96,16 @@ SYMBOL_CACHE_MAX_BYTES = 200 * 1024 * 1024
 
 #: 이 개수 이하의 연도만 바뀌었으면 그 연도만 다시 읽어 캐시를 이어붙인다(증분 갱신).
 SYMBOL_CACHE_INCREMENTAL_MAX_YEARS = 3
+
+#: pyarrow 내부 스레드 사용 여부. **기본은 끈다(False).**
+#: 서버 워커 스레드가 동시에 parquet 을 읽을 때 arrow 스레드풀이 겹치면
+#: Windows 에서 arrow.dll 접근 위반으로 프로세스가 통째로 죽는 사례가 있었다.
+#: 속도(차트 첫 조회 1.2초 -> 3.1초)보다 크래시 회피를 우선한다.
+#: 환경이 안정적이라 속도를 되찾고 싶으면 ``KRX_ARROW_THREADS=1`` 로 켤 수 있다.
+ARROW_USE_THREADS = os.environ.get("KRX_ARROW_THREADS", "").strip() in ("1", "true", "True", "yes")
+
+#: 이 모듈의 진단 로그. 폴백이 조용히 도는 상황을 눈에 보이게 하려고 둔다.
+_log = logging.getLogger(__name__)
 
 
 def halted_mask(df: pd.DataFrame):
@@ -896,10 +907,17 @@ class MarcapStore:
             # 앞자리 0 을 떼고 저장한 옛 파일에서만 변형 목록을 쓴다.
             key = variants[0] if _is_zero_padded(pf) else list(variants)
             flt = [("Code", "==", key)] if isinstance(key, str) else [("Code", "in", key)]
-            # use_threads: arrow 내부 스레드. 서버 워커 스레드와 중첩되지만 arrow 스레드풀은
-            # 멀티스레드 호출을 지원한다. 끄면 차트 첫 조회가 1.2초 -> 3.1초로 느려진다.
-            # 크래시가 재발하면 여기를 False 로 바꾸는 게 다음 수단이다.
+            # use_threads: arrow 내부 스레드. 모듈 상단 ARROW_USE_THREADS 참고.
+            # 기본은 False(크래시 회피 우선), KRX_ARROW_THREADS=1 로 켤 수 있다.
             tb = pq.read_table(path, columns=use, filters=flt, use_threads=ARROW_USE_THREADS)
+        except (NameError, AttributeError, TypeError) as exc:
+            # 여기로 오면 데이터가 아니라 **이 코드가 잘못된 것**이다.
+            # 폴백(연도 파일 통째로 읽기)은 그대로 돌지만, 조용히 삼키면
+            # "왜 느리지?" 를 영영 못 찾으므로 반드시 남긴다.
+            _log.error("parquet 푸시다운 실패(코드 오류) — 연도 전체를 읽는 폴백으로 넘어갑니다: "
+                       "%s: %s (%s)", type(exc).__name__, exc, path)
+            df = pd.read_parquet(path, columns=list(cols) if cols else None)
+            return df[df["Code"].astype(str).isin(list(variants))]
         except Exception:  # pragma: no cover - 구버전 pyarrow / 이상한 파일은 통째로 읽는다
             df = pd.read_parquet(path, columns=list(cols) if cols else None)
             return df[df["Code"].astype(str).isin(list(variants))]

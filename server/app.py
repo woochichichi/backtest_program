@@ -32,7 +32,7 @@ import traceback
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException, RequestValidationError
@@ -1644,10 +1644,61 @@ def _col(df: Any, *names: str) -> Optional[str]:
     return None
 
 
-def _series(df: Any, name: Optional[str]) -> List[Any]:
+def _series(df: Any, name: Optional[str], halted: Optional[set] = None) -> List[Any]:
+    """컬럼 하나를 JSON 배열로. ``halted`` 위치는 값 대신 None 을 넣는다."""
     if name is None:
         return [None] * len(df)
-    return [sanitize(v) for v in df[name].tolist()]
+    out = [sanitize(v) for v in df[name].tolist()]
+    if halted:
+        for i in halted:
+            if 0 <= i < len(out):
+                out[i] = None
+    return out
+
+
+def _halted_positions(df: Any, cols: Sequence[Optional[str]]) -> set:
+    """OHLC 중 하나라도 0 이하인 행의 **위치 인덱스** 집합 = 거래정지일.
+
+    marcap 은 거래정지일 시/고/저를 0 으로 발표한다(종가만 기준가). 0 을 그대로
+    내보내면 캔들이 0 까지 늘어나므로, 여기서 미리 찾아 봉을 지운다.
+    """
+    import pandas as pd  # engine 이 있으면 반드시 존재한다
+
+    out: set = set()
+    price_cols = [c for c in cols[:4] if c is not None]
+    if not price_cols:
+        return out
+    for name in price_cols:
+        try:
+            values = pd.to_numeric(df[name], errors="coerce").to_numpy("float64")
+        except Exception:
+            continue
+        for i, v in enumerate(values):
+            if not (v > 0):      # 0, 음수, NaN 모두 거래정지로 본다
+                out.add(i)
+    return out
+
+
+def _df_without_halted(df: Any, halted: set, cols: Sequence[Optional[str]]) -> Any:
+    """거래정지일 값을 NaN 으로 바꾼 **사본**. 원본은 절대 건드리지 않는다.
+
+    0 을 그대로 두면 이동평균이 그날만 뚝 떨어져 지표 선이 망가진다.
+    """
+    if not halted:
+        return df
+    import pandas as pd  # engine 이 있으면 반드시 존재한다
+
+    out = df.copy()
+    for name in cols:
+        if name is None or name not in out.columns:
+            continue
+        try:
+            col = pd.to_numeric(out[name], errors="coerce").astype("float64")
+        except Exception:
+            continue
+        col.iloc[sorted(halted)] = float("nan")
+        out[name] = col
+    return out
 
 
 def _to_yyyymmdd(value: Any) -> Optional[int]:
@@ -1817,6 +1868,14 @@ def api_chart(
     v_col = _col(df, "Volume")
     a_col = _col(df, "Amount")
 
+    # ---- 거래정지일 처리 ----
+    # marcap 은 거래정지일 OHLC 를 0 으로 내려준다. 그대로 그리면 0 까지 늘어난
+    # 거대한 봉이 되고, 이동평균도 0 때문에 아래로 끌려간다.
+    # OHLC 중 하나라도 0 이하면 거래정지로 보고, 봉은 그리지 않는다(None).
+    halted_idx = _halted_positions(df, (o_col, h_col, l_col, c_col))
+    # 지표용 df 는 0 -> NaN 으로 바꾼 **사본**을 쓴다. 원본 df 는 건드리지 않는다.
+    ind_df = _df_without_halted(df, halted_idx, (o_col, h_col, l_col, c_col, v_col, a_col))
+
     name = ""
     name_col = _col(df, "Name")
     if name_col is not None:
@@ -1845,12 +1904,13 @@ def api_chart(
         "requested": {"start": start, "end": end},
         "truncated": False,
         "t": t,
-        "o": _series(df, o_col),
-        "h": _series(df, h_col),
-        "l": _series(df, l_col),
-        "c": _series(df, c_col),
-        "v": _series(df, v_col),
-        "amt": _series(df, a_col),
+        "o": _series(df, o_col, halted_idx),
+        "h": _series(df, h_col, halted_idx),
+        "l": _series(df, l_col, halted_idx),
+        "c": _series(df, c_col, halted_idx),
+        "v": _series(df, v_col, halted_idx),
+        "amt": _series(df, a_col, halted_idx),
+        "halted": [1 if i in halted_idx else 0 for i in range(n)],
         "indicators": {},
         "markers": [],
         "bands": [],
@@ -1861,6 +1921,8 @@ def api_chart(
 
     # ---- 실제 적용된 범위 vs 요청 범위 ----
     warnings: List[str] = []
+    if halted_idx:
+        warnings.append(f"거래정지 {len(halted_idx)}일은 봉을 그리지 않습니다.")
     req_start = _requested_date(start)
     req_end = _requested_date(end)
     truncated = False
@@ -1889,7 +1951,7 @@ def api_chart(
         for token, key, args in tokens:
             params = _indicator_params(key, args, REGISTRY)
             try:
-                values = compute(key, params, df)
+                values = compute(key, params, ind_df)
             except Exception as exc:
                 payload["indicators"][token] = [None] * n
                 payload.setdefault("warnings", []).append(
@@ -2078,6 +2140,16 @@ _PLACEHOLDER_HTML = """<!doctype html>
 """
 
 
+#: 정적 파일 응답에 항상 붙이는 캐시 금지 헤더.
+#: 이게 없으면 브라우저가 휴리스틱 캐싱을 해서, git pull 로 server/web/js/*.js 를
+#: 갱신해도 사용자 화면에는 옛 스크립트가 그대로 남는다. 로컬에서 돌리는 도구라
+#: 캐시로 아낄 게 없으니 매번 새로 받게 한다.
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+
 def _serve_static(rel_path: str) -> Response:
     rel_path = (rel_path or "").strip().lstrip("/")
     if not rel_path or rel_path.endswith("/"):
@@ -2085,7 +2157,8 @@ def _serve_static(rel_path: str) -> Response:
 
     if not WEB_DIR.is_dir():
         if rel_path == "index.html":
-            return Response(content=_PLACEHOLDER_HTML, media_type="text/html; charset=utf-8")
+            return Response(content=_PLACEHOLDER_HTML, media_type="text/html; charset=utf-8",
+                            headers=dict(_NO_CACHE_HEADERS))
         return error_response(
             404,
             "정적 파일 폴더(server/web)가 아직 없습니다.",
@@ -2100,14 +2173,16 @@ def _serve_static(rel_path: str) -> Response:
 
     if not target.is_file():
         if rel_path == "index.html":
-            return Response(content=_PLACEHOLDER_HTML, media_type="text/html; charset=utf-8")
+            return Response(content=_PLACEHOLDER_HTML, media_type="text/html; charset=utf-8",
+                            headers=dict(_NO_CACHE_HEADERS))
         return error_response(404, "파일을 찾을 수 없습니다.", f"요청 경로: /{rel_path}")
 
     media, _ = mimetypes.guess_type(str(target))
     media = media or "application/octet-stream"
     if media.startswith("text/") or media in ("application/javascript", "application/json"):
         media = f"{media}; charset=utf-8"
-    return Response(content=target.read_bytes(), media_type=media)
+    return Response(content=target.read_bytes(), media_type=media,
+                    headers=dict(_NO_CACHE_HEADERS))
 
 
 @app.get("/", include_in_schema=False)

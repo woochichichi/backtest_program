@@ -245,10 +245,14 @@ export class CandleChart {
     const o = toF64(p.o, n), h = toF64(p.h, n), l = toF64(p.l, n), c = toF64(p.c, n);
     const v = toF64(p.v, n), amt = toF64(p.amt, n);
 
-    // 거래대금 급증 봉 표시용 (1,000억 이상) — 색만이 아니라 툴팁에도 쓴다
+    // 봉 플래그. 1=상승, 2=거래대금 급증(1,000억 이상), 4=거래정지
+    // 거래정지일은 서버가 o/h/l/c 를 null 로 내려주므로 여기서 NaN 이 된다.
+    // 그런 봉은 색도 크기도 정할 수 없으니 아예 그리지 않고 빈 칸으로 남긴다.
     const flag = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
-      if (c[i] >= o[i]) flag[i] |= 1;
+      const O = o[i], H = h[i], L = l[i], Cc = c[i];
+      if (!(O === O && H === H && L === L && Cc === Cc)) { flag[i] |= 4; continue; }
+      if (Cc >= O) flag[i] |= 1;
       if (amt[i] >= 1e11) flag[i] |= 2;
     }
 
@@ -491,13 +495,15 @@ export class CandleChart {
       cX[b] = PL + (b + 0.5) * cw;
     }
 
-    let lastB = -1;
     let pMin = Infinity, pMax = -Infinity, aMax = 0;
     const scale = cols / nVis;
     for (let i = i0; i < i1; i++) {
       let b = ((i - i0) * scale) | 0;
       if (b >= cols) b = cols - 1;
-      if (b !== lastB) { cO[b] = o[i]; lastB = b; }      // first
+      // 거래정지 봉은 집계에 넣지 않는다. 넣으면 NaN 이 섞여 컬럼 하나가 통째로 깨진다.
+      if (flag[i] & 4) continue;
+      // 컬럼 플래그 8 = "이 컬럼에 그릴 봉이 하나라도 있다"
+      if ((cFlag[b] & 8) === 0) { cO[b] = o[i]; cFlag[b] |= 8; }   // first (유효 봉 기준)
       cC[b] = c[i];                                       // last
       const H = hi[i], L = lo[i];
       if (H > cH[b]) cH[b] = H;
@@ -505,13 +511,18 @@ export class CandleChart {
       if (H > pMax) pMax = H;
       if (L < pMin) pMin = L;
       const A = amt[i];
-      if (A > cAmt[b]) cAmt[b] = A;
-      if (A > aMax) aMax = A;
+      if (A === A) {                                      // NaN 거래대금은 건너뛴다
+        if (A > cAmt[b]) cAmt[b] = A;
+        if (A > aMax) aMax = A;
+      }
       cFlag[b] |= (flag[i] & 2);                          // 급증 표시는 OR
       cIdx[b] = i;                                        // 대표 인덱스 (마지막 봉)
     }
-    // 상승/하락은 집계된 open/close 로 다시 판정
-    for (let b = 0; b < cols; b++) if (cC[b] >= cO[b]) cFlag[b] |= 1;
+    // 상승/하락은 집계된 open/close 로 다시 판정 (그릴 봉이 있는 컬럼만)
+    for (let b = 0; b < cols; b++) {
+      if ((cFlag[b] & 8) === 0) continue;
+      if (cC[b] >= cO[b]) cFlag[b] |= 1;
+    }
 
     this._cols = cols;
     return { cols, cw, pMin, pMax, aMax };
@@ -562,6 +573,9 @@ export class CandleChart {
         if (p > pMax) pMax = p;
       }
     }
+    // 가시 구간이 전부 거래정지면 pMin/pMax 가 Infinity 로 남는다. 그대로 두면
+    // 스케일이 NaN 이 되어 화면이 통째로 사라지므로 여기서 안전한 값으로 되돌린다.
+    if (!Number.isFinite(pMin) || !Number.isFinite(pMax)) { pMin = 0; pMax = 1; }
     if (!(pMax > pMin)) { pMax = pMin + 1; }
     const padP = (pMax - pMin) * 0.06;
     pMin -= padP; pMax += padP;
@@ -650,6 +664,7 @@ export class CandleChart {
       let any = false;
       for (let b = 0; b < cols; b++) {
         const f = flag[b];
+        if ((f & 8) === 0) continue;          // 거래정지만 있는 컬럼은 비워 둔다
         const isHi = (f & 2) !== 0;
         const isUp = (f & 1) !== 0;
         const which = isHi ? 2 : (isUp ? 1 : 0);
@@ -696,6 +711,7 @@ export class CandleChart {
         ctx.beginPath();
         let any = false;
         for (let b = 0; b < cols; b++) {
+          if ((F[b] & 8) === 0) continue;     // 거래정지만 있는 컬럼은 빈 칸
           if (((F[b] & 1) !== 0) !== !!up) continue;
           const x = Math.round(cx[b]);
           const y0 = Math.round(Y(H[b])), y1 = Math.round(Y(L[b]));
@@ -715,6 +731,7 @@ export class CandleChart {
       ctx.beginPath();
       let any = false;
       for (let b = 0; b < cols; b++) {
+        if ((F[b] & 8) === 0) continue;       // 거래정지만 있는 컬럼은 빈 칸
         if (((F[b] & 1) !== 0) !== !!up) continue;
         const x = Math.round(cx[b]) + 0.5;
         ctx.moveTo(x, Y(H[b])); ctx.lineTo(x, Y(L[b]));
@@ -730,6 +747,7 @@ export class CandleChart {
       ctx.beginPath();
       let any = false;
       for (let b = 0; b < cols; b++) {
+        if ((F[b] & 8) === 0) continue;       // 거래정지만 있는 컬럼은 빈 칸
         if (((F[b] & 1) !== 0) !== !!up) continue;
         const yo = Y(O[b]), yc = Y(Cl[b]);
         const top = Math.min(yo, yc);
@@ -1117,13 +1135,18 @@ export class CandleChart {
     for (let k = 0; k < M.n; k++) {
       if (M.i[k] === i) { marker = { type: ['ref', 'buy', 'sell', 'other'][M.type[k]], label: M.label[k], note: M.note[k], price: M.price[k] }; break; }
     }
+    const halted = (d.flag[i] & 4) !== 0;
+    // 거래정지일 직전 종가를 찾는다. 바로 앞도 정지면 등락률은 계산하지 않는다.
     const prevC = i > 0 ? d.c[i - 1] : d.c[i];
+    const chgPct = (!halted && Number.isFinite(prevC) && prevC)
+      ? (d.c[i] / prevC - 1) * 100 : 0;
     return {
       i, changed, px, py,
       date: ymd(d.t[i]),
+      halted,
       o: d.o[i], h: d.h[i], l: d.l[i], c: d.c[i], v: d.v[i], amt: d.amt[i],
-      chgPct: prevC ? (d.c[i] / prevC - 1) * 100 : 0,
-      spike: (d.flag[i] & 2) !== 0,
+      chgPct,
+      spike: !halted && (d.flag[i] & 2) !== 0,
       up: (d.flag[i] & 1) !== 0,
       indicators: ind,
       indicatorValues,

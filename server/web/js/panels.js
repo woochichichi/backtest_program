@@ -804,7 +804,9 @@ export function renderLegend(info, meta, slotColor, symbol) {
       : '';
     return;
   }
-  const head = `<div class="row">
+  const head = info.halted
+    ? `<div class="row"><span class="k">거래정지</span></div>`
+    : `<div class="row">
       <span class="k">O</span><span>${fmt(info.o)}</span>
       <span class="k">H</span><span>${fmt(info.h)}</span>
       <span class="k">L</span><span>${fmt(info.l)}</span>
@@ -836,6 +838,19 @@ export function renderLegend(info, meta, slotColor, symbol) {
 export function renderTooltip(info, hostRect) {
   const tt = $('tt');
   if (!info) { tt.style.display = 'none'; return; }
+  // 거래정지일은 봉 자체가 없다(서버가 OHLC 를 null 로 내린다). 숫자 자리를 억지로
+  // 채우지 말고 "거래정지" 한 줄만 보여준다.
+  if (info.halted) {
+    tt.innerHTML =
+      `<div class="d">${esc(info.date)}</div>` +
+      `<div class="ev">거래정지</div>` +
+      (info.marker ? `<div class="ev">${esc(info.marker.label)} · ${esc(info.marker.note)}</div>` : '');
+    tt.style.display = 'block';
+    const hw = tt.offsetWidth, hh = tt.offsetHeight;
+    tt.style.left = Math.max(4, Math.min(info.px + 14, hostRect.width - hw - 8)) + 'px';
+    tt.style.top = Math.max(4, Math.min(info.py + 14, hostRect.height - hh - 8)) + 'px';
+    return;
+  }
   const eokv = Number.isFinite(info.amt) ? (info.amt / 1e8) : NaN;
   const amtTx = Number.isFinite(eokv) ? (eokv >= 10 ? fmt(eokv) + '억' : eokv.toFixed(1) + '억') : '—';
   tt.innerHTML =

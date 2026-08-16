@@ -171,6 +171,7 @@ result = run_backtest(strategy: dict, store: MarcapStore, progress: callable | N
   "code": "042700", "name": "한미반도체", "n": 132,
   "t": [20260112, 20260113],
   "o": [], "h": [], "l": [], "c": [], "v": [], "amt": [],
+  "halted": [0, 1],
   "indicators": {"SMA:20": [null, "..."], "SMA:45": [null, "..."]},
   "markers": [{"i": 60, "type": "ref", "price": 45439, "label": "기준일", "note": "..."},
               {"i": 74, "type": "buy", "price": 45439, "label": "B1", "note": "..."}],
@@ -179,6 +180,12 @@ result = run_backtest(strategy: dict, store: MarcapStore, progress: callable | N
 }
 ```
 `t`는 `YYYYMMDD` 정수. 모든 배열 길이는 `n`으로 동일. 결측은 `null`.
+
+`halted`는 거래정지일 표시(0/1). marcap은 거래정지일 OHLC를 `0`으로 발표하는데, 그대로 그리면
+캔들이 0까지 늘어난다. 그래서 **OHLC 중 하나라도 0 이하인 날은 거래정지로 보고**
+`o/h/l/c/v/amt`를 `null`로 내리고 `halted[i] = 1`로 표시한다. 프런트는 그 자리를 빈 칸으로 남기고
+툴팁에 "거래정지"라고 쓴다. 지표도 0이 아닌 NaN 기준으로 계산한다(이동평균 왜곡 방지).
+거래정지일이 있으면 `warnings`에 한 줄이 추가된다.
 
 ### 4-7. `POST /api/ai/strategy`
 요청 `{"prompt": "자연어 조건", "base": <선택, 기존 DSL>}`
