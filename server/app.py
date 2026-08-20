@@ -1680,24 +1680,41 @@ def _halted_positions(df: Any, cols: Sequence[Optional[str]]) -> set:
 
 
 def _df_without_halted(df: Any, halted: set, cols: Sequence[Optional[str]]) -> Any:
-    """거래정지일 값을 NaN 으로 바꾼 **사본**. 원본은 절대 건드리지 않는다.
+    """거래정지일 **행을 통째로 뺀** 사본. 원본은 절대 건드리지 않는다.
 
-    0 을 그대로 두면 이동평균이 그날만 뚝 떨어져 지표 선이 망가진다.
+    거래정지일 OHLC 0 을 그대로 두면 이동평균이 그날만 뚝 떨어진다. 그렇다고
+    값만 NaN 으로 바꾸면 이번엔 ``rolling(n, min_periods=n)`` 이 그 NaN 을
+    창 밖으로 밀어낼 때까지 **뒤로 n 개**를 통째로 NaN 으로 만들어, 이동평균선이
+    거래정지 직후부터 n 봉 동안 끊겨 보인다(정지 5일 -> 60일선이 64봉 사라짐).
+
+    그래서 값을 지우는 대신 **행 자체를 빼고** 계산한다. 20일선은 "거래된 20일"의
+    평균이 되고(거래정지일은 애초에 시세가 없으니 평균에 낄 값도 없다),
+    NaN 오염이 없으므로 선이 끊기지 않는다. 빠진 자리는
+    ``_expand_to_full`` 이 원래 위치로 되돌려 놓는다.
     """
     if not halted:
         return df
-    import pandas as pd  # engine 이 있으면 반드시 존재한다
+    keep = [i for i in range(len(df)) if i not in halted]
+    return df.iloc[keep]
 
-    out = df.copy()
-    for name in cols:
-        if name is None or name not in out.columns:
-            continue
-        try:
-            col = pd.to_numeric(out[name], errors="coerce").astype("float64")
-        except Exception:
-            continue
-        col.iloc[sorted(halted)] = float("nan")
-        out[name] = col
+
+def _expand_to_full(values: Any, halted: set, total: int) -> Any:
+    """거래정지 행을 빼고 계산한 결과를 원래 길이(``total``)로 되돌린다.
+
+    거래정지일 자리에는 NaN 을 넣는다(그날은 봉 자체를 그리지 않으므로
+    지표 점도 찍히지 않는 게 맞다). 선은 그 자리를 건너뛰고 이어진다.
+    """
+    import numpy as np
+
+    arr = np.asarray(values, dtype="float64").ravel()
+    if not halted:
+        return arr
+    out = np.full(total, np.nan, dtype="float64")
+    keep = [i for i in range(total) if i not in halted]
+    m = min(len(keep), arr.shape[0])
+    if m:
+        # 길이가 어긋나면 뒤쪽(최신)을 기준으로 맞춘다 — _fit 과 같은 규칙.
+        out[np.asarray(keep[-m:], dtype="int64")] = arr[-m:]
     return out
 
 
@@ -1777,6 +1794,61 @@ def _indicator_params(key: str, args: List[str], registry: Any) -> Dict[str, Any
     return params
 
 
+#: 지표 워밍업으로 끌어올 수 있는 최대 봉 수. 이상한 period(예: SMA:99999)가
+#: 들어와도 조회량이 폭발하지 않도록 상한을 둔다.
+INDICATOR_WARMUP_MAX_BARS = 400
+
+#: 워밍업 봉 수 -> 달력 날짜로 환산할 때 쓰는 배수.
+#: 주말/공휴일 때문에 거래일 N개를 확보하려면 달력으로 그보다 넉넉히 잡아야 한다.
+_WARMUP_CALENDAR_FACTOR = 1.9
+
+
+def _indicator_warmup_bars(tokens: Sequence[Tuple[str, str, List[str]]], registry: Any) -> int:
+    """지표들이 첫 값을 내려면 앞에 몇 개의 봉이 더 필요한가.
+
+    ``rolling(n, min_periods=n)`` 계열은 앞의 ``n-1`` 개를 NaN 으로 버린다.
+    화면 구간만 읽어서 계산하면 그 NaN 이 **구간 맨 앞**에 남는데,
+    프런트가 과거 청크를 이어 붙이면(prependData) 그 자리가 **선 한가운데**가 되어
+    이동평균선이 끊겨 보인다. 그래서 요청 구간보다 앞을 더 읽어서 계산하고,
+    응답에서는 ``_fit`` 이 뒤에서 n 개만 잘라 내보낸다.
+    """
+    need = 0
+    for _token, key, args in tokens:
+        try:
+            params = _indicator_params(key, args, registry)
+        except Exception:
+            continue
+        for value in params.values():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                v = int(value)
+            except Exception:
+                continue
+            # period/span/stddev 등 어떤 이름이든 "가장 큰 정수 파라미터" 를 창 길이로 본다.
+            # MACD 처럼 여러 창을 합치는 지표가 있어 합산이 아니라 최댓값 + 여유로 잡는다.
+            if 1 < v <= INDICATOR_WARMUP_MAX_BARS and v > need:
+                need = v
+    if need <= 0:
+        return 0
+    # MACD(fast/slow + signal) 처럼 창이 겹치는 지표를 감안해 2배로 넉넉히 잡는다.
+    return min(need * 2, INDICATOR_WARMUP_MAX_BARS)
+
+
+def _warmup_start(start: Optional[str], bars: int) -> Optional[str]:
+    """``start`` 보다 거래일 ``bars`` 개만큼 앞선 날짜(달력 기준 근사).
+
+    ``start`` 가 없으면(=제한 없음) 이미 전체 히스토리를 읽으므로 그대로 둔다.
+    """
+    if not start or bars <= 0:
+        return start
+    base = _requested_date(start)
+    if base is None:
+        return start
+    days = int(bars * _WARMUP_CALENDAR_FACTOR) + 7
+    return (base - _dt.timedelta(days=days)).isoformat()
+
+
 def _requested_date(value: Optional[str]) -> Optional[_dt.date]:
     """쿼리로 들어온 날짜 문자열을 date 로. 'auto'/빈값/파싱 실패는 None."""
     text = (value or "").strip()
@@ -1835,8 +1907,21 @@ def api_chart(
     store = get_store()
     store_start = _store_range_arg(start, "start")
     store_end = _store_range_arg(end, "end")
+
+    # 지표 워밍업: 요청 구간보다 앞을 더 읽어야 이동평균이 구간 첫날부터 값을 갖는다.
+    # (안 그러면 과거 청크를 이어 붙일 때 이음매마다 선이 period 만큼 끊긴다)
+    ind_tokens = _parse_indicator_tokens(indicators or "")
+    warmup_bars = 0
+    if ind_tokens and store_start:
+        try:
+            _compute_probe, _registry_probe = _engine("engine.indicators", "compute", "REGISTRY")
+            warmup_bars = _indicator_warmup_bars(ind_tokens, _registry_probe)
+        except Exception:
+            warmup_bars = 0
+    fetch_start = _warmup_start(store_start, warmup_bars) if warmup_bars else store_start
+
     try:
-        df = store.bars(code, start=store_start, end=store_end)
+        df = store.bars(code, start=fetch_start, end=store_end)
     except ApiError:
         raise
     except Exception as exc:
@@ -1850,6 +1935,26 @@ def api_chart(
             f"'{code}' 종목의 봉 데이터가 없습니다.",
             "종목코드와 기간을 확인하세요.",
         )
+
+    # 워밍업으로 앞을 더 읽었다면, **지표 계산에만** 전체 프레임을 쓰고
+    # 화면에 내보내는 df 는 요청 구간으로 되돌린다.
+    # (t/o/h/l/c/markers 등 모든 출력 배열의 기준은 어디까지나 요청 구간이다)
+    full_df = df
+    if warmup_bars and store_start:
+        try:
+            import pandas as _pd
+
+            _cut = _requested_date(store_start)
+            _dcol = _col(df, "Date")
+            _dates = _pd.to_datetime(df[_dcol] if _dcol is not None else df.index)
+            _kept = df[_dates >= _pd.Timestamp(_cut)]
+            if _cut is not None and len(_kept) > 0:
+                df = _kept
+            else:
+                full_df = df
+        except Exception:
+            # 자르기에 실패하면 워밍업 없이 예전처럼 동작한다(안전한 쪽).
+            full_df = df
 
     n = int(len(df))
 
@@ -1874,7 +1979,16 @@ def api_chart(
     # OHLC 중 하나라도 0 이하면 거래정지로 보고, 봉은 그리지 않는다(None).
     halted_idx = _halted_positions(df, (o_col, h_col, l_col, c_col))
     # 지표용 df 는 0 -> NaN 으로 바꾼 **사본**을 쓴다. 원본 df 는 건드리지 않는다.
-    ind_df = _df_without_halted(df, halted_idx, (o_col, h_col, l_col, c_col, v_col, a_col))
+    # 워밍업 구간(요청 시작일 이전)까지 포함한 full_df 로 계산해야 이동평균이
+    # 구간 첫날부터 값을 갖는다. 거래정지 마스킹은 여기서도 똑같이 적용한다.
+    full_n = int(len(full_df))
+    full_halted_idx = (
+        halted_idx if full_df is df
+        else _halted_positions(full_df, (o_col, h_col, l_col, c_col))
+    )
+    ind_df = _df_without_halted(
+        full_df, full_halted_idx, (o_col, h_col, l_col, c_col, v_col, a_col)
+    )
 
     name = ""
     name_col = _col(df, "Name")
@@ -1958,11 +2072,16 @@ def api_chart(
                     f"{token} 지표 계산 실패: {type(exc).__name__}: {exc}"
                 )
                 continue
+            # 거래정지 행을 빼고 계산했으므로, 원래 자리로 되돌린 뒤 길이를 맞춘다.
             if isinstance(values, dict):
                 for field, arr in values.items():
-                    payload["indicators"][f"{token}.{field}"] = _fit(arr, n)
+                    payload["indicators"][f"{token}.{field}"] = _fit(
+                        _expand_to_full(arr, full_halted_idx, full_n), n
+                    )
             else:
-                payload["indicators"][token] = _fit(values, n)
+                payload["indicators"][token] = _fit(
+                    _expand_to_full(values, full_halted_idx, full_n), n
+                )
 
     # ---- run_id 기반 마커/보유구간/기준선 ----
     if run_id:

@@ -21,6 +21,10 @@ const PANE_GAP = 12;
 const MIN_BARS = 15;          // 최대 확대 시 남는 봉 수
 const OSC_PANE_H = 56;        // 오실레이터 패널 1개 높이
 const MAX_OSC_PANES = 2;
+//: 이동평균선에서 이어 그릴 최대 결측 봉 수.
+//: 거래정지는 길어야 며칠이라 이 정도면 선이 끊기지 않고,
+//: 그보다 긴 공백(워밍업 부족 등)은 억지로 잇지 않는다.
+const MA_BRIDGE_MAX_GAP = 10;
 
 const MK_REF = 0, MK_BUY = 1, MK_SELL = 2, MK_OTHER = 3;
 const MK_TYPE = { ref: MK_REF, buy: MK_BUY, sell: MK_SELL };
@@ -773,12 +777,18 @@ export class CandleChart {
       const a = ind.arr;
       ctx.strokeStyle = C.maSlots[ind.slot % C.maSlots.length];
       ctx.beginPath();
-      let started = false, drew = false;
+      let started = false, drew = false, gap = 0;
       for (let i = this.i0; i < this.i1; i += stride) {
         const v = a[i];
-        if (v !== v) { started = false; continue; }
+        if (v !== v) { gap++; continue; }
         const x = X(i), y = Y(v);
+        // 거래정지처럼 **짧은** 결측 구간은 건너뛰고 선을 이어 준다.
+        // 그 며칠은 시세 자체가 없을 뿐 이동평균이 실제로 끊긴 게 아니다.
+        // 반대로 긴 결측(지표 워밍업 부족 등)은 이어 버리면 없는 추세를
+        // 지어내는 셈이라, 그대로 끊어 둔다.
+        if (started && gap > MA_BRIDGE_MAX_GAP) started = false;
         if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
+        gap = 0;
         drew = true;
       }
       if (drew) ctx.stroke();
