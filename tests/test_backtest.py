@@ -1677,7 +1677,11 @@ def test_position_kept_through_halt(dates, strategy1):
 
 
 def test_price_adjustment_split():
-    """액면분할 50:1 — 과거 가격이 1/50 로 소급 조정되고 거래량은 50배가 된다."""
+    """액면분할 50:1 — 과거 가격만 1/50 로 소급 조정된다. 거래량은 원본 그대로다.
+
+    KRX 원본 거래량은 분할 전후 모두 실제 체결 주식 수라 조정하면 안 된다
+    (네이버 금융도 조정하지 않는다).
+    """
     from engine.data import apply_price_adjustment
 
     df = pd.DataFrame({
@@ -1695,7 +1699,8 @@ def test_price_adjustment_split():
     assert df.loc[1, "Close"] == pytest.approx(53000.0)     # 2,650,000 / 50
     assert df.loc[0, "Close"] == pytest.approx(53000.0)
     assert df.loc[2, "Close"] == pytest.approx(51900.0)     # 분할 이후는 그대로
-    assert df.loc[0, "Volume"] == pytest.approx(5000.0)     # 100 x 50
+    assert df.loc[0, "Volume"] == pytest.approx(100.0)      # 원본 그대로 (조정 금지)
+    assert df.loc[2, "Volume"] == pytest.approx(39565391.0)
     assert df.loc[1, "Open"] == 0.0, "거래정지 봉의 0 은 그대로 0"
 
 

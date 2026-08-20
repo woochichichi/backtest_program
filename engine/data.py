@@ -30,7 +30,7 @@ from .errors import DataUnavailable
 __all__ = ["MarcapStore", "MARCAP_COLUMNS", "NUMERIC_COLUMNS",
            "halted_mask", "HALTED_COLUMN", "PRICE_LIMIT_PCT", "code_variants",
            "adjustment_factors", "apply_price_adjustment", "ADJUST_STOCKS_RATIO",
-           "ADJUST_LIMITATIONS"]
+           "ADJUST_LIMITATIONS", "ADJUST_LOGIC_VERSION"]
 
 
 #: marcap parquet 의 컬럼 (``ChagesRatio`` 오타는 원본 그대로 유지한다)
@@ -79,6 +79,22 @@ ADJUST_LIMITATIONS = [
     "배당락은 반영되지 않습니다. 상장주식수가 변하지 않기 때문입니다.",
     "조정 기준 시점은 불러온 구간의 마지막 거래일입니다.",
 ]
+
+#: **수정주가 조정 로직의 버전.**
+#:
+#: 디스크 캐시(``cache/sym/*.parquet``, ``cache/panel-*.feather``)는 조정이 **이미 적용된**
+#: 가격을 담는다. 그래서 소스 parquet 이 그대로여도 조정 로직이 바뀌면 캐시는 낡은 값이 된다.
+#: 소스 지문(``_source_fingerprint``)만으로는 이걸 절대 알아챌 수 없다.
+#:
+#: **``adjustment_factors`` / ``apply_price_adjustment`` 의 결과 가격이 달라지는 변경을 하면
+#: 반드시 이 값을 1 올려라.** 그러면 기존 캐시가 자동으로 미스 처리되어 재생성된다.
+#: (임계값 상수 ``ADJUST_STOCKS_RATIO`` / ``ADJUST_CONTINUITY_*`` 를 바꾸는 것도 포함.
+#:  ``ADJUST_LIMITATIONS`` 같은 안내 문구만 고치는 건 해당 없다.)
+#:
+#: 이력:
+#:   v1 — 최초. OHLC × 계수 + ``Volume ÷ 계수``
+#:   v2 — Volume 조정 제거 (KRX 원본 거래량은 실제 체결 주식 수라 조정하면 안 된다)
+ADJUST_LOGIC_VERSION = 2
 
 _YEAR_RE = re.compile(r"marcap-(\d{4})\.parquet$", re.IGNORECASE)
 
@@ -221,8 +237,13 @@ def apply_price_adjustment(df: pd.DataFrame,
     """``df`` 의 OHLC 를 제자리에서 수정주가로 바꾼다.
 
     * OHLC × 계수 (과거를 현재 기준으로 끌어내린다)
-    * Volume ÷ 계수 (거래대금이 보존된다)
-    * Amount·Marcap·Stocks 는 **건드리지 않는다** (이미 금액/원본 수치다)
+    * Volume·Amount·Marcap·Stocks 는 **건드리지 않는다**
+      KRX 원본 거래량은 분할 전후 모두 *실제로 체결된 주식 수* 라서 조정하면 안 된다
+      (네이버 금융도 조정하지 않는다). 예전에는 ``Volume ÷ 계수`` 를 했는데,
+      그러면 005930 의 2018-05-04 분할 이전 구간 거래량이 50배로 부풀려졌다.
+      ``Amount``(거래대금)는 실제 체결 금액이라 마찬가지로 원본 그대로 둔다.
+      따라서 조정 구간에서 ``Amount != 조정Close × Volume`` 인 것은 **정상**이다
+      (조정가는 현재 액면 기준의 가상 가격이기 때문).
     * 거래정지 봉의 0 은 0 × 계수 = 0 이라 그대로 남는다
     """
     parts, stats = adjustment_factors(df, threshold, beat)
@@ -231,15 +252,14 @@ def apply_price_adjustment(df: pd.DataFrame,
         stats["applied"] = False
         return stats
 
-    for col, invert in (("Open", False), ("High", False), ("Low", False),
-                        ("Close", False), ("Volume", True)):
+    for col in ("Open", "High", "Low", "Close"):
         if col not in df.columns:
             continue
         arr = np.array(df[col].to_numpy(), copy=True)
         for pos, vals, _n in parts:
             cur = arr[pos].astype("float64")
             with np.errstate(divide="ignore", invalid="ignore"):
-                new = cur / vals if invert else cur * vals
+                new = cur * vals
             new[~np.isfinite(new)] = 0.0
             arr[pos] = new.astype(arr.dtype, copy=False)
         df[col] = arr
@@ -707,7 +727,11 @@ class MarcapStore:
             raise DataUnavailable(f"구간이 뒤집혔습니다: {s} ~ {e}")
 
         adj = self.adjusted if adjusted is None else bool(adjusted)
-        tag = "adj" if adj else "raw"
+        # 이 캐시는 meta 파일이 없어서 별도의 버전 필드를 둘 곳이 없다.
+        # 조정 캐시는 파일명에 조정 로직 버전을 박아 구버전 파일과 아예 다른 경로를 쓰게 한다
+        # (= 로직을 바꾸고 ADJUST_LOGIC_VERSION 을 올리면 자동으로 재생성된다).
+        # raw 는 조정을 거치지 않으므로 버전을 붙이지 않는다.
+        tag = f"adj{ADJUST_LOGIC_VERSION}" if adj else "raw"
         cache_path = self.cache_dir / f"panel-{s.isoformat()}-{e.isoformat()}-{tag}.feather"
         if use_cache and columns is None and cache_path.is_file():
             try:
@@ -972,6 +996,12 @@ class MarcapStore:
         except (OSError, ValueError):
             return None
 
+        # 조정 캐시는 조정이 이미 적용된 가격을 담는다. 엔진의 조정 로직이 바뀌면
+        # 소스 parquet 이 그대로여도 캐시 내용이 낡은 것이 되므로 통째로 버린다.
+        # 버전 필드가 없는 구버전 meta 도 (None != 정수) 로 자동 미스 처리된다.
+        if adjusted and meta.get("adjust_logic") != ADJUST_LOGIC_VERSION:
+            return None
+
         cached_cols = meta.get("columns")
         if cols is not None and cached_cols is not None and not set(cols) <= set(cached_cols):
             return None                       # 캐시에 없는 컬럼을 요구한다 → 다시 읽는다
@@ -1033,6 +1063,9 @@ class MarcapStore:
                         "columns": list(cols) if cols is not None else None,
                         "years": sorted(int(y) for y in years),
                         "adjusted": bool(adjusted),
+                        # 조정 캐시에만 의미가 있다. raw 캐시는 조정을 거치지 않으므로
+                        # 로직 버전과 무관하다 (기록은 해 두되 로드 시 보지 않는다).
+                        "adjust_logic": ADJUST_LOGIC_VERSION,
                         "rows": int(len(df)),
                         "first": str(df["Date"].min().date()) if len(df) else None,
                         "last": str(df["Date"].max().date()) if len(df) else None,
